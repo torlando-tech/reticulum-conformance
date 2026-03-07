@@ -1,0 +1,17 @@
+# Build artifacts
+impls/swift/.build/
+impls/kotlin/.gradle/
+impls/kotlin/build/
+impls/kotlin/gradle/
+impls/kotlin/gradlew
+impls/kotlin/gradlew.bat
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+*.swp
+.DS_Store

@@ -338,3 +338,30 @@ class PipeSession:
         if self.RNS.Transport.has_path(dest_bytes):
             return self.RNS.Transport.hops_to(dest_bytes)
         return None
+
+    def python_path_table_entry(self, dest_hash_hex):
+        """Get raw path table entry from Python RNS Transport for a destination."""
+        dest_bytes = bytes.fromhex(dest_hash_hex)
+        return self.RNS.Transport.path_table.get(dest_bytes)
+
+    def python_recall_identity(self, dest_hash_hex):
+        """Recall an identity from Python's identity storage by destination hash."""
+        dest_bytes = bytes.fromhex(dest_hash_hex)
+        return self.RNS.Identity.recall(dest_bytes)
+
+    # --- Target Message Waiters ---
+
+    def wait_for_announce_received(self, dest_hash=None, timeout=15):
+        """Wait for target to emit an announce_received message."""
+        def predicate(msg):
+            if dest_hash is not None:
+                return msg.get("destination_hash") == dest_hash
+            return True
+        return self.wait_for_message("announce_received", timeout=timeout, predicate=predicate)
+
+    def wait_for_path_table_entry(self, dest_hash, timeout=15):
+        """Wait for target's path_table to contain a specific destination."""
+        def predicate(msg):
+            entries = msg.get("entries", [])
+            return any(e.get("destination_hash") == dest_hash for e in entries)
+        return self.wait_for_message("path_table", timeout=timeout, predicate=predicate)

@@ -14,6 +14,12 @@ def pytest_addoption(parser):
         default=None,
         help="Command to launch the target pipe peer binary.",
     )
+    parser.addoption(
+        "--python-only",
+        action="store_true",
+        default=False,
+        help="Run three-node tests with Python-only SUT (no Swift binary needed).",
+    )
 
 
 @pytest.fixture(scope="session")

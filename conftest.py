@@ -14,8 +14,8 @@ from bridge_client import BridgeClient
 # Override with CONFORMANCE_BRIDGE_CMD environment variable for custom bridges
 BRIDGE_COMMANDS = {
     "reference": "python3 {root}/reference/bridge_server.py",
-    "swift": "{root}/impls/swift/.build/release/SwiftBridge",
-    "kotlin": "java -jar {root}/impls/kotlin/build/libs/KotlinBridge.jar",
+    "swift": "{root}/../reticulum-swift-lib/.build/release/ConformanceBridge",
+    "kotlin": "java -jar {root}/../reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar",
 }
 
 # Root directory of the conformance suite
@@ -65,12 +65,8 @@ def get_impl_list(config):
             continue
         cmd = resolve_command(name)
         # Check if the bridge executable/JAR exists
-        if name == "swift":
-            if os.path.exists(cmd):
-                impls.append(name)
-        elif name == "kotlin":
-            jar_path = os.path.join(ROOT_DIR, "impls/kotlin/build/libs/KotlinBridge.jar")
-            if os.path.exists(jar_path):
+        if name in ("swift", "kotlin"):
+            if os.path.exists(cmd.split()[-1]):
                 impls.append(name)
         else:
             impls.append(name)

@@ -2705,6 +2705,122 @@ def cmd_ifac_verify(params):
     }
 
 
+def cmd_ifac_mask_packet(params):
+    """Apply IFAC masking to a raw packet.
+
+    Performs the full IFAC transmit transform:
+    1. Compute IFAC tag (Ed25519 sign, take last ifac_size bytes)
+    2. Set IFAC flag (0x80) on header byte 0
+    3. Insert IFAC after 2-byte header
+    4. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
+    5. Apply mask: header bytes and payload masked, IFAC bytes NOT masked
+
+    Returns the masked wire-format packet.
+    """
+    from pure25519.ed25519_oop import SigningKey
+
+    ifac_key = hex_to_bytes(params['ifac_key'])
+    raw = hex_to_bytes(params['packet_data'])
+    ifac_size = int(params.get('ifac_size', 16))
+
+    # 1. Compute IFAC
+    ed25519_key = ifac_key[32:]
+    sk = SigningKey(ed25519_key)
+    signature = sk.sign(raw)
+    ifac = signature[-ifac_size:]
+
+    # 2-3. Set flag and insert IFAC
+    new_header = bytes([raw[0] | 0x80, raw[1]])
+    new_raw = new_header + ifac + raw[2:]
+
+    # 4. Generate mask
+    mask = HKDF.hkdf(
+        length=len(new_raw),
+        derive_from=ifac,
+        salt=ifac_key,
+        context=None,
+    )
+
+    # 5. Apply mask
+    masked_raw = b""
+    for i, byte in enumerate(new_raw):
+        if i == 0:
+            masked_raw += bytes([byte ^ mask[i] | 0x80])
+        elif i == 1 or i > ifac_size + 1:
+            masked_raw += bytes([byte ^ mask[i]])
+        else:
+            masked_raw += bytes([byte])
+
+    return {
+        'masked_packet': bytes_to_hex(masked_raw),
+        'ifac': bytes_to_hex(ifac),
+    }
+
+
+def cmd_ifac_unmask_packet(params):
+    """Unmask and validate an IFAC-protected packet.
+
+    Performs the full IFAC receive transform:
+    1. Check IFAC flag (0x80) is set
+    2. Extract IFAC from bytes [2:2+ifac_size]
+    3. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
+    4. Unmask header bytes and payload (not IFAC itself)
+    5. Clear IFAC flag, remove IFAC bytes
+    6. Recompute expected IFAC and validate
+
+    Returns the original unmasked packet (or invalid=true).
+    """
+    from pure25519.ed25519_oop import SigningKey
+
+    ifac_key = hex_to_bytes(params['ifac_key'])
+    masked = hex_to_bytes(params['masked_packet'])
+    ifac_size = int(params.get('ifac_size', 16))
+
+    # 1. Check flag
+    if masked[0] & 0x80 != 0x80:
+        return {'valid': False, 'error': 'ifac_flag_not_set'}
+
+    if len(masked) <= 2 + ifac_size:
+        return {'valid': False, 'error': 'packet_too_short'}
+
+    # 2. Extract IFAC (not masked)
+    ifac = masked[2:2 + ifac_size]
+
+    # 3. Generate mask
+    mask = HKDF.hkdf(
+        length=len(masked),
+        derive_from=ifac,
+        salt=ifac_key,
+        context=None,
+    )
+
+    # 4. Unmask
+    unmasked = b""
+    for i, byte in enumerate(masked):
+        if i <= 1 or i > ifac_size + 1:
+            unmasked += bytes([byte ^ mask[i]])
+        else:
+            unmasked += bytes([byte])
+
+    # 5. Clear flag and remove IFAC
+    new_raw = bytes([unmasked[0] & 0x7f, unmasked[1]]) + unmasked[2 + ifac_size:]
+
+    # 6. Validate
+    ed25519_key = ifac_key[32:]
+    sk = SigningKey(ed25519_key)
+    expected_ifac = sk.sign(new_raw)[-ifac_size:]
+
+    valid = ifac == expected_ifac
+
+    result = {
+        'valid': valid,
+        'ifac': bytes_to_hex(ifac),
+    }
+    if valid:
+        result['packet_data'] = bytes_to_hex(new_raw)
+    return result
+
+
 # Compression operations
 def cmd_bz2_compress(params):
     """Compress data using BZ2.
@@ -4542,6 +4658,8 @@ COMMANDS = {
     'ifac_derive_key': cmd_ifac_derive_key,
     'ifac_compute': cmd_ifac_compute,
     'ifac_verify': cmd_ifac_verify,
+    'ifac_mask_packet': cmd_ifac_mask_packet,
+    'ifac_unmask_packet': cmd_ifac_unmask_packet,
     # Compression operations
     'bz2_compress': cmd_bz2_compress,
     'bz2_decompress': cmd_bz2_decompress,

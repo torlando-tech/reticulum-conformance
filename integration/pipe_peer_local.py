@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local conformance pipe peer with path request and destination-only support.
+Local conformance pipe peer with path request, destination-only, and channel serve support.
 
 Actions:
   - "announce": Create destination, announce it, report hash, run path table dumper.
@@ -8,6 +8,8 @@ Actions:
   - "path_request": Send path request for a destination hash (from env or file).
   - "destination_only": Create destination (don't announce), report hash. RNS
     auto-announces when a path request arrives for local destinations.
+  - "channel_serve": Create a destination, accept an incoming link, and send a
+    proof-dependent three-message channel sequence.
 
 Environment variables:
   PIPE_PEER_ACTION: Action to perform (default: "listen")
@@ -19,22 +21,124 @@ Environment variables:
   PIPE_PEER_PATH_REQUEST_DEST_FILE: File to poll for destination hash (path_request)
   PYTHON_RNS_PATH: Path to Python RNS source (default: ~/repos/Reticulum)
 """
-import sys
-import os
 import json
-import time
-import threading
+import os
+import sys
 import tempfile
+import threading
+import time
 
 # Add RNS to path
-rns_path = os.environ.get('PYTHON_RNS_PATH',
-    os.path.expanduser('~/repos/Reticulum'))
+rns_path = os.environ.get("PYTHON_RNS_PATH", os.path.expanduser("~/repos/Reticulum"))
 sys.path.insert(0, rns_path)
+
+
+_BridgeMessageClass = None
 
 
 def emit(msg):
     sys.stderr.write(json.dumps(msg) + "\n")
     sys.stderr.flush()
+
+
+
+def _get_bridge_message_class():
+    import RNS
+
+    global _BridgeMessageClass
+    if _BridgeMessageClass is None:
+        class BridgeMessage(RNS.Channel.MessageBase):
+            MSGTYPE = 0x0101
+
+            def __init__(self, data=b""):
+                self.data = data
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = raw
+
+        _BridgeMessageClass = BridgeMessage
+
+    return _BridgeMessageClass
+
+
+
+def _link_closed(link):
+    emit({
+        "type": "link_closed",
+        "link_id": link.link_id.hex() if link.link_id else "",
+        "destination_hash": link.destination.hash.hex() if link.destination else "",
+    })
+
+
+
+def _setup_channel_peer(link, send_sequence=False):
+    BridgeMessage = _get_bridge_message_class()
+    channel = link.get_channel()
+    channel.register_message_type(BridgeMessage)
+
+    def on_channel_message(message):
+        if isinstance(message, BridgeMessage):
+            data = bytes(message.data)
+            emit({
+                "type": "channel_data",
+                "link_id": link.link_id.hex() if link.link_id else "",
+                "data_hex": data.hex(),
+                "data_utf8": data.decode("utf-8", errors="replace"),
+            })
+            return True
+        return False
+
+    channel.add_message_handler(on_channel_message)
+
+    if not send_sequence:
+        return
+
+    def send_messages():
+        time.sleep(1.0)
+        for payload in (b"channel-one", b"channel-two", b"channel-three"):
+            deadline = time.time() + 5.0
+            while (
+                time.time() < deadline
+                and link.status == link.ACTIVE
+                and not channel.is_ready_to_send()
+            ):
+                time.sleep(0.05)
+
+            if link.status != link.ACTIVE:
+                emit({"type": "error", "message": "Link became inactive before channel send"})
+                return
+
+            if not channel.is_ready_to_send():
+                emit({"type": "error", "message": "Channel never became ready for next send"})
+                return
+
+            try:
+                channel.send(BridgeMessage(payload))
+                emit({
+                    "type": "channel_sent",
+                    "link_id": link.link_id.hex() if link.link_id else "",
+                    "data_hex": payload.hex(),
+                })
+            except Exception as e:
+                emit({"type": "error", "message": f"Channel send failed: {e}"})
+                return
+
+    threading.Thread(target=send_messages, daemon=True).start()
+
+
+
+def _channel_serve_established(link):
+    emit({
+        "type": "link_established",
+        "link_id": link.link_id.hex() if link.link_id else "",
+        "destination_hash": link.destination.hash.hex() if link.destination else "",
+    })
+    link.set_link_closed_callback(_link_closed)
+    _setup_channel_peer(link, send_sequence=True)
+
 
 
 def main():
@@ -70,12 +174,10 @@ def main():
     }
     iface_mode = mode_map.get(mode_str, BaseInterface.MODE_FULL)
 
-    # Create pipe interface on stdin/stdout
     pipe_iface = _create_pipe_interface(RNS, sys.stdin.buffer, sys.stdout.buffer, "StdioPipe")
     pipe_iface.owner = RNS.Transport
     reticulum._add_interface(pipe_iface, mode=iface_mode)
 
-    # Register announce handler
     handler = _AnnounceHandler(RNS)
     RNS.Transport.register_announce_handler(handler)
 
@@ -84,8 +186,11 @@ def main():
     if action == "announce":
         identity = RNS.Identity()
         destination = RNS.Destination(
-            identity, RNS.Destination.IN, RNS.Destination.SINGLE,
-            app_name, *aspects
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects,
         )
         destination.announce()
         dest_hash_hex = destination.hash.hex()
@@ -96,7 +201,6 @@ def main():
             "identity_public_key": identity.get_public_key().hex(),
         })
 
-        # Write hash to output file if specified (for cross-process coordination)
         hash_output_file = os.environ.get("PIPE_PEER_HASH_OUTPUT_FILE", "")
         if hash_output_file:
             with open(hash_output_file, "w") as f:
@@ -108,13 +212,13 @@ def main():
         _path_table_dumper(RNS)
 
     elif action == "destination_only":
-        # Create a destination but do NOT announce it.
-        # When a path request arrives for this destination, Python RNS
-        # automatically announces it in response (Transport.py:2718-2720).
         identity = RNS.Identity()
         destination = RNS.Destination(
-            identity, RNS.Destination.IN, RNS.Destination.SINGLE,
-            app_name, *aspects
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects,
         )
         dest_hash_hex = destination.hash.hex()
         emit({
@@ -124,7 +228,6 @@ def main():
             "identity_public_key": identity.get_public_key().hex(),
         })
 
-        # Write hash to output file if specified (for cross-process coordination)
         hash_output_file = os.environ.get("PIPE_PEER_HASH_OUTPUT_FILE", "")
         if hash_output_file:
             with open(hash_output_file, "w") as f:
@@ -133,12 +236,9 @@ def main():
         _path_table_dumper(RNS)
 
     elif action == "path_request":
-        # Send a path request for a specific destination hash.
-        # Hash can come from env var or by polling a file.
         dest_hash_hex = os.environ.get("PIPE_PEER_PATH_REQUEST_DEST", "")
 
         if not dest_hash_hex:
-            # Poll a file for the destination hash
             dest_file = os.environ.get("PIPE_PEER_PATH_REQUEST_DEST_FILE", "")
             if dest_file:
                 emit({"type": "waiting_for_dest_file", "file": dest_file})
@@ -152,21 +252,21 @@ def main():
                     time.sleep(0.5)
 
         if not dest_hash_hex:
-            emit({"type": "error", "message": "No destination hash (set PIPE_PEER_PATH_REQUEST_DEST or PIPE_PEER_PATH_REQUEST_DEST_FILE)"})
+            emit({
+                "type": "error",
+                "message": "No destination hash (set PIPE_PEER_PATH_REQUEST_DEST or PIPE_PEER_PATH_REQUEST_DEST_FILE)",
+            })
             _path_table_dumper(RNS)
             return
 
         dest_hash = bytes.fromhex(dest_hash_hex)
         emit({"type": "path_request_queued", "destination_hash": dest_hash_hex})
 
-        # Wait a moment for the pipe to be fully connected
         time.sleep(1)
 
-        # Send the path request
         RNS.Transport.request_path(dest_hash)
         emit({"type": "path_request_sent", "destination_hash": dest_hash_hex})
 
-        # Wait for path to be discovered
         deadline = time.time() + 20
         while time.time() < deadline:
             if RNS.Transport.has_path(dest_hash):
@@ -184,6 +284,25 @@ def main():
                 "destination_hash": dest_hash_hex,
             })
 
+        _path_table_dumper(RNS)
+
+    elif action == "channel_serve":
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            app_name,
+            *aspects,
+        )
+        destination.set_link_established_callback(_channel_serve_established)
+        destination.announce()
+        emit({
+            "type": "announced",
+            "destination_hash": destination.hash.hex(),
+            "identity_hash": identity.hash.hex(),
+            "identity_public_key": identity.get_public_key().hex(),
+        })
         _path_table_dumper(RNS)
 
     else:
@@ -207,6 +326,7 @@ class _AnnounceHandler:
         })
 
 
+
 def _path_table_dumper(RNS):
     last_dump = ""
     try:
@@ -226,6 +346,7 @@ def _path_table_dumper(RNS):
                 last_dump = current
     except (KeyboardInterrupt, BrokenPipeError):
         pass
+
 
 
 def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):

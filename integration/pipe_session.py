@@ -312,6 +312,21 @@ class PipeSession:
     def wait_for_announced(self, timeout=15):
         return self.wait_for_message("announced", timeout=timeout)
 
+    def wait_for_link_established(self, timeout=15):
+        return self.wait_for_message("link_established", timeout=timeout)
+
+    def wait_for_link_closed(self, timeout=15):
+        return self.wait_for_message("link_closed", timeout=timeout)
+
+    def wait_for_channel_sent(self, timeout=15):
+        return self.wait_for_message("channel_sent", timeout=timeout)
+
+    def wait_for_channel_data(self, timeout=15):
+        return self.wait_for_message("channel_data", timeout=timeout)
+
+    def wait_for_error(self, timeout=15):
+        return self.wait_for_message("error", timeout=timeout)
+
     # --- Python-side Actions ---
 
     def python_announce(self, app_name="pipetest", aspects=("routing",)):

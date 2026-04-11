@@ -98,8 +98,16 @@ def active_link(session, target_dest):
     yield link
 
     if link.status == RNS.Link.ACTIVE:
+        link_id = link.link_id.hex() if link.link_id else None
         link.teardown()
-        time.sleep(0.5)
+        if link_id is not None:
+            session.wait_for_message(
+                "link_closed",
+                timeout=3,
+                predicate=lambda msg: msg.get("link_id") == link_id,
+            )
+        else:
+            time.sleep(0.5)
 
 
 class TestChannelSendWindow:

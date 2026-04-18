@@ -57,9 +57,19 @@ def behavioral(behavioral_impl):
         else {}
     )
     client = BridgeClient(cmd, env=env)
+    harness = _BehavioralHarness(client)
     try:
-        yield _BehavioralHarness(client)
+        yield harness
     finally:
+        # Run harness.cleanup() first to stop any remaining instances on
+        # the bridge side before we close the pipe. Tests typically call
+        # cleanup themselves in a finally, but doing it here too makes
+        # sure a test that raises before reaching its finally still
+        # tears down cleanly.
+        try:
+            harness.cleanup()
+        except Exception:
+            pass
         client.close()
 
 

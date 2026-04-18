@@ -74,42 +74,6 @@ def build_random_hash(random_prefix: bytes, emission_ts: int) -> bytes:
     return random_prefix[:5] + ts_bytes
 
 
-def build_announce_raw(
-    bridge,
-    identity_public_key: bytes,
-    identity_private_key: bytes,
-    destination_hash: bytes,
-    random_prefix: bytes,
-    emission_ts: int,
-    wire_hops: int = 0,
-    context: int = CONTEXT_NONE,
-    ratchet: Optional[bytes] = None,
-    app_data: bytes = b"",
-    transport_id: Optional[bytes] = None,
-) -> bytes:
-    """Build a valid HEADER_1 announce packet's raw wire bytes via the bridge.
-
-    The signature is computed over destination_hash + public_key + name_hash +
-    random_hash + ratchet + app_data, matching RNS/Destination.py:1463-1465.
-
-    name_hash is derived from the destination hash layout. For tests we invert
-    the usual derivation: the caller tells us the destination_hash, and we
-    use the first 10 bytes of full_hash(dest_hash + public_key) as a stand-in
-    name_hash — not cryptographically identical to real name_hash derivation,
-    but RNS's announce validation rebuilds the dest_hash from the name_hash +
-    identity_hash and compares. So for a realistic test, derive name_hash + the
-    dest hash together via the bridge's `destination_hash` command.
-
-    For now we accept that tests which need signature-verifying announces must
-    use a pre-computed (name_hash, destination_hash) pair via
-    build_announce_from_destination().
-    """
-    raise NotImplementedError(
-        "Use build_announce_from_destination() — full announce construction needs "
-        "a real name/aspect derivation which flows through bridge.destination_hash."
-    )
-
-
 def build_announce_from_destination(
     bridge,
     identity_private_key: bytes,
@@ -195,10 +159,19 @@ def build_announce_from_destination(
     return raw, destination_hash, public_key
 
 
+HEADER_1_MIN_SIZE = 2 + TRUNCATED_HASH_BYTES + 1  # flags + hops + dest_hash + ctx = 19
+HEADER_2_MIN_SIZE = 2 + 2 * TRUNCATED_HASH_BYTES + 1  # + transport_id before dest = 35
+
+
 def parse_packet_header(raw: bytes) -> dict:
-    """Parse just the outer packet header bytes. Does not validate signatures."""
-    if len(raw) < 19:
-        raise ValueError("raw too short to be a packet")
+    """Parse just the outer packet header bytes. Does not validate signatures.
+
+    HEADER_1 packets need at least 19 bytes (flags + hops + dest_hash + context).
+    HEADER_2 packets have an additional 16-byte transport_id inserted between
+    hops and dest_hash, so need at least 35 bytes.
+    """
+    if len(raw) < HEADER_1_MIN_SIZE:
+        raise ValueError(f"raw too short to be a packet: {len(raw)} < {HEADER_1_MIN_SIZE}")
     flags = raw[0]
     hops = raw[1]
     header_type = (flags & 0b01000000) >> 6
@@ -208,6 +181,10 @@ def parse_packet_header(raw: bytes) -> dict:
     packet_type = flags & 0b00000011
 
     if header_type == HEADER_2:
+        if len(raw) < HEADER_2_MIN_SIZE:
+            raise ValueError(
+                f"HEADER_2 packet too short: {len(raw)} < {HEADER_2_MIN_SIZE}"
+            )
         transport_id = raw[2 : 2 + TRUNCATED_HASH_BYTES]
         dest_hash = raw[2 + TRUNCATED_HASH_BYTES : 2 + 2 * TRUNCATED_HASH_BYTES]
         context = raw[2 + 2 * TRUNCATED_HASH_BYTES]

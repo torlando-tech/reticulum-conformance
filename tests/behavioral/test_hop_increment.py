@@ -107,6 +107,13 @@ def test_hop_increment_when_transport_disabled(behavioral):
 
         inst.inject(iface_a, raw)
 
+        # Wait past the PATHFINDER_RW retransmit window before draining.
+        # Without this sleep the test would pass even if transport were
+        # actually enabled (the retransmit hasn't fired yet at inject time),
+        # producing a false positive. Sleeping ensures that if Transport is
+        # going to emit at all, it has done so before we drain.
+        time.sleep(3.0)
+
         assert first_announce(inst.drain_tx(iface_a)) is None
         assert first_announce(inst.drain_tx(iface_b)) is None, (
             "Announce was rebroadcast with transport disabled and no local clients"

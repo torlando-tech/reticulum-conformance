@@ -2,25 +2,65 @@
 Behavioral-test fixtures.
 
 These tests use the `behavioral_*` bridge commands (see
-reference/behavioral_transport.py). Each test gets a fresh Transport
-instance per impl with a deterministic identity seed so runs are
-reproducible across the matrix.
+reference/behavioral_transport.py). Each test gets a FRESH bridge
+process — unlike the session-scoped `sut` fixture used by byte-level
+tests — because Python RNS's Reticulum singleton state can't be
+reset in-process, and reusing a singleton across tests with different
+`enable_transport` values silently produces false-positive passes.
 """
 
+import os
 import secrets
 
 import pytest
 
+from bridge_client import BridgeClient
+from conftest import get_impl_list, resolve_command
+
+
+def pytest_generate_tests(metafunc):
+    """Parametrize behavioral tests with the same impl list as the rest of
+    the suite. We do this independently of the root conftest's `sut`-based
+    parametrization because behavioral tests don't use `sut` directly
+    (they use `behavioral`, which spawns a fresh bridge per-test).
+    """
+    if "behavioral_impl" in metafunc.fixturenames:
+        impls = get_impl_list(metafunc.config) or ["reference"]
+        metafunc.parametrize("behavioral_impl", impls, scope="function")
+
 
 @pytest.fixture
-def behavioral(sut):
-    """Helper bound to the system-under-test bridge.
+def behavioral_impl(request):
+    """Name of the impl under test (reference/kotlin/swift).
 
-    Parametrized via pytest's `sut` fixture — `--impl=kotlin` targets the
-    Kotlin bridge, `--impl=swift` the Swift bridge, `--reference-only` runs
-    against the Python reference as a sanity check.
+    Parametrized by `pytest_generate_tests` above.
     """
-    return _BehavioralHarness(sut)
+    return request.param
+
+
+@pytest.fixture
+def behavioral(behavioral_impl):
+    """Helper bound to a FRESHLY-SPAWNED bridge process per test."""
+    cmd = resolve_command(behavioral_impl)
+    env = (
+        {
+            "PYTHON_RNS_PATH": os.environ.get(
+                "PYTHON_RNS_PATH",
+                os.path.expanduser("~/repos/Reticulum"),
+            ),
+            "PYTHON_LXMF_PATH": os.environ.get(
+                "PYTHON_LXMF_PATH",
+                os.path.expanduser("~/repos/LXMF"),
+            ),
+        }
+        if behavioral_impl == "reference"
+        else {}
+    )
+    client = BridgeClient(cmd, env=env)
+    try:
+        yield _BehavioralHarness(client)
+    finally:
+        client.close()
 
 
 class _BehavioralHarness:

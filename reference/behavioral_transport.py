@@ -130,9 +130,9 @@ def _reset_transport_state():
     """Zero out Transport's in-memory tables so a new test starts clean.
 
     Does NOT destroy the Transport thread / identity — those are fine to
-    reuse. Does reset the `enable_transport` flag based on the current test's
-    desired config (Reticulum reads it from config_dir, so we write a fresh
-    config before calling this).
+    reuse. Does NOT change the `enable_transport` flag (that's a singleton
+    property, set at first `RNS.Reticulum.__init__` and not mutable after;
+    see `_ensure_rns_started` for the mismatch guard).
     """
     RNS = _get_rns()
     T = RNS.Transport
@@ -146,24 +146,41 @@ def _reset_transport_state():
         T.announce_rate_table.clear()
 
 
-def _ensure_rns_started(config_dir, enable_transport):
-    """Start (or reuse) the process-wide Reticulum instance. Writes config
-    before starting so share_instance=No / enable_transport flags apply.
+_shared_enable_transport: bool | None = None
 
-    If an instance already exists we reset its Transport state but keep the
-    singleton alive, since RNS.Reticulum can't be re-initialized in the same
-    process. enable_transport is a config-file property, so it cannot be
-    changed after first init — document this as a known harness limitation
-    and warn if a test asks for a different value.
+
+def _ensure_rns_started(config_dir, enable_transport):
+    """Start (or reuse) the process-wide Reticulum instance.
+
+    `enable_transport` is a config-file property that Python RNS reads at
+    `Reticulum.__init__` time and cannot change after. Since the bridge
+    hosts a single singleton for its lifetime, the first `behavioral_start`
+    call fixes `enable_transport` for every subsequent call in the same
+    bridge process.
+
+    If a later call requests a different `enable_transport`, raise loudly so
+    the caller can spawn a fresh bridge process (what pytest's session
+    fixture does) rather than silently running with the previous value —
+    which would produce false-positive test passes.
     """
-    global _shared_rns_instance, _shared_config_dir
+    global _shared_rns_instance, _shared_config_dir, _shared_enable_transport
     RNS = _get_rns()
 
     if _shared_rns_instance is not None:
+        if _shared_enable_transport != enable_transport:
+            raise RuntimeError(
+                f"behavioral_start requested enable_transport={enable_transport} "
+                f"but the bridge's Reticulum singleton was initialized with "
+                f"enable_transport={_shared_enable_transport}. Python RNS can't "
+                f"switch this flag after init. Restart the bridge process "
+                f"(e.g. via a session-scoped pytest fixture with --forked) to "
+                f"change it."
+            )
         _reset_transport_state()
         return _shared_rns_instance
 
     _shared_config_dir = config_dir
+    _shared_enable_transport = enable_transport
     config_file = os.path.join(config_dir, "config")
     if not os.path.isfile(config_file):
         os.makedirs(config_dir, exist_ok=True)
@@ -184,15 +201,23 @@ def _ensure_rns_started(config_dir, enable_transport):
 def cmd_behavioral_start(params):
     """Start a Transport instance with a deterministic identity seed.
 
-    Each instance lives in its own config directory. Multiple instances can run
-    concurrently in the same bridge process, each with its own path_table and
-    mock interfaces."""
+    The bridge process hosts a single RNS.Reticulum singleton for its lifetime
+    (RNS can't be re-initialized in-process). Per-test state is reset on each
+    call. See `_ensure_rns_started` for the `enable_transport` compatibility
+    contract.
+    """
     RNS = _get_rns()
 
     identity_seed_hex = params.get("identity_seed")
     enable_transport = bool(params.get("enable_transport", True))
 
-    config_dir = tempfile.mkdtemp(prefix="rns_behavioral_")
+    # Only allocate a config dir on the first call; subsequent calls reuse
+    # the singleton and would leave the new dir orphaned.
+    config_dir = (
+        _shared_config_dir
+        if _shared_rns_instance is not None
+        else tempfile.mkdtemp(prefix="rns_behavioral_")
+    )
     rns = _ensure_rns_started(config_dir, enable_transport)
 
     # Inject an identity from the seed if provided; otherwise use whatever RNS

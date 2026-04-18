@@ -150,7 +150,8 @@ def build_announce_from_destination(
         "destination_hash",
         identity_hash=identity_hash.hex(),
         app_name=app_name,
-        aspects=",".join(aspects),
+        aspects=list(aspects),  # JSON array — Python accepts list OR string,
+                                # Kotlin bridge only accepts array.
     )
     destination_hash = bytes.fromhex(dest_info["destination_hash"])
 

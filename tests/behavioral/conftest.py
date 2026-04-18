@@ -13,15 +13,14 @@ import pytest
 
 
 @pytest.fixture
-def behavioral(reference):
-    """Context manager that yields a helper bound to a single behavioral
-    Transport instance. Tears down on exit.
+def behavioral(sut):
+    """Helper bound to the system-under-test bridge.
 
-    For now we only run against the reference bridge. Once the Kotlin/Swift
-    bridges implement the behavioral_* commands, this fixture expands to a
-    parametrized matrix.
+    Parametrized via pytest's `sut` fixture — `--impl=kotlin` targets the
+    Kotlin bridge, `--impl=swift` the Swift bridge, `--reference-only` runs
+    against the Python reference as a sanity check.
     """
-    return _BehavioralHarness(reference)
+    return _BehavioralHarness(sut)
 
 
 class _BehavioralHarness:

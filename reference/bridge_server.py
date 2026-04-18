@@ -4717,6 +4717,15 @@ COMMANDS = {
     'packet_parse_header': cmd_packet_parse_header,
 }
 
+# Behavioral conformance commands (black-box Transport tests).
+# See behavioral_transport.py for the rationale and command spec.
+try:
+    from behavioral_transport import BEHAVIORAL_COMMANDS
+    COMMANDS.update(BEHAVIORAL_COMMANDS)
+except ImportError:
+    # Module not present (older bridge); skip silently
+    pass
+
 
 def handle_request(request):
     """Process a single request and return response."""

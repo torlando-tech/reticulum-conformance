@@ -4726,6 +4726,14 @@ except ImportError:
     # Module not present (older bridge); skip silently
     pass
 
+# Wire-level TCP interop commands (E2E IFAC tests).
+# See wire_tcp.py for the rationale and command spec.
+try:
+    from wire_tcp import WIRE_COMMANDS
+    COMMANDS.update(WIRE_COMMANDS)
+except ImportError:
+    pass
+
 
 def handle_request(request):
     """Process a single request and return response."""

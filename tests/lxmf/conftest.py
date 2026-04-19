@@ -314,9 +314,13 @@ class _LxmfPeer:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             if self.stored_message_count() == expected:
-                # Linger a hair to make sure a just-arriving duplicate
-                # would still fail the FINAL equality check below.
-                time.sleep(0.2)
+                # Linger past the poll cadence (0.2s) to make sure a
+                # just-arriving duplicate would still fail the FINAL
+                # equality check. 1s gives >=5x the poll interval so a
+                # duplicate landing within a full cycle after we first
+                # hit `expected` still registers. Costs <1s on the
+                # happy path (negligible vs. ~25s total test wall).
+                time.sleep(1.0)
                 return self.stored_message_count() == expected
             time.sleep(0.2)
         return self.stored_message_count() == expected

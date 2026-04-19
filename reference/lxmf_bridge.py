@@ -72,9 +72,19 @@ def _wire_instance(wire_handle: str):
     Duplicates nothing — the wire_tcp module owns the RNS singleton;
     we just borrow its Reticulum to attach an LXMF router to.
     """
-    from wire_tcp import _instances as wire_instances, _instances_lock as wire_lock
+    wire_instances, wire_lock = _wire_lock_pair()
     with wire_lock:
         return wire_instances.get(wire_handle)
+
+
+def _wire_lock_pair():
+    """Return the (dict, lock) pair owned by wire_tcp so we can protect
+    reads/writes of the wire_inst dicts consistently with wire_tcp's
+    own discipline. Imported lazily so this module can load even if
+    wire_tcp isn't importable (e.g., minimal CI for a different layer).
+    """
+    from wire_tcp import _instances as wire_instances, _instances_lock as wire_lock
+    return wire_instances, wire_lock
 
 
 def cmd_lxmf_start(params):
@@ -447,7 +457,14 @@ def cmd_lxmf_spawn_daemon_propagation_node(params):
     # it. We attach to the wire handle (not an lxmf_start handle) because
     # the middle peer never calls lxmf_start — it has no LXMRouter of its
     # own; lxmd IS the router for this peer.
-    with _instances_lock:
+    #
+    # The wire_inst dict is owned by wire_tcp._instances and must be
+    # mutated under wire_tcp's own lock to stay consistent with how
+    # wire_tcp protects the same dict (see cmd_wire_* handlers). Using
+    # this module's _instances_lock here would not synchronize against
+    # wire_tcp's route-table and listener-accept threads.
+    _, wire_lock = _wire_lock_pair()
+    with wire_lock:
         wire_inst["lxmd_proc"] = lxmd_proc
         wire_inst["lxmd_config_dir"] = lxmd_config_dir
         wire_inst["lxmd_reader_thread"] = reader_thread
@@ -855,15 +872,22 @@ def cmd_lxmf_stop_daemon_propagation_node(params):
             none was present or it had already exited.
     """
     wire_handle = params["wire_handle"]
-    wire_inst = _wire_instance(wire_handle)
-    if wire_inst is None:
-        return {"stopped": False}
-
-    proc = wire_inst.pop("lxmd_proc", None)
-    lxmd_config_dir = wire_inst.pop("lxmd_config_dir", None)
-    reader_done = wire_inst.pop("lxmd_reader_done", None)
-    wire_inst.pop("lxmd_reader_thread", None)
-    wire_inst.pop("lxmd_recent_output", None)
+    # Look up and pop under wire_tcp's lock — the wire_inst dict is
+    # owned by wire_tcp and mutating it outside wire_lock races with
+    # wire_tcp's own accessors. We do the actual subprocess termination
+    # + reader-join OUTSIDE the lock because _terminate_lxmd blocks on
+    # wait() (up to 5s) and we don't want to hold a module-wide lock
+    # that long.
+    wire_instances, wire_lock = _wire_lock_pair()
+    with wire_lock:
+        wire_inst = wire_instances.get(wire_handle)
+        if wire_inst is None:
+            return {"stopped": False}
+        proc = wire_inst.pop("lxmd_proc", None)
+        lxmd_config_dir = wire_inst.pop("lxmd_config_dir", None)
+        reader_done = wire_inst.pop("lxmd_reader_done", None)
+        wire_inst.pop("lxmd_reader_thread", None)
+        wire_inst.pop("lxmd_recent_output", None)
 
     was_running = proc is not None and proc.poll() is None
     if proc is not None:

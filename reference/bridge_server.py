@@ -4734,6 +4734,15 @@ try:
 except ImportError:
     pass
 
+# LXMF-layer conformance commands (propagation E2E tests). Layered on top
+# of wire_tcp — lxmf_start binds to an existing wire handle rather than
+# reinitializing RNS. See lxmf_bridge.py for the rationale.
+try:
+    from lxmf_bridge import LXMF_COMMANDS
+    COMMANDS.update(LXMF_COMMANDS)
+except ImportError:
+    pass
+
 
 def handle_request(request):
     """Process a single request and return response."""

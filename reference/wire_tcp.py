@@ -76,12 +76,22 @@ def _write_ifac_ini(
     iface_block: str,
     network_name: str,
     passphrase: str,
+    share_instance: bool = False,
+    instance_name: str | None = None,
 ):
     """Write a minimal RNS config with a single interface.
 
     `iface_block` is the full interface type/target/port block; this helper
     adds the `[reticulum]` header, the shared IFAC fields (if any), and
     wraps the interface block.
+
+    share_instance=True publishes this RNS as a shared instance (AF_UNIX
+    abstract socket) so out-of-process daemons like lxmd can attach via
+    `--rnsconfig <config_dir>` and ride this peer's Transport. Used by the
+    LXMF propagation-node peer so the daemon isn't a standalone Reticulum.
+    When True, instance_name MUST be set to a value unique to this bridge
+    process — the abstract socket namespace is global and default=="default"
+    collides across parallel bridges.
     """
     os.makedirs(config_dir, exist_ok=True)
     config_file = os.path.join(config_dir, "config")
@@ -92,11 +102,23 @@ def _write_ifac_ini(
     if passphrase:
         ifac_lines += f"    passphrase = {passphrase}\n"
 
+    if share_instance and not instance_name:
+        raise ValueError(
+            "share_instance=True requires instance_name; leaving it at the "
+            "default 'default' would collide with parallel bridge processes."
+        )
+
+    share_value = "Yes" if share_instance else "No"
+    instance_line = (
+        f"  instance_name = {instance_name}\n" if share_instance and instance_name else ""
+    )
+
     with open(config_file, "w") as f:
         f.write(
             "[reticulum]\n"
             "  enable_transport = Yes\n"
-            "  share_instance = No\n"
+            f"  share_instance = {share_value}\n"
+            f"{instance_line}"
             "  respond_to_probes = No\n"
             "\n"
             "[interfaces]\n"
@@ -126,10 +148,16 @@ def _ensure_wire_rns_started(config_dir: str):
         return _shared_wire_rns
 
     _shared_wire_config_dir = config_dir
-    RNS.loglevel = RNS.LOG_CRITICAL
+    # Default loglevel=CRITICAL keeps the bridge's stderr clean. Setting
+    # CONFORMANCE_WIRE_DEBUG=1 bumps it to DEBUG, useful when tracking
+    # down "topology didn't converge" style issues (are announces even
+    # being forwarded?). Opt-in so the vast majority of tests stay quiet.
+    debug_wire = bool(os.environ.get("CONFORMANCE_WIRE_DEBUG"))
+    ll = RNS.LOG_DEBUG if debug_wire else RNS.LOG_CRITICAL
+    RNS.loglevel = ll
     _shared_wire_rns = RNS.Reticulum(
         configdir=config_dir,
-        loglevel=RNS.LOG_CRITICAL,
+        loglevel=ll,
     )
     return _shared_wire_rns
 
@@ -140,15 +168,28 @@ def cmd_wire_start_tcp_server(params):
     If bind_port=0 (default), pre-allocates a free port OS-side so both
     impls can use the same "tell me a usable port" contract. The
     returned `port` is what the client peer should connect to.
+
+    share_instance (bool, default False): publish this RNS as an AF_UNIX
+    shared instance so external daemons (lxmd) can attach via `--rnsconfig
+    <config_dir>` rather than spinning up their own Reticulum. Only the
+    middle peer in the LXMF propagation trio needs this — sender/receiver
+    run their LXMRouters in-process against the bridge's own Reticulum.
+    When True, a unique `instance_name` is auto-generated from the token
+    so parallel bridge subprocesses don't collide on the abstract socket.
     """
     network_name = params.get("network_name") or ""
     passphrase = params.get("passphrase") or ""
     bind_port = int(params.get("bind_port", 0))
+    share_instance = bool(params.get("share_instance", False))
 
     if bind_port == 0:
         bind_port = _allocate_free_port()
 
     config_dir = tempfile.mkdtemp(prefix="rns_wire_server_")
+    # instance_name must be unique per bridge process: the AF_UNIX abstract
+    # namespace (\0rns/<name>) is global. Use the tail of the config dir
+    # so it's stable within this process but distinct across parallel ones.
+    instance_name = f"wire_{os.path.basename(config_dir)}"
     iface_block = (
         "    type = TCPServerInterface\n"
         "    enabled = Yes\n"
@@ -161,6 +202,8 @@ def cmd_wire_start_tcp_server(params):
         iface_block,
         network_name,
         passphrase,
+        share_instance=share_instance,
+        instance_name=instance_name if share_instance else None,
     )
 
     RNS = _get_rns()
@@ -176,6 +219,8 @@ def cmd_wire_start_tcp_server(params):
             "role": "server",
             "port": bind_port,
             "destinations": [],
+            "share_instance": share_instance,
+            "instance_name": instance_name if share_instance else None,
         }
 
     return {

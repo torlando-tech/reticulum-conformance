@@ -174,6 +174,38 @@ class _WirePeer:
         )
         return [bytes.fromhex(p) for p in resp.get("packets", [])]
 
+    def resource_send(
+        self, link_id: bytes, data: bytes, timeout_ms: int = 30000
+    ) -> dict:
+        """Send arbitrary-size bytes via the RNS Resource API.
+
+        Returns the bridge's response dict with `success`, `status`,
+        `size`, `timed_out`. Used to exercise multi-packet chunked
+        transfer over a Link (the path LXMF uses for image/file
+        attachments).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_send",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def resource_poll(
+        self, destination_hash: bytes, timeout_ms: int = 30000
+    ) -> list:
+        """Drain all reassembled Resource payloads received on a listener."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_resource_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("resources", [])]
+
     def stop(self):
         if self.handle is None:
             return

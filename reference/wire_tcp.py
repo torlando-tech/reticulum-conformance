@@ -297,11 +297,15 @@ def cmd_wire_listen(params):
     """Register an IN SINGLE destination that accepts incoming Links.
 
     On link establishment, attach a packet callback that buffers received
-    bytes into an in-memory queue keyed by destination_hash. Tests poll
-    via wire_link_poll.
+    bytes into an in-memory queue keyed by destination_hash. Also accept
+    any Resource transfers on the link and buffer their reassembled data.
+    Tests poll via wire_link_poll (single-packet data) or
+    wire_resource_poll (completed resources).
 
     Intended for the receiver-side peer in multi-hop link tests. The
-    sender uses wire_link_open (below) to establish the link.
+    sender uses wire_link_open to establish the link, then either
+    wire_link_send (single packet) or wire_resource_send (arbitrary-size
+    data chunked via the Resource API).
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -322,16 +326,33 @@ def cmd_wire_listen(params):
         *aspects,
     )
 
-    # Per-destination receive buffer: list of raw bytes, appended on each
-    # link-data callback. Protected by the instance's own state lock.
-    recv_buffer = []
+    # Per-destination receive buffers.
+    recv_buffer = []         # single-packet link data
+    resource_buffer = []     # completed resources (bytes)
     recv_lock = threading.Lock()
 
     def on_link_established(link):
         def on_packet(message, packet):
             with recv_lock:
                 recv_buffer.append(bytes(message))
+        def on_resource_concluded(resource):
+            # resource.data is a BytesIO-like object on complete resources.
+            if getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+                data_blob = resource.data
+                if hasattr(data_blob, "read"):
+                    try:
+                        data_blob.seek(0)
+                    except Exception:
+                        pass
+                    payload = data_blob.read()
+                else:
+                    payload = bytes(data_blob)
+                with recv_lock:
+                    resource_buffer.append(payload)
         link.set_packet_callback(on_packet)
+        # Accept any incoming Resource; buffer its data on completion.
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_concluded_callback(on_resource_concluded)
 
     destination.set_link_established_callback(on_link_established)
 
@@ -342,6 +363,7 @@ def cmd_wire_listen(params):
         "destination": destination,
         "identity": identity,
         "recv_buffer": recv_buffer,
+        "resource_buffer": resource_buffer,
         "recv_lock": recv_lock,
     }
     # Keep strong reference so it isn't garbage collected.
@@ -458,6 +480,111 @@ def cmd_wire_link_send(params):
     return {"sent": True}
 
 
+def cmd_wire_resource_send(params):
+    """Send arbitrary-size bytes over an established outbound Link via the
+    Resource API, blocking until the transfer completes or times out.
+
+    This exercises the same code path LXMF uses for image/file/media
+    attachments in apps like Columba and Sideband. Data > link.mdu gets
+    chunked into multiple link DATA packets and reassembled at the
+    receiver. The receiver must have accepted resources on the link
+    (wire_listen wires this up automatically).
+
+    Returns {success, status, size}. `status` is the RNS Resource status
+    code (COMPLETE=6, FAILED=7) at completion / timeout.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+    timeout_ms = int(params.get("timeout_ms", 30000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    done = threading.Event()
+    final_status = [None]
+
+    def on_done(resource):
+        final_status[0] = getattr(resource, "status", None)
+        done.set()
+
+    resource = RNS.Resource(payload, link, callback=on_done)
+
+    if not done.wait(timeout=timeout_ms / 1000.0):
+        # Cancel the outbound resource so its worker threads / callbacks
+        # don't continue touching `final_status` / `done` after we
+        # return. Harmless under the current fresh-bridge-per-test
+        # fixture, but prevents interference if a future fixture reuses
+        # a bridge process across tests on the same link.
+        try:
+            resource.cancel()
+        except Exception:
+            pass
+        raw_status = getattr(resource, "status", None)
+        return {
+            "success": False,
+            # Use explicit None check rather than `... or -1` — a genuine
+            # status of 0 (Resource.NONE) is falsy and would coerce to
+            # -1 under the truthiness fallback.
+            "status": int(raw_status) if raw_status is not None else -1,
+            "size": len(payload),
+            "timed_out": True,
+        }
+
+    status_value = final_status[0]
+    success = status_value == RNS.Resource.COMPLETE
+    return {
+        "success": bool(success),
+        "status": int(status_value) if status_value is not None else -1,
+        "size": len(payload),
+        "timed_out": False,
+    }
+
+
+def cmd_wire_resource_poll(params):
+    """Drain all completed Resource payloads received on a listener.
+
+    Blocks up to timeout_ms for at least one completed resource; returns
+    whatever's present at deadline. Paired with wire_listen, which sets
+    up the listener to accept any resource and buffer completed ones.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 30000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        with listener["recv_lock"]:
+            if listener["resource_buffer"]:
+                out = [p.hex() for p in listener["resource_buffer"]]
+                listener["resource_buffer"].clear()
+                return {"resources": out}
+        time.sleep(0.1)
+
+    with listener["recv_lock"]:
+        out = [p.hex() for p in listener["resource_buffer"]]
+        listener["resource_buffer"].clear()
+    return {"resources": out}
+
+
 def cmd_wire_link_poll(params):
     """Poll the receive buffer for a listening destination.
 
@@ -525,5 +652,7 @@ WIRE_COMMANDS = {
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,
     "wire_link_poll": cmd_wire_link_poll,
+    "wire_resource_send": cmd_wire_resource_send,
+    "wire_resource_poll": cmd_wire_resource_poll,
     "wire_stop": cmd_wire_stop,
 }

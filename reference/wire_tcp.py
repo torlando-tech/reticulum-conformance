@@ -518,17 +518,31 @@ def cmd_wire_resource_send(params):
     resource = RNS.Resource(payload, link, callback=on_done)
 
     if not done.wait(timeout=timeout_ms / 1000.0):
+        # Cancel the outbound resource so its worker threads / callbacks
+        # don't continue touching `final_status` / `done` after we
+        # return. Harmless under the current fresh-bridge-per-test
+        # fixture, but prevents interference if a future fixture reuses
+        # a bridge process across tests on the same link.
+        try:
+            resource.cancel()
+        except Exception:
+            pass
+        raw_status = getattr(resource, "status", None)
         return {
             "success": False,
-            "status": int(getattr(resource, "status", -1) or -1),
+            # Use explicit None check rather than `... or -1` — a genuine
+            # status of 0 (Resource.NONE) is falsy and would coerce to
+            # -1 under the truthiness fallback.
+            "status": int(raw_status) if raw_status is not None else -1,
             "size": len(payload),
             "timed_out": True,
         }
 
-    success = final_status[0] == RNS.Resource.COMPLETE
+    status_value = final_status[0]
+    success = status_value == RNS.Resource.COMPLETE
     return {
         "success": bool(success),
-        "status": int(final_status[0] or -1),
+        "status": int(status_value) if status_value is not None else -1,
         "size": len(payload),
         "timed_out": False,
     }

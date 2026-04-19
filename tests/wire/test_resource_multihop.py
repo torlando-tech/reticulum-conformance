@@ -52,33 +52,6 @@ def _xfail_kotlin_receiver(wire_trio, reason_suffix=""):
         )
 
 
-def _xfail_kotlin_anywhere_ifac(wire_trio):
-    """Mark the test as expected-to-fail when Kotlin participates in
-    ANY role in an IFAC-protected multi-hop resource transfer.
-
-    Reproduces a production bug where Columba (Kotlin sender) sends
-    image attachments via the Resource API over an IFAC-protected
-    link through rnsd; the transfer repeatedly times out and LXMF
-    falls back to propagated delivery. Empirically the failure
-    covers every triple where Kotlin is the sender OR the
-    transport node — not just Kotlin-as-receiver (which has its
-    own separate receive-side issue).
-
-    Suspected root cause: an interaction between reticulum-kt's
-    per-packet IFAC mask/unmask path and Resource chunk
-    transmission (back-to-back large packets). Not addressed in the
-    PR introducing this test — this test serves as the reproducer
-    that will flip green once the reticulum-kt fix lands.
-    """
-    sender, transport, receiver = wire_trio
-    if "kotlin" in (sender, transport, receiver):
-        pytest.xfail(
-            "IFAC + reticulum-kt + chunked Resource send is broken; "
-            "see reticulum-kt follow-up issue. Failing topology: "
-            f"{sender}->{transport}->{receiver}"
-        )
-
-
 def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
     """Bring up sender/transport/receiver and establish a Link from
     sender to receiver via transport. Returns (sender, receiver,

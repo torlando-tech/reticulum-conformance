@@ -288,121 +288,127 @@ def cmd_lxmf_spawn_daemon_propagation_node(params):
     #     PROPAGATION_COST (16); we use it as-is. LXMF-kt's sender reads
     #     the cost from the node's announce and generates a matching
     #     stamp. At cost=16 that's ~65k attempts (~2-5s) — acceptable.
+    # All resource allocation from here through reader_thread.start() is
+    # wrapped in a single guard: if anything raises (Popen EPERM despite
+    # shutil.which succeeding, log-file open EACCES, Thread.start()
+    # ENOMEM), we reverse-unwind whatever has already been allocated so
+    # the caller sees the original exception without leaking tempdirs,
+    # file handles, or subprocess pipes.
     lxmd_config_dir = tempfile.mkdtemp(prefix="lxmd_conf_")
-    lxmd_config_path = os.path.join(lxmd_config_dir, "config")
-    # CONFORMANCE_LXMD_LOGLEVEL overrides the default loglevel (4=Notice).
-    # Set to 7 (EXTREME) when debugging announce forwarding / path convergence
-    # issues — matches RNS.LOG_EXTREME and surfaces the "Sending announce"
-    # lines lxmd emits at that level.
-    lxmd_loglevel = int(os.environ.get("CONFORMANCE_LXMD_LOGLEVEL", "4"))
-    with open(lxmd_config_path, "w") as f:
-        f.write(
-            "[lxmf]\n"
-            f"  display_name = {display_name}\n"
-            "  announce_at_start = Yes\n"
-            "\n"
-            "[logging]\n"
-            f"  loglevel = {lxmd_loglevel}\n"
-            "\n"
-            "[propagation]\n"
-            "  enable_node = Yes\n"
-            f"  node_name = {display_name}\n"
-            "  announce_at_start = Yes\n"
-            "  message_storage_limit = 100\n"
-            "  propagation_message_max_accepted_size = 25000\n"
-            "  propagation_sync_max_accepted_size = 102400\n"
+    lxmd_proc = None
+    lxmd_logfile = None
+    try:
+        lxmd_config_path = os.path.join(lxmd_config_dir, "config")
+        # CONFORMANCE_LXMD_LOGLEVEL overrides the default loglevel (4=Notice).
+        # Set to 7 (EXTREME) when debugging announce forwarding / path convergence
+        # issues — matches RNS.LOG_EXTREME and surfaces the "Sending announce"
+        # lines lxmd emits at that level.
+        lxmd_loglevel = int(os.environ.get("CONFORMANCE_LXMD_LOGLEVEL", "4"))
+        with open(lxmd_config_path, "w") as f:
+            f.write(
+                "[lxmf]\n"
+                f"  display_name = {display_name}\n"
+                "  announce_at_start = Yes\n"
+                "\n"
+                "[logging]\n"
+                f"  loglevel = {lxmd_loglevel}\n"
+                "\n"
+                "[propagation]\n"
+                "  enable_node = Yes\n"
+                f"  node_name = {display_name}\n"
+                "  announce_at_start = Yes\n"
+                "  message_storage_limit = 100\n"
+                "  propagation_message_max_accepted_size = 25000\n"
+                "  propagation_sync_max_accepted_size = 102400\n"
+            )
+
+        # Spawn lxmd. Drop -s so stdout/stderr are text streams we can tail.
+        # --propagation-node is redundant with enable_node=Yes in the config
+        # but matches the production invocation and is belt-and-suspenders.
+        #
+        # PYTHONUNBUFFERED=1 is essential: when stdout is piped (not a tty),
+        # CPython buffers full blocks, which means the "Propagation Node
+        # started on <hex>" line won't reach our reader until lxmd emits
+        # several more log lines — and in practice lxmd goes quiet after
+        # startup, so without this we hit the 30s timeout even though lxmd
+        # is healthy. `text=True, bufsize=1` alone doesn't fix this because
+        # bufsize controls OUR pipe, not the child's internal stdio buffer.
+        child_env = dict(os.environ)
+        child_env["PYTHONUNBUFFERED"] = "1"
+        lxmd_proc = subprocess.Popen(
+            [
+                lxmd_path,
+                "--rnsconfig", rns_config_dir,
+                "--config", lxmd_config_dir,
+                "--propagation-node",
+                "-v",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # interleaved so the regex match wins
+            text=True,
+            bufsize=1,  # line-buffered on OUR pipe
+            env=child_env,
         )
 
-    # Spawn lxmd. Drop -s so stdout/stderr are text streams we can tail.
-    # --propagation-node is redundant with enable_node=Yes in the config
-    # but matches the production invocation and is belt-and-suspenders.
-    #
-    # PYTHONUNBUFFERED=1 is essential: when stdout is piped (not a tty),
-    # CPython buffers full blocks, which means the "Propagation Node
-    # started on <hex>" line won't reach our reader until lxmd emits
-    # several more log lines — and in practice lxmd goes quiet after
-    # startup, so without this we hit the 30s timeout even though lxmd
-    # is healthy. `text=True, bufsize=1` alone doesn't fix this because
-    # bufsize controls OUR pipe, not the child's internal stdio buffer.
-    child_env = dict(os.environ)
-    child_env["PYTHONUNBUFFERED"] = "1"
-    lxmd_proc = subprocess.Popen(
-        [
-            lxmd_path,
-            "--rnsconfig", rns_config_dir,
-            "--config", lxmd_config_dir,
-            "--propagation-node",
-            "-v",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,  # interleaved so the regex match wins
-        text=True,
-        bufsize=1,  # line-buffered on OUR pipe
-        env=child_env,
-    )
+        # Drain lxmd's stdout in a background thread so its pipe buffer can't
+        # fill and deadlock the child. We only actually care about the
+        # "Propagation Node started on <hex>" line; everything else is tee'd
+        # into a ring buffer for teardown-time diagnostics.
+        recent_output: list[str] = []
+        prop_dest_hex = [None]  # captured by the thread; single-slot mailbox
+        started_event = threading.Event()
+        reader_done = threading.Event()
 
-    # Drain lxmd's stdout in a background thread so its pipe buffer can't
-    # fill and deadlock the child. We only actually care about the
-    # "Propagation Node started on <hex>" line; everything else is tee'd
-    # into a ring buffer for teardown-time diagnostics.
-    recent_output: list[str] = []
-    prop_dest_hex = [None]  # captured by the thread; single-slot mailbox
-    started_event = threading.Event()
-    reader_done = threading.Event()
+        # Optional file-tee for debugging: if CONFORMANCE_LXMD_LOG is set, we
+        # also mirror lxmd's output there. Useful for diagnosing "lxmd is up
+        # but topology didn't converge" failures where the stderr/stdout ring
+        # buffer is discarded on success.
+        lxmd_logfile_path = os.environ.get("CONFORMANCE_LXMD_LOG")
+        lxmd_logfile = open(lxmd_logfile_path, "a") if lxmd_logfile_path else None
+        if lxmd_logfile:
+            lxmd_logfile.write(f"\n=== lxmd spawn (wire_handle={wire_handle}) ===\n")
+            lxmd_logfile.flush()
 
-    # Optional file-tee for debugging: if CONFORMANCE_LXMD_LOG is set, we
-    # also mirror lxmd's output there. Useful for diagnosing "lxmd is up
-    # but topology didn't converge" failures where the stderr/stdout ring
-    # buffer is discarded on success.
-    lxmd_logfile_path = os.environ.get("CONFORMANCE_LXMD_LOG")
-    lxmd_logfile = open(lxmd_logfile_path, "a") if lxmd_logfile_path else None
-    if lxmd_logfile:
-        lxmd_logfile.write(f"\n=== lxmd spawn (wire_handle={wire_handle}) ===\n")
-        lxmd_logfile.flush()
-
-    def _tail_lxmd():
-        try:
-            for line in lxmd_proc.stdout:
-                line = line.rstrip("\n")
-                recent_output.append(line)
+        def _tail_lxmd():
+            try:
+                for line in lxmd_proc.stdout:
+                    line = line.rstrip("\n")
+                    recent_output.append(line)
+                    if lxmd_logfile:
+                        lxmd_logfile.write(line + "\n")
+                        lxmd_logfile.flush()
+                    # Cap the buffer at ~200 lines so a long-running test
+                    # doesn't gradually eat memory. 200 lines is plenty
+                    # for "why did lxmd fail to start" diagnostics.
+                    if len(recent_output) > 200:
+                        del recent_output[:50]
+                    if prop_dest_hex[0] is None:
+                        m = _LXMD_PROP_DEST_RE.search(line)
+                        if m:
+                            prop_dest_hex[0] = m.group(1)
+                            started_event.set()
+            finally:
                 if lxmd_logfile:
-                    lxmd_logfile.write(line + "\n")
-                    lxmd_logfile.flush()
-                # Cap the buffer at ~200 lines so a long-running test
-                # doesn't gradually eat memory. 200 lines is plenty
-                # for "why did lxmd fail to start" diagnostics.
-                if len(recent_output) > 200:
-                    del recent_output[:50]
-                if prop_dest_hex[0] is None:
-                    m = _LXMD_PROP_DEST_RE.search(line)
-                    if m:
-                        prop_dest_hex[0] = m.group(1)
-                        started_event.set()
-        finally:
-            if lxmd_logfile:
-                try:
-                    lxmd_logfile.close()
-                except Exception:
-                    pass
-            reader_done.set()
+                    try:
+                        lxmd_logfile.close()
+                    except Exception:
+                        pass
+                reader_done.set()
 
-    # Thread start is the only place _tail_lxmd.finally runs, and that's
-    # the only place lxmd_logfile is closed. If Thread.start itself raises
-    # (OS thread-limit, memory pressure), _tail_lxmd never runs and the
-    # logfile leaks. Also handle lxmd_proc in the same guard so a thread-
-    # start failure doesn't leak the subprocess pipe either.
-    reader_thread = threading.Thread(
-        target=_tail_lxmd, name=f"lxmd-tail-{wire_handle}", daemon=True
-    )
-    try:
+        reader_thread = threading.Thread(
+            target=_tail_lxmd, name=f"lxmd-tail-{wire_handle}", daemon=True
+        )
         reader_thread.start()
     except Exception:
-        if lxmd_logfile:
+        # Reverse-unwind: file handle → subprocess → tempdir. Each step
+        # is idempotent on None so the guard works at any failure point.
+        if lxmd_logfile is not None:
             try:
                 lxmd_logfile.close()
             except Exception:
                 pass
-        _terminate_lxmd(lxmd_proc)
+        if lxmd_proc is not None:
+            _terminate_lxmd(lxmd_proc)
         _cleanup_lxmd_dir(lxmd_config_dir)
         raise
 
@@ -459,6 +465,21 @@ def cmd_lxmf_spawn_daemon_propagation_node(params):
         app_data = RNS.Identity.recall_app_data(prop_dest_bytes)
         if app_data:
             cfg = msgpack.unpackb(app_data)
+            # Schema reference (LXMF/LXMRouter.py get_propagation_node_app_data):
+            #   cfg[0] = legacy LXMF PN support (bool)
+            #   cfg[1] = node timebase (int epoch)
+            #   cfg[2] = propagation node state (bool)
+            #   cfg[3] = per-transfer limit (kB)
+            #   cfg[4] = per-sync limit
+            #   cfg[5] = [propagation_stamp_cost, flexibility, peering_cost]
+            #   cfg[6] = metadata dict
+            # cfg[5][0] is the advertised stamp cost. If LXMF changes this
+            # layout, the broad except below catches the resulting
+            # IndexError / TypeError and falls back to PROPAGATION_COST
+            # (16) — which remains the correct tests-default, but means a
+            # schema drift goes undetected rather than surfacing as an
+            # error. Re-audit against LXMRouter.get_propagation_node_app_data
+            # when bumping the pinned LXMF version.
             stamp_cost = int(cfg[5][0])
     except Exception:
         pass  # fall through to the default

@@ -204,8 +204,10 @@ def test_link_data_roundtrip_multiple_packets(wire_trio, wire_3peer):
     received = receiver.link_poll(dest_hash, timeout_ms=_POLL_TIMEOUT_MS)
     # Order of reception isn't strictly guaranteed for link data across a
     # transport (it usually is, but we avoid asserting an invariant the
-    # protocol doesn't make), so compare as sets.
-    assert set(received) == set(payloads), (
+    # protocol doesn't make), so compare as sets. Include a length guard
+    # so a duplicate of one payload + a drop of another doesn't silently
+    # satisfy a set-equality check.
+    assert len(received) == len(payloads) and set(received) == set(payloads), (
         f"{receiver.role_label} got {len(received)} packets from "
         f"{sender.role_label} (expected {len(payloads)}). "
         f"Missing: {set(payloads) - set(received)!r}. "

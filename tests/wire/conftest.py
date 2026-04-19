@@ -40,13 +40,16 @@ def _env_for(impl: str) -> dict:
 
 
 def pytest_generate_tests(metafunc):
-    """Parametrize wire tests over EVERY (server_impl, client_impl) pair.
+    """Parametrize wire tests over EVERY (server_impl, client_impl) pair
+    for 2-peer fixtures, and EVERY (sender, transport, receiver) triple
+    for 3-peer fixtures.
 
-    For impls ["reference", "kotlin"] that's 4 pairs per test. The
-    homogeneous pairs (reference↔reference, kotlin↔kotlin) are useful
-    smoke tests: they isolate whether a failure is interop-specific vs.
-    just broken end-to-end on one side. The heterogeneous pairs are the
-    real cross-impl assertion.
+    For impls ["reference", "kotlin"] that's 4 pairs / 8 triples per test.
+    The homogeneous combos (reference-only, kotlin-only) are sanity
+    baselines — they isolate "is anything broken end-to-end on one side"
+    from "is interop broken". The heterogeneous combos (e.g.
+    kotlin → reference → reference) are the real cross-impl assertions;
+    that specific triple is the Columba → rnsd → Sideband topology.
     """
     if "wire_pair" in metafunc.fixturenames:
         impls = get_impl_list(metafunc.config) or []
@@ -57,6 +60,8 @@ def pytest_generate_tests(metafunc):
         pairs = [(a, b) for a in peers for b in peers]
         ids = [f"{a}-to-{b}" for a, b in pairs]
         metafunc.parametrize("wire_pair", pairs, ids=ids, scope="function")
+
+    _parametrize_wire_trio(metafunc)
 
 
 class _WirePeer:
@@ -185,7 +190,7 @@ def wire_pair(request):
     return request.param
 
 
-def _parametrize_wire_trio(metafunc, param_name="wire_trio"):
+def _parametrize_wire_trio(metafunc):
     """Parametrize 3-peer multi-hop tests.
 
     Each test runs with (sender_impl, transport_impl, receiver_impl).
@@ -195,25 +200,13 @@ def _parametrize_wire_trio(metafunc, param_name="wire_trio"):
     to a Python receiver — reproducing what Columba does over rnsd
     to Sideband.
     """
-    if param_name not in metafunc.fixturenames:
+    if "wire_trio" not in metafunc.fixturenames:
         return
     impls = get_impl_list(metafunc.config) or []
     peers = sorted(set(impls) | {"reference"})
     trios = [(a, b, c) for a in peers for b in peers for c in peers]
     ids = [f"{a}->{b}->{c}" for a, b, c in trios]
-    metafunc.parametrize(param_name, trios, ids=ids, scope="function")
-
-
-# Extend the module-level generator so both wire_pair and wire_trio are
-# parametrized when their fixtures are in use. pytest only recognizes
-# the canonical `pytest_generate_tests` name as a hook, so the trio
-# helper is dispatched from inside it rather than declared separately.
-_pytest_generate_tests_pair_only = pytest_generate_tests
-
-
-def pytest_generate_tests(metafunc):
-    _pytest_generate_tests_pair_only(metafunc)
-    _parametrize_wire_trio(metafunc)
+    metafunc.parametrize("wire_trio", trios, ids=ids, scope="function")
 
 
 @pytest.fixture

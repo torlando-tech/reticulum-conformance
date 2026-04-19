@@ -396,20 +396,36 @@ def cmd_wire_link_open(params):
         closed_reason[0] = getattr(link, "teardown_reason", "unknown")
         established.set()  # unblock the wait regardless of outcome
 
-    link = RNS.Link(out_destination)
-    link.set_link_established_callback(on_established)
-    link.set_link_closed_callback(on_closed)
+    # Pass callbacks at construction time so they're wired up before RNS's
+    # background handshake thread can dispatch them — otherwise an immediate
+    # reject (which can happen on fast loopback) would never be observed.
+    link = RNS.Link(
+        out_destination,
+        established_callback=on_established,
+        closed_callback=on_closed,
+    )
 
-    if not established.wait(timeout=timeout_ms / 1000.0):
-        raise TimeoutError(
-            f"Link to {destination_hash.hex()} did not become active within "
-            f"{timeout_ms}ms (teardown_reason={closed_reason[0]})"
-        )
-    if getattr(link, "status", None) != RNS.Link.ACTIVE:
-        raise RuntimeError(
-            f"Link to {destination_hash.hex()} closed before becoming active "
-            f"(teardown_reason={closed_reason[0]}, status={getattr(link, 'status', None)})"
-        )
+    try:
+        if not established.wait(timeout=timeout_ms / 1000.0):
+            raise TimeoutError(
+                f"Link to {destination_hash.hex()} did not become active within "
+                f"{timeout_ms}ms (teardown_reason={closed_reason[0]})"
+            )
+        if getattr(link, "status", None) != RNS.Link.ACTIVE:
+            raise RuntimeError(
+                f"Link to {destination_hash.hex()} closed before becoming active "
+                f"(teardown_reason={closed_reason[0]}, status={getattr(link, 'status', None)})"
+            )
+    except BaseException:
+        # Tear down on any failure path so the link doesn't linger in
+        # Transport's link_table for the rest of the bridge process's
+        # lifetime — otherwise a retry for the same destination would
+        # create a second concurrent Link and confuse RNS's path lookup.
+        try:
+            link.teardown()
+        except Exception:
+            pass
+        raise
 
     inst.setdefault("out_links", {})[link.link_id] = link
     return {"link_id": link.link_id.hex()}

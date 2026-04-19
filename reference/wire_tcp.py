@@ -293,6 +293,208 @@ def cmd_wire_poll_path(params):
     return {"found": False, "hops": None}
 
 
+def cmd_wire_listen(params):
+    """Register an IN SINGLE destination that accepts incoming Links.
+
+    On link establishment, attach a packet callback that buffers received
+    bytes into an in-memory queue keyed by destination_hash. Tests poll
+    via wire_link_poll.
+
+    Intended for the receiver-side peer in multi-hop link tests. The
+    sender uses wire_link_open (below) to establish the link.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity,
+        RNS.Destination.IN,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    # Per-destination receive buffer: list of raw bytes, appended on each
+    # link-data callback. Protected by the instance's own state lock.
+    recv_buffer = []
+    recv_lock = threading.Lock()
+
+    def on_link_established(link):
+        def on_packet(message, packet):
+            with recv_lock:
+                recv_buffer.append(bytes(message))
+        link.set_packet_callback(on_packet)
+
+    destination.set_link_established_callback(on_link_established)
+
+    # Announce immediately so the sender can learn a path via the transport.
+    destination.announce()
+
+    inst.setdefault("listeners", {})[destination.hash] = {
+        "destination": destination,
+        "identity": identity,
+        "recv_buffer": recv_buffer,
+        "recv_lock": recv_lock,
+    }
+    # Keep strong reference so it isn't garbage collected.
+    inst["destinations"].append((identity, destination))
+
+    return {
+        "destination_hash": destination.hash.hex(),
+        "identity_hash": identity.hash.hex(),
+    }
+
+
+def cmd_wire_link_open(params):
+    """Open an outbound Link to a remote IN destination and wait for active.
+
+    Requires the remote's identity to be known (via a received announce).
+    Returns only after the link reaches ACTIVE state, or raises on timeout.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    timeout_ms = int(params.get("timeout_ms", 10000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    established = threading.Event()
+    closed_reason = [None]
+
+    def on_established(_link):
+        established.set()
+
+    def on_closed(link):
+        closed_reason[0] = getattr(link, "teardown_reason", "unknown")
+        established.set()  # unblock the wait regardless of outcome
+
+    # Pass callbacks at construction time so they're wired up before RNS's
+    # background handshake thread can dispatch them — otherwise an immediate
+    # reject (which can happen on fast loopback) would never be observed.
+    link = RNS.Link(
+        out_destination,
+        established_callback=on_established,
+        closed_callback=on_closed,
+    )
+
+    try:
+        if not established.wait(timeout=timeout_ms / 1000.0):
+            raise TimeoutError(
+                f"Link to {destination_hash.hex()} did not become active within "
+                f"{timeout_ms}ms (teardown_reason={closed_reason[0]})"
+            )
+        if getattr(link, "status", None) != RNS.Link.ACTIVE:
+            raise RuntimeError(
+                f"Link to {destination_hash.hex()} closed before becoming active "
+                f"(teardown_reason={closed_reason[0]}, status={getattr(link, 'status', None)})"
+            )
+    except BaseException:
+        # Tear down on any failure path so the link doesn't linger in
+        # Transport's link_table for the rest of the bridge process's
+        # lifetime — otherwise a retry for the same destination would
+        # create a second concurrent Link and confuse RNS's path lookup.
+        try:
+            link.teardown()
+        except Exception:
+            pass
+        raise
+
+    inst.setdefault("out_links", {})[link.link_id] = link
+    return {"link_id": link.link_id.hex()}
+
+
+def cmd_wire_link_send(params):
+    """Send bytes over an established outbound Link.
+
+    Python RNS doesn't expose `link.send(data)` directly — arbitrary
+    link data is sent by constructing a Packet whose destination is
+    the Link object itself and calling its .send(). That's the same
+    path link.send_keepalive and link.send_request use internally.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    packet = RNS.Packet(link, payload)
+    packet.send()
+    return {"sent": True}
+
+
+def cmd_wire_link_poll(params):
+    """Poll the receive buffer for a listening destination.
+
+    Returns all packets received since the last poll (drained). Blocks up
+    to timeout_ms waiting for at least one packet; returns whatever is
+    present at deadline even if empty.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        with listener["recv_lock"]:
+            if listener["recv_buffer"]:
+                out = [p.hex() for p in listener["recv_buffer"]]
+                listener["recv_buffer"].clear()
+                return {"packets": out}
+        time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        out = [p.hex() for p in listener["recv_buffer"]]
+        listener["recv_buffer"].clear()
+    return {"packets": out}
+
+
 def cmd_wire_stop(params):
     """Release resources for a wire-mode instance handle.
 
@@ -319,5 +521,9 @@ WIRE_COMMANDS = {
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
+    "wire_listen": cmd_wire_listen,
+    "wire_link_open": cmd_wire_link_open,
+    "wire_link_send": cmd_wire_link_send,
+    "wire_link_poll": cmd_wire_link_poll,
     "wire_stop": cmd_wire_stop,
 }

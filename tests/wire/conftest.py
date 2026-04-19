@@ -40,13 +40,16 @@ def _env_for(impl: str) -> dict:
 
 
 def pytest_generate_tests(metafunc):
-    """Parametrize wire tests over EVERY (server_impl, client_impl) pair.
+    """Parametrize wire tests over EVERY (server_impl, client_impl) pair
+    for 2-peer fixtures, and EVERY (sender, transport, receiver) triple
+    for 3-peer fixtures.
 
-    For impls ["reference", "kotlin"] that's 4 pairs per test. The
-    homogeneous pairs (reference↔reference, kotlin↔kotlin) are useful
-    smoke tests: they isolate whether a failure is interop-specific vs.
-    just broken end-to-end on one side. The heterogeneous pairs are the
-    real cross-impl assertion.
+    For impls ["reference", "kotlin"] that's 4 pairs / 8 triples per test.
+    The homogeneous combos (reference-only, kotlin-only) are sanity
+    baselines — they isolate "is anything broken end-to-end on one side"
+    from "is interop broken". The heterogeneous combos (e.g.
+    kotlin → reference → reference) are the real cross-impl assertions;
+    that specific triple is the Columba → rnsd → Sideband topology.
     """
     if "wire_pair" in metafunc.fixturenames:
         impls = get_impl_list(metafunc.config) or []
@@ -57,6 +60,8 @@ def pytest_generate_tests(metafunc):
         pairs = [(a, b) for a in peers for b in peers]
         ids = [f"{a}-to-{b}" for a, b in pairs]
         metafunc.parametrize("wire_pair", pairs, ids=ids, scope="function")
+
+    _parametrize_wire_trio(metafunc)
 
 
 class _WirePeer:
@@ -119,6 +124,56 @@ class _WirePeer:
         )
         return bool(resp.get("found"))
 
+    def listen(self, app_name: str, aspects: list) -> bytes:
+        """Register an IN destination that accepts incoming Links."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_listen",
+            handle=self.handle,
+            app_name=app_name,
+            aspects=list(aspects),
+        )
+        return bytes.fromhex(resp["destination_hash"])
+
+    def link_open(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        timeout_ms: int = 10000,
+    ) -> bytes:
+        """Open an outbound Link to a remote IN destination."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_link_open",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            timeout_ms=timeout_ms,
+        )
+        return bytes.fromhex(resp["link_id"])
+
+    def link_send(self, link_id: bytes, data: bytes):
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_link_send",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+        )
+
+    def link_poll(self, destination_hash: bytes, timeout_ms: int = 5000) -> list:
+        """Drain all link data received on `destination_hash` since last poll."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_link_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("packets", [])]
+
     def stop(self):
         if self.handle is None:
             return
@@ -133,6 +188,77 @@ class _WirePeer:
 def wire_pair(request):
     """Return (server_impl, client_impl) tuple from pytest_generate_tests."""
     return request.param
+
+
+def _parametrize_wire_trio(metafunc):
+    """Parametrize 3-peer multi-hop tests.
+
+    Each test runs with (sender_impl, transport_impl, receiver_impl).
+    The homogeneous reference-only triple is the sanity baseline; the
+    (kotlin, reference, reference) case is the diagnostic topology
+    where a Kotlin sender routes link data through a Python transport
+    to a Python receiver — reproducing what Columba does over rnsd
+    to Sideband.
+    """
+    if "wire_trio" not in metafunc.fixturenames:
+        return
+    impls = get_impl_list(metafunc.config) or []
+    peers = sorted(set(impls) | {"reference"})
+    trios = [(a, b, c) for a in peers for b in peers for c in peers]
+    ids = [f"{a}->{b}->{c}" for a, b, c in trios]
+    metafunc.parametrize("wire_trio", trios, ids=ids, scope="function")
+
+
+@pytest.fixture
+def wire_trio(request):
+    """(sender_impl, transport_impl, receiver_impl) from parametrization."""
+    return request.param
+
+
+@pytest.fixture
+def wire_3peer(wire_trio):
+    """Three freshly-spawned bridge subprocesses arranged as
+    sender → transport → receiver.
+
+    Topology:
+
+        sender (TCPClient)                 receiver (TCPClient)
+               \\                                 /
+                `----> transport (TCPServer) <---'
+                       enable_transport=True
+
+    The transport is the only peer that listens; the other two connect
+    outbound to its port. Both sender and receiver share the transport
+    as their only interface, so any packet from sender to receiver must
+    cross the transport, making this the minimum topology for a
+    multi-hop test.
+
+    Yields (sender, transport, receiver) as `_WirePeer` objects. Caller
+    sets up any listeners/announces/links they need.
+    """
+    sender_impl, transport_impl, receiver_impl = wire_trio
+    bridges = [
+        BridgeClient(resolve_command(sender_impl), env=_env_for(sender_impl)),
+        BridgeClient(resolve_command(transport_impl), env=_env_for(transport_impl)),
+        BridgeClient(resolve_command(receiver_impl), env=_env_for(receiver_impl)),
+    ]
+    sender = _WirePeer(bridges[0], role_label=f"sender({sender_impl})")
+    transport = _WirePeer(bridges[1], role_label=f"transport({transport_impl})")
+    receiver = _WirePeer(bridges[2], role_label=f"receiver({receiver_impl})")
+
+    try:
+        yield sender, transport, receiver
+    finally:
+        for peer in (sender, transport, receiver):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
 
 
 @pytest.fixture

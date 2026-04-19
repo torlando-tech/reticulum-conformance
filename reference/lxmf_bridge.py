@@ -681,8 +681,15 @@ def cmd_lxmf_send_propagated(params):
             f"Failed to generate propagation stamp for {message.transient_id!r} "
             f"at cost {target_cost}. LXStamper.generate_stamp returned None."
         )
+    # LXMF's get_propagation_stamp already sets propagation_stamp and
+    # propagation_stamp_valid on the success path (LXMessage.py:352-354),
+    # so these two assignments are defensive-redundant. Kept for clarity
+    # and to guard against any future LXMF change that moves the write.
     message.propagation_stamp = generated_stamp
     message.propagation_stamp_valid = True
+    # defer_stamp / defer_propagation_stamp ARE read by handle_outbound
+    # (LXMRouter.py:1669, 1673) — the whole point of this function is
+    # to force the non-deferred path. These assignments are load-bearing.
     message.defer_stamp = False
     message.defer_propagation_stamp = False
     # pack() must be re-run after the stamp is attached (LXMessage.pack
@@ -797,6 +804,26 @@ def cmd_lxmf_sync_inbound(params):
 
     final_state = router.propagation_transfer_state
     last_result = int(router.propagation_transfer_last_result or 0)
+
+    # Preserve the "blocks until callbacks have fired" guarantee even on
+    # the timeout path. Scenario this closes: transfer reaches PR_COMPLETE
+    # at second 14.99 of a 15s timeout, callback hasn't fired yet, the
+    # outer `while time.time() < deadline` expires — without this guard,
+    # sync_inbound would return messages_received=1 while poll_inbox sees
+    # an empty list, causing a confusing "sync says 1, inbox is 0"
+    # mismatch downstream. Use a short post-loop spin bounded to 500ms so
+    # a genuine transfer failure still returns within 15.5s instead of
+    # stretching further toward 30s.
+    expected_inbox_size = inbox_size_before + last_result
+    with inst["inbox_lock"]:
+        current_inbox_size = len(inst["inbox"])
+    if current_inbox_size < expected_inbox_size:
+        spin_deadline = time.time() + 0.5
+        while time.time() < spin_deadline:
+            time.sleep(0.05)
+            with inst["inbox_lock"]:
+                if len(inst["inbox"]) >= expected_inbox_size:
+                    break
 
     return {
         "messages_received": last_result,

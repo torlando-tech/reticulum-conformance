@@ -187,11 +187,9 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     carrying images is IFAC-protected (network_name + passphrase set).
 
     This is the bug that shows up in production for Columba image
-    sends. Every Kotlin-involved topology currently fails. Marked
-    xfail until a reticulum-kt fix lands that correctly interleaves
-    Resource chunk masking with back-to-back send.
+    sends.
     """
-    _xfail_kotlin_anywhere_ifac(wire_trio)
+    _xfail_kotlin_receiver(wire_trio, " with IFAC")
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(
         wire_3peer, ifac=True
     )

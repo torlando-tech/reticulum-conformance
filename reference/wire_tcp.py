@@ -13,14 +13,34 @@ This module covers the layer above: full packet flow through a real RNS
 instance and real TCP framing, reproducing the issue-#29 symptom end-to-end.
 
 Commands:
-  wire_start_tcp_server(network_name, passphrase, bind_port=0)
+  wire_start_tcp_server(network_name, passphrase, bind_port=0, mode=None)
     -> {handle, port, identity_hash}
-  wire_start_tcp_client(network_name, passphrase, target_host, target_port)
+  wire_start_tcp_client(network_name, passphrase, target_host, target_port, mode=None)
     -> {handle, identity_hash}
+  wire_set_interface_mode(handle, mode) -> {mode: str}
+    Runtime mutation of the configured interface's mode (and its
+    spawned children). Prefer the `mode=` param of wire_start_* when
+    possible — that avoids a race between startup and first packet.
   wire_announce(handle, app_name, aspects=[], app_data="")
     -> {destination_hash, identity_hash}
   wire_poll_path(handle, destination_hash, timeout_ms=5000)
     -> {found: bool, hops: int | None}
+  wire_request_path(handle, destination_hash) -> {sent: bool}
+    Fire a path-request packet for dest_hash immediately (no early-skip
+    guards), matching RNS.Transport.request_path's unconditional send.
+  wire_read_path_entry(handle, destination_hash)
+    -> {found, timestamp, expires, hops, next_hop, receiving_interface_name}
+    Read the local path_table entry. timestamp/expires are milliseconds-
+    since-epoch for symmetry with the Kotlin bridge.
+  wire_has_discovery_path_request(handle, destination_hash) -> {found: bool}
+    Membership test on RNS.Transport.discovery_path_requests — observable
+    proof that a mode-gated recursive forward was triggered.
+  wire_has_announce_table_entry(handle, destination_hash) -> {found: bool}
+    Membership test on RNS.Transport.announce_table — observable for
+    "a cached-announce re-emission has been scheduled".
+  wire_read_path_random_hash(handle, destination_hash)
+    -> {found: bool, random_hash: hex}
+    Extract the 10-byte random_hash segment of the cached announce.
   wire_stop(handle) -> {stopped: bool}
 
 Each bridge process hosts at most one wire RNS singleton. Attempting a second
@@ -70,6 +90,39 @@ def _allocate_free_port() -> int:
         s.close()
 
 
+_ALLOWED_INTERFACE_MODES = frozenset({
+    "full",
+    "access_point",
+    "accesspoint",
+    "ap",
+    "point_to_point",
+    "pointtopoint",
+    "ptp",
+    "roaming",
+    "boundary",
+    "gateway",
+    "gw",
+})
+
+
+def _normalize_mode(raw: str | None) -> str | None:
+    """Normalize a free-form mode string to Python RNS's config-recognized
+    synonyms. Returns None if the input was empty / unset.
+
+    Raises ValueError for a non-empty value that isn't in the accepted set —
+    silently falling back to FULL on typos would make a test that expected
+    ROAMING semantics pass vacuously under FULL behavior.
+    """
+    if raw is None:
+        return None
+    s = raw.strip().lower()
+    if not s:
+        return None
+    if s not in _ALLOWED_INTERFACE_MODES:
+        raise ValueError(f"Unknown interface mode: {raw!r}")
+    return s
+
+
 def _write_ifac_ini(
     config_dir: str,
     iface_name: str,
@@ -78,6 +131,7 @@ def _write_ifac_ini(
     passphrase: str,
     share_instance: bool = False,
     instance_name: str | None = None,
+    mode: str | None = None,
 ):
     """Write a minimal RNS config with a single interface.
 
@@ -101,6 +155,16 @@ def _write_ifac_ini(
         ifac_lines += f"    network_name = {network_name}\n"
     if passphrase:
         ifac_lines += f"    passphrase = {passphrase}\n"
+    if mode:
+        # Python RNS's config reader at Reticulum.py:619-647 has a bug in
+        # the `interface_mode` branch: inside `if "interface_mode" in c`,
+        # the final `elif` references `c["mode"]` (not `c["interface_mode"]`),
+        # which KeyErrors when the config only sets `interface_mode` and not
+        # `mode`. The `elif "mode" in c` fallback branch at line 634 is
+        # internally consistent, so we write `mode = <name>` to avoid the
+        # buggy code path entirely. The semantics are identical on both
+        # sides — the same MODE_* constant is assigned.
+        ifac_lines += f"    mode = {mode}\n"
 
     if share_instance and not instance_name:
         raise ValueError(
@@ -181,6 +245,7 @@ def cmd_wire_start_tcp_server(params):
     passphrase = params.get("passphrase") or ""
     bind_port = int(params.get("bind_port", 0))
     share_instance = bool(params.get("share_instance", False))
+    mode = _normalize_mode(params.get("mode"))
 
     if bind_port == 0:
         bind_port = _allocate_free_port()
@@ -204,6 +269,7 @@ def cmd_wire_start_tcp_server(params):
         passphrase,
         share_instance=share_instance,
         instance_name=instance_name if share_instance else None,
+        mode=mode,
     )
 
     RNS = _get_rns()
@@ -236,6 +302,7 @@ def cmd_wire_start_tcp_client(params):
     passphrase = params.get("passphrase") or ""
     target_host = params["target_host"]
     target_port = int(params["target_port"])
+    mode = _normalize_mode(params.get("mode"))
 
     config_dir = tempfile.mkdtemp(prefix="rns_wire_client_")
     iface_block = (
@@ -250,6 +317,7 @@ def cmd_wire_start_tcp_client(params):
         iface_block,
         network_name,
         passphrase,
+        mode=mode,
     )
 
     RNS = _get_rns()
@@ -667,6 +735,301 @@ def cmd_wire_link_poll(params):
     return {"packets": out}
 
 
+def _mode_string_to_int(mode: str):
+    """Map a config-string mode to an RNS.Interfaces.Interface.MODE_* int.
+
+    Python RNS's config parser does this same mapping in Reticulum.py:619-647;
+    reproduced here so `wire_set_interface_mode` can mutate a running
+    interface's mode field (which is an int constant, not a string).
+    """
+    RNS = _get_rns()
+    IM = RNS.Interfaces.Interface.Interface
+    mapping = {
+        "full": IM.MODE_FULL,
+        "access_point": IM.MODE_ACCESS_POINT,
+        "accesspoint": IM.MODE_ACCESS_POINT,
+        "ap": IM.MODE_ACCESS_POINT,
+        "point_to_point": IM.MODE_POINT_TO_POINT,
+        "pointtopoint": IM.MODE_POINT_TO_POINT,
+        "ptp": IM.MODE_POINT_TO_POINT,
+        "roaming": IM.MODE_ROAMING,
+        "boundary": IM.MODE_BOUNDARY,
+        "gateway": IM.MODE_GATEWAY,
+        "gw": IM.MODE_GATEWAY,
+    }
+    return mapping[mode]
+
+
+def _interfaces_matching_handle(rns, role: str):
+    """Return the live RNS.Transport.interfaces entries that belong to this
+    bridge's wire handle.
+
+    A bridge process hosts at most one wire RNS singleton with exactly one
+    configured interface (TCPServerInterface or TCPClientInterface) — plus
+    any spawned children. This returns the configured interface AND all of
+    its spawned children so `wire_set_interface_mode` can mutate every
+    relevant mode field in one call (matching the Kotlin bridge's
+    symmetric propagation to spawnedInterfaces).
+
+    Python's `str(iface)` returns "TCPServerInterface[<name>/<addr>:<port>]"
+    and the spawned child's `.name` is "Client on <parent name>". Match by
+    the `.name` attribute directly — `str(iface)` wraps the name in a
+    class-prefixed + address-suffixed form that breaks string prefix
+    matching.
+    """
+    RNS = _get_rns()
+    results = []
+    for iface in list(RNS.Transport.interfaces):
+        iface_name = getattr(iface, "name", "") or ""
+        # Primary interface names set by cmd_wire_start_* are exactly
+        # "Wire TCP Server" or "Wire TCP Client" (see the `iface_name`
+        # argument to _write_ifac_ini). Spawned children (Python only:
+        # TCPInterface.py:586) are named "Client on <parent.name>".
+        if iface_name == "Wire TCP Server" or iface_name == "Wire TCP Client":
+            results.append(iface)
+            continue
+        parent = getattr(iface, "parent_interface", None)
+        parent_name = getattr(parent, "name", "") if parent is not None else ""
+        if parent_name in ("Wire TCP Server", "Wire TCP Client"):
+            results.append(iface)
+    return results
+
+
+def cmd_wire_set_interface_mode(params):
+    """Runtime-mutate the mode of this bridge's configured wire interface.
+
+    Preferred usage is to set the mode at `wire_start_tcp_*` time via the
+    `mode` parameter (which lands in the config file before the interface
+    starts). This command exists for tests that need to flip a mode after
+    startup — e.g., to exercise a transition.
+
+    Propagates to spawned child interfaces so that `receiving_interface`
+    for already-established peer connections also reports the new mode.
+    """
+    handle = params["handle"]
+    mode_str = _normalize_mode(params["mode"])
+    if mode_str is None:
+        raise ValueError("mode parameter is required and must be non-empty")
+    mode_int = _mode_string_to_int(mode_str)
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    ifaces = _interfaces_matching_handle(inst["rns"], inst["role"])
+    if not ifaces:
+        raise RuntimeError(
+            f"No live interfaces found for handle {handle} "
+            f"(role={inst['role']}); cannot apply mode"
+        )
+    for iface in ifaces:
+        iface.mode = mode_int
+
+    return {"mode": mode_str}
+
+
+def cmd_wire_request_path(params):
+    """Send a raw path-request packet for `destination_hash`.
+
+    Thin synchronous wrapper around RNS.Transport.request_path. Unlike the
+    Kotlin `Transport.requestPath` which has `hasPath` / `too recent`
+    guards, Python's `request_path` sends unconditionally — matching this
+    command's contract of "always emit a packet on the wire".
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS.Transport.request_path(destination_hash)
+    return {"sent": True}
+
+
+def cmd_wire_read_path_entry(params):
+    """Return the path_table entry for `destination_hash`, or found=False.
+
+    Fields mirror Python's IDX_PT_* layout, converted to the same field
+    names the Kotlin bridge uses:
+      timestamp, expires (both in milliseconds since epoch for cross-impl
+      symmetry), hops, next_hop (hex), receiving_interface_name.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    entry = RNS.Transport.path_table.get(destination_hash)
+    if entry is None:
+        return {"found": False}
+
+    # IDX_PT_TIMESTAMP = 0, IDX_PT_NEXT_HOP = 1, IDX_PT_HOPS = 2,
+    # IDX_PT_EXPIRES = 3, IDX_PT_RANDBLOBS = 4, IDX_PT_RVCD_IF = 5,
+    # IDX_PT_PACKET = 6 — see Transport.py:3274-3280.
+    timestamp_sec = entry[0]
+    next_hop = entry[1]
+    hops = entry[2]
+    expires_sec = entry[3]
+    rvcd_if = entry[5]
+
+    iface_name = str(rvcd_if) if rvcd_if is not None else None
+    return {
+        "found": True,
+        # Python stores seconds-since-epoch floats; Kotlin stores
+        # milliseconds-since-epoch longs. Normalize to ms here so the
+        # cross-impl tests can compare expires - timestamp in the same
+        # unit on both sides.
+        "timestamp": int(timestamp_sec * 1000),
+        "expires": int(expires_sec * 1000),
+        "hops": int(hops),
+        "next_hop": next_hop.hex() if next_hop is not None else "",
+        "receiving_interface_name": iface_name,
+    }
+
+
+def cmd_wire_has_discovery_path_request(params):
+    """Observable: has this transport forwarded a path request for dest?
+
+    Exposes RNS.Transport.discovery_path_requests[dest] membership as a
+    boolean so `test_discover_paths_for_mode_gating` can assert whether
+    the interface's mode triggered the recursive-forwarding branch.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    return {
+        "found": destination_hash in RNS.Transport.discovery_path_requests,
+    }
+
+
+def cmd_wire_has_announce_table_entry(params):
+    """Membership test on `RNS.Transport.announce_table[dest]`.
+
+    Path-request answering enqueues the cached announce into
+    announce_table (Transport.py:2781) for re-transmission after
+    PATH_REQUEST_GRACE. Absence immediately after a PR is the observable
+    for "this transport refused to answer" (e.g., ROAMING loop-
+    prevention, Transport.py:2731).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    return {"found": destination_hash in RNS.Transport.announce_table}
+
+
+def cmd_wire_tx_bytes(params):
+    """Return sum of TX bytes across this bridge's configured interface
+    and spawned children.
+
+    Used as a model-agnostic "did this peer emit any wire traffic"
+    signal for tests where introspecting internal announce_table /
+    held_announces timing is impl-sensitive (Kotlin and Python restore
+    held_announces entries at different points in the PR-answer flow,
+    so a timestamp-based observable is unreliable across impls).
+    """
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    ifaces = _interfaces_matching_handle(inst["rns"], inst["role"])
+    total = sum(getattr(iface, "txb", 0) for iface in ifaces)
+    return {"tx_bytes": int(total)}
+
+
+def cmd_wire_read_announce_table_timestamp(params):
+    """Return the `timestamp` field of RNS.Transport.announce_table[dest]
+    as ms-since-epoch, or found=False.
+
+    Unlike `wire_has_announce_table_entry` (pure membership), the
+    timestamp lets tests distinguish "entry is the ORIGINAL announce
+    rebroadcast slot that's still being retried" from "entry was
+    REPLACED by a path-request answer". The path_request answering
+    path inserts a fresh entry (Transport.py:2781) with `now` in the
+    timestamp slot; unchanged timestamp means the PR's answer path
+    was skipped (e.g., ROAMING loop-prevention).
+
+    Python stores seconds-since-epoch floats; we scale to ms to match
+    the Kotlin bridge's return type and `read_path_entry` convention.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    entry = RNS.Transport.announce_table.get(destination_hash)
+    if entry is None:
+        return {"found": False}
+    # IDX_AT_TIMESTAMP = 0 (Transport.py:1755)
+    return {"found": True, "timestamp": int(entry[0] * 1000)}
+
+
+def cmd_wire_read_path_random_hash(params):
+    """Extract the 10-byte random_hash from the cached announce packet
+    stored against this destination's path entry.
+
+    Proves cached-announce byte-identity for `test_path_response_reuses_
+    cached_announce`: when B re-emits a cached announce in response to a
+    path request, the random_hash bytes in the re-emitted announce MUST
+    be the same bytes that were in the original announce — any
+    regeneration would replace them with fresh random + fresh timestamp.
+
+    Announce data layout (Identity.py, Destination.py):
+      public_key[0:64] + name_hash[64:74] + random_hash[74:84] + ...
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    entry = RNS.Transport.path_table.get(destination_hash)
+    if entry is None:
+        return {"found": False}
+
+    packet_hash = entry[6]  # IDX_PT_PACKET
+    packet = RNS.Transport.get_cached_packet(packet_hash, packet_type="announce")
+    if packet is None:
+        return {"found": False}
+    packet.unpack()
+    data = packet.data
+    if len(data) < 84:
+        raise RuntimeError(
+            f"Cached announce data too short ({len(data)} < 84) for "
+            f"{destination_hash.hex()}"
+        )
+    random_hash = data[74:84]
+    return {"found": True, "random_hash": random_hash.hex()}
+
+
 def cmd_wire_stop(params):
     """Release resources for a wire-mode instance handle.
 
@@ -691,8 +1054,16 @@ def cmd_wire_stop(params):
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
+    "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
+    "wire_request_path": cmd_wire_request_path,
+    "wire_read_path_entry": cmd_wire_read_path_entry,
+    "wire_has_discovery_path_request": cmd_wire_has_discovery_path_request,
+    "wire_has_announce_table_entry": cmd_wire_has_announce_table_entry,
+    "wire_read_announce_table_timestamp": cmd_wire_read_announce_table_timestamp,
+    "wire_tx_bytes": cmd_wire_tx_bytes,
+    "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
     "wire_listen": cmd_wire_listen,
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,

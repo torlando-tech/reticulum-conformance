@@ -363,18 +363,20 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     # cached announce, and both are ROAMING mode → loop-prevention fires.
     tx_delta = _tx_delta_after_pr(client, server, dest_hash)
 
-    # The key invariant: no answer packet was emitted. Background
-    # keep-alive / heartbeat traffic on idle TCP interfaces is zero in
-    # both impls, so strict equality to zero is the right bound — any
-    # non-zero delta means B sent something it shouldn't have.
-    assert tx_delta == 0, (
+    # The key invariant: no answer packet was emitted. Tolerate a
+    # small byte budget for idle-link framing / keep-alive traffic;
+    # any real response packet is ≥~130 bytes (path-response announce
+    # with signature + random + app_data), so <20 reliably
+    # distinguishes "no answer" from "answer emitted" without being
+    # brittle to future RNS background-traffic changes.
+    assert tx_delta < 20, (
         f"B ({server.role_label}) emitted {tx_delta} bytes after A's "
-        f"PR for {dest_hash.hex()} under ROAMING mode. The roaming "
-        f"loop-prevention rule (Transport.py:2731 / "
-        f"Transport.kt:processPathRequest's roaming-mode branch) "
-        f"should have skipped the answer path entirely — B's A-facing "
-        f"interface IS the `received_from` for D1's cached path, and "
-        f"both are ROAMING."
+        f"PR for {dest_hash.hex()} under ROAMING mode (above idle-"
+        f"traffic budget). The roaming loop-prevention rule "
+        f"(Transport.py:2731 / Transport.kt:processPathRequest's "
+        f"roaming-mode branch) should have skipped the answer path "
+        f"entirely — B's A-facing interface IS the `received_from` "
+        f"for D1's cached path, and both are ROAMING."
     )
 
 

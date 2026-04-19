@@ -1015,8 +1015,15 @@ def cmd_wire_read_path_random_hash(params):
     if entry is None:
         return {"found": False}
 
-    packet_hash = entry[6]  # IDX_PT_PACKET
-    packet = RNS.Transport.get_cached_packet(packet_hash, packet_type="announce")
+    # IDX_PT_PACKET is a misleading constant name upstream: entry[6]
+    # stores the announce's *packet hash* (bytes), NOT the Packet object
+    # itself. Verified against upstream RNS.Transport.py:3027 where the
+    # same slot is extracted into a local also named `packet_hash` and
+    # passed to `get_cached_packet(...)` (which takes a hash).
+    # Using an unambiguous name here to prevent readers from assuming
+    # it's a Packet object and mis-debugging a future layout change.
+    cached_announce_hash = entry[6]  # IDX_PT_PACKET (slot name, not contents)
+    packet = RNS.Transport.get_cached_packet(cached_announce_hash, packet_type="announce")
     if packet is None:
         return {"found": False}
     packet.unpack()

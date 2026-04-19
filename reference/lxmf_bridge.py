@@ -1,4 +1,20 @@
-"""LXMF conformance commands (E2E propagation interop harness).
+"""LXMF conformance commands (E2E interop harness).
+
+Covers all three LXMF delivery methods:
+
+  - PROPAGATED: sender submits to a propagation node (real lxmd
+    subprocess), receiver pulls it down via
+    request_messages_from_propagation_node.
+  - OPPORTUNISTIC: sender unicasts a single encrypted packet; no
+    link, no node. Single-packet only (oversized content is rejected
+    up-front rather than silently upgraded to DIRECT).
+  - DIRECT: sender opens a Link to the recipient's delivery
+    destination; payloads > MDU use a Resource for multi-packet
+    chunked transfer. This is the single-hop real-time path.
+
+The OPPORTUNISTIC and DIRECT tests use a plain-transport middle peer
+(no lxmd); only PROPAGATED spins up the lxmd subprocess.
+
 
 Layered ON TOP of the wire_tcp layer. The pattern:
 
@@ -43,6 +59,77 @@ import time
 
 _instances = {}
 _instances_lock = threading.Lock()
+
+
+def _encode_field_value_for_inbox(value):
+    """Recursively convert bytes -> hex in an LXMF field value.
+
+    Why recursive: the canonical Python-LXMF FIELD_FILE_ATTACHMENTS wire
+    shape is ``[[filename_str, data_bytes], ...]`` — raw ``bytes`` buried
+    inside a list. If we only handled the top level (``isinstance(v,
+    bytes)``), a call to json.dumps() on the resulting inbox entry would
+    raise TypeError, because ``bytes`` is not JSON-serializable at any
+    depth. Mirrored in Lxmf.kt's ``lxmfFieldValueToJson`` so the two
+    impls serialize attachments identically for tight cross-impl
+    assertion.
+
+    Scalar passthrough for ints / strs / bools / floats (JSON-native).
+    """
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, (list, tuple)):
+        return [_encode_field_value_for_inbox(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _encode_field_value_for_inbox(v) for k, v in value.items()}
+    return value
+
+
+def _decode_field_value_from_params(value):
+    """Inverse of _encode_field_value_for_inbox for the send-side.
+
+    Accepted JSON shapes (matches Lxmf.kt's lxmfFieldValueFromJson):
+      - ``{"bytes": "<hex>"}``     -> bytes
+      - ``{"str": "..."}``          -> str
+      - ``{"int": 123}``            -> int
+      - ``{"bool": true}``          -> bool
+      - a JSON array                -> list (recursive)
+      - a bare JSON primitive       -> its native type (passthrough)
+
+    The explicit-tag wrapper is load-bearing for FIELD_FILE_ATTACHMENTS:
+    attachment elements are ``[filename_str, data_bytes]``, and without
+    a tag there's no way to tell "hex-encoded bytes" from a literal
+    string value. Callers that want a straight list use the array shape
+    at the outer level; the inner bytes element uses the ``{"bytes":
+    ...}`` tag.
+    """
+    if isinstance(value, dict):
+        if "bytes" in value:
+            return bytes.fromhex(value["bytes"])
+        if "str" in value:
+            return value["str"]
+        if "int" in value:
+            return int(value["int"])
+        if "bool" in value:
+            return bool(value["bool"])
+        raise ValueError(
+            f"Unsupported LXMF field object shape; expected one of "
+            f"{{bytes|str|int|bool}}: {value!r}"
+        )
+    if isinstance(value, list):
+        return [_decode_field_value_from_params(v) for v in value]
+    # Bare JSON primitives pass through as-is.
+    return value
+
+
+def _decode_fields_param(fields_param):
+    """Convert the JSON ``fields`` dict (str keys -> tagged values) into
+    the ``dict[int, Any]`` shape LXMessage expects."""
+    if not fields_param:
+        return {}
+    decoded = {}
+    for k, v in fields_param.items():
+        decoded[int(k)] = _decode_field_value_from_params(v)
+    return decoded
 
 
 def _get_rns():
@@ -160,11 +247,16 @@ def cmd_lxmf_start(params):
                 else (message.content or "")
             ),
         }
-        # Fields are opaque bytes/values; serialize them as hex for bytes
-        # and keep primitives as-is so tests can assert on them directly.
+        # Fields may contain NESTED bytes — the canonical
+        # FIELD_FILE_ATTACHMENTS shape is [[filename_str, data_bytes]].
+        # json.dumps() raises TypeError on raw bytes at any nesting level,
+        # so we must recursively convert bytes -> hex anywhere inside a
+        # list/tuple/dict value. Mirrors the Kotlin bridge's
+        # lxmfFieldValueToJson so both impls serialize attachments
+        # identically for tight cross-impl assertion.
         fields = {}
         for k, v in (getattr(message, "fields", None) or {}).items():
-            fields[str(k)] = v.hex() if isinstance(v, bytes) else v
+            fields[str(k)] = _encode_field_value_for_inbox(v)
         entry["fields"] = fields
         with inbox_lock:
             inbox.append(entry)
@@ -705,6 +797,165 @@ def cmd_lxmf_send_propagated(params):
     }
 
 
+def cmd_lxmf_send_opportunistic(params):
+    """Build + submit an LXMessage with OPPORTUNISTIC delivery.
+
+    Single-packet unicast over any available interface — no link
+    setup, no propagation node, no stamp. Oversized content fails
+    up-front rather than silently upgrading to DIRECT; the
+    conformance suite keeps opportunistic tests single-packet and
+    treats any upgrade as a distinct class of test (deferred).
+
+    params:
+        handle (str): lxmf_start handle for the sender.
+        recipient_delivery_dest_hash (hex): recipient's delivery hash.
+        content (str): UTF-8 message content.
+        title (str, optional): UTF-8 title, defaults to "".
+        fields (dict[str,Any], optional): int-keyed (as str) fields.
+            Values use the tagged-dict shape described in
+            _decode_field_value_from_params. Keep payload small —
+            LXMF will fall back to DIRECT for content + fields that
+            exceed LXMF.LXMessage.ENCRYPTED_PACKET_MAX_CONTENT and
+            we reject that up-front.
+
+    Returns:
+        message_hash (hex): LXMessage hash.
+    """
+    handle = params["handle"]
+    recipient_hash_hex = params["recipient_delivery_dest_hash"]
+    content = params["content"]
+    title = params.get("title", "")
+    fields = _decode_fields_param(params.get("fields"))
+
+    recipient_hash = bytes.fromhex(recipient_hash_hex)
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS = _get_rns()
+    LXMF = _get_lxmf()
+
+    recipient_identity = RNS.Identity.recall(recipient_hash)
+    if recipient_identity is None:
+        raise RuntimeError(
+            f"No identity known for recipient {recipient_hash.hex()}. "
+            f"Ensure the recipient announced its delivery destination "
+            f"before calling lxmf_send_opportunistic."
+        )
+
+    recipient_destination = RNS.Destination(
+        recipient_identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery",
+    )
+
+    message = LXMF.LXMessage(
+        destination=recipient_destination,
+        source=inst["delivery_destination"],
+        content=content,
+        title=title,
+        fields=fields,
+        desired_method=LXMF.LXMessage.OPPORTUNISTIC,
+    )
+
+    router = inst["router"]
+
+    # Pack first so LXMessage.pack() has a chance to flip
+    # desired_method back to DIRECT if the packed size exceeds
+    # ENCRYPTED_PACKET_MAX_CONTENT. We want to surface that
+    # up-front rather than silently sending via DIRECT.
+    if not getattr(message, "packed", None):
+        message.pack()
+    if message.desired_method != LXMF.LXMessage.OPPORTUNISTIC:
+        raise RuntimeError(
+            f"Opportunistic delivery silently upgraded to method "
+            f"{message.desired_method} — content+fields exceeded "
+            f"LXMessage.ENCRYPTED_PACKET_MAX_CONTENT. Shrink the "
+            f"payload or use lxmf_send_direct."
+        )
+
+    router.handle_outbound(message)
+
+    return {
+        "message_hash": message.hash.hex() if message.hash else "",
+    }
+
+
+def cmd_lxmf_send_direct(params):
+    """Build + submit an LXMessage with DIRECT delivery.
+
+    Link-based — the router opens (or reuses) an outbound Link to
+    the recipient's delivery destination. Payloads > MDU go via a
+    Resource (multi-packet, chunked + reassembled by RNS). This is
+    the single-hop real-time delivery path LXMF uses when both
+    peers are online.
+
+    params:
+        handle (str): lxmf_start handle for the sender.
+        recipient_delivery_dest_hash (hex): recipient's delivery hash.
+        content (str): UTF-8 message content (any size).
+        title (str, optional): UTF-8 title, defaults to "".
+        fields (dict[str,Any], optional): same shape as
+            lxmf_send_opportunistic. Large values (e.g. file
+            attachments) are fine here — they'll be chunked by the
+            Resource API transparently.
+
+    Returns:
+        message_hash (hex): LXMessage hash.
+    """
+    handle = params["handle"]
+    recipient_hash_hex = params["recipient_delivery_dest_hash"]
+    content = params["content"]
+    title = params.get("title", "")
+    fields = _decode_fields_param(params.get("fields"))
+
+    recipient_hash = bytes.fromhex(recipient_hash_hex)
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS = _get_rns()
+    LXMF = _get_lxmf()
+
+    recipient_identity = RNS.Identity.recall(recipient_hash)
+    if recipient_identity is None:
+        raise RuntimeError(
+            f"No identity known for recipient {recipient_hash.hex()}. "
+            f"Ensure the recipient announced its delivery destination "
+            f"before calling lxmf_send_direct."
+        )
+
+    recipient_destination = RNS.Destination(
+        recipient_identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        "lxmf",
+        "delivery",
+    )
+
+    message = LXMF.LXMessage(
+        destination=recipient_destination,
+        source=inst["delivery_destination"],
+        content=content,
+        title=title,
+        fields=fields,
+        desired_method=LXMF.LXMessage.DIRECT,
+    )
+
+    router = inst["router"]
+    router.handle_outbound(message)
+
+    return {
+        "message_hash": message.hash.hex() if message.hash else "",
+    }
+
+
 def cmd_lxmf_sync_inbound(params):
     """Ask this peer's LXMRouter to fetch stored messages from its
     configured outbound propagation node.
@@ -931,6 +1182,8 @@ LXMF_COMMANDS = {
     "lxmf_stop_daemon_propagation_node": cmd_lxmf_stop_daemon_propagation_node,
     "lxmf_set_outbound_propagation_node": cmd_lxmf_set_outbound_propagation_node,
     "lxmf_send_propagated": cmd_lxmf_send_propagated,
+    "lxmf_send_opportunistic": cmd_lxmf_send_opportunistic,
+    "lxmf_send_direct": cmd_lxmf_send_direct,
     "lxmf_sync_inbound": cmd_lxmf_sync_inbound,
     "lxmf_poll_inbox": cmd_lxmf_poll_inbox,
     "lxmf_stop": cmd_lxmf_stop,

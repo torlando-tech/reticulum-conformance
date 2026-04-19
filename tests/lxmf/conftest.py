@@ -1,26 +1,49 @@
-"""LXMF-layer (propagation E2E) fixtures.
+"""LXMF-layer (E2E) fixtures.
 
 Layered on top of tests/wire/. The wire layer spins up a real Reticulum +
 TCP interface per bridge; the LXMF layer attaches an LXMRouter to that
-same RNS instance and exercises PROPAGATED delivery across three peers:
+same RNS instance and exercises all three delivery methods.
 
-    sender (TCPClient)                    receiver (TCPClient)
-           \\                                   /
-            `----> transport (TCPServer) <----'
-                   enable_transport=True
-                   share_instance=True
-                       └── lxmd subprocess (propagation node)
+Two 3-peer topologies live here:
 
-The middle peer wears two hats: its bridge process is the RNS TCP
-transport, and a SEPARATE `lxmd` subprocess attached to the same shared
-Reticulum is the LXMF propagation node. This matches how production
-deployments run propagation nodes (see fleet/yggdrasil/reticulum-node.yaml
-— rnsd + lxmd in the same container, sharing `/root/.reticulum`).
+    1) lxmf_3peer (PROPAGATED delivery, middle = lxmd subprocess):
 
-MVP emits a single parametrization: (kotlin, lxmd, reference). The middle
-slot is "lxmd" (not "reference") to make it architecturally explicit that
-it's a separate daemon process, not an in-router mode. If LXMF-kt ever
-grows a daemon equivalent, the slot could become "lxmd-kt".
+         sender (TCPClient)                    receiver (TCPClient)
+                \\                                   /
+                 `----> transport (TCPServer) <----'
+                        enable_transport=true
+                        share_instance=true
+                            └── lxmd subprocess (propagation node)
+
+       The middle peer wears two hats: its bridge process is the RNS TCP
+       transport, and a SEPARATE lxmd subprocess attached to the same
+       shared Reticulum is the LXMF propagation node. Matches production
+       (see fleet/yggdrasil/reticulum-node.yaml — rnsd + lxmd in the
+       same container, sharing /root/.reticulum).
+
+    2) lxmf_transport_3peer (OPPORTUNISTIC and DIRECT delivery, middle
+       = plain transport, NO lxmd):
+
+         sender (TCPClient)                    receiver (TCPClient)
+                \\                                   /
+                 `----> transport (TCPServer) <----'
+                        enable_transport=true
+
+       The middle is JUST a packet mover. sender and receiver run
+       in-process LXMRouters against their own bridge RNS; the middle
+       has no LXMF state of its own. This matches how LXMF works when
+       both peers are online and there's a transport hop between them
+       (the typical Columba ↔ rnsd ↔ Sideband path).
+
+Both fixtures share the lxmf_start + announce-stagger + path-convergence
+logic in _setup_lxmf_peers_on_transport — only the middle-peer role
+configuration differs.
+
+Parametrization emits 4 combos for each fixture via lxmf_trio:
+(kotlin|reference) × (kotlin|reference) on the sender/receiver slots. The
+middle is always "lxmd" for propagation and always "reference" for
+transport (lxmf-kt has no equivalent transport-mode node distinct from
+enable_transport=true anyway).
 
 See reference/lxmf_bridge.py and conformance-bridge/src/main/kotlin/
 Lxmf.kt for the command surface these fixtures drive.
@@ -89,26 +112,33 @@ _SYNC_TIMEOUT_MS = 30_000
 
 
 def pytest_generate_tests(metafunc):
-    """Parametrize LXMF tests over (sender_impl, prop_node_impl, receiver_impl).
+    """Parametrize LXMF tests over (sender_impl, middle_impl, receiver_impl).
 
-    The middle slot is always "lxmd" — architecturally a Python subprocess
-    running the real lxmd daemon (not an in-router-mode LXMRouter). The
-    tuple shape is kept future-proof: if LXMF-kt ever ships a daemon, the
-    middle could become "lxmd-kt". Today, "lxmd" is the only value that
-    makes sense for a separate-process propagation node.
+    The middle slot depends on which fixture is in use:
+      - lxmf_3peer (PROPAGATED): middle = "lxmd" (separate Python
+        subprocess running the real lxmd daemon, not an in-router-mode
+        LXMRouter). Future-proof: if LXMF-kt ever ships a daemon, the
+        middle could become "lxmd-kt".
+      - lxmf_transport_3peer (OPPORTUNISTIC / DIRECT): middle =
+        "reference" (plain Python transport, no LXMF state of its own).
+        LXMF-kt has no equivalent transport-mode node distinct from the
+        wire bridge's enable_transport=true — sticking with reference
+        for the middle keeps Phase 1 scope focused on the cross-impl
+        sender/receiver matrix.
 
     Cartesian product over impls ∪ {"reference"} for sender + receiver:
-    with --impl=kotlin this emits 4 combos (reference and kotlin on each
-    end). Mirrors the wire-layer `_parametrize_wire_trio` pattern so the
-    matrix shape is consistent across test categories.
+    with --impl=kotlin this emits 4 combos per fixture (reference and
+    kotlin on each end). Mirrors the wire-layer
+    `_parametrize_wire_trio` pattern so the matrix shape is consistent
+    across test categories.
 
     The reference-only combo is the end-to-end sanity baseline (does
-    propagation work AT ALL when both ends are Python?). The kotlin-on-
-    sender combo exercises LXMF-kt's stamp generation + link-layer
-    message delivery. The kotlin-on-receiver combo exercises LXMF-kt's
-    two-phase propagation pull (listMessages + requestMessages). The
-    homogeneous kotlin combo exercises both ends of the Kotlin LXMF
-    implementation simultaneously — the most regression-prone path.
+    the delivery method work AT ALL when both ends are Python?). The
+    kotlin-on-sender combo exercises LXMF-kt's send path. The
+    kotlin-on-receiver combo exercises LXMF-kt's inbound decrypt +
+    delivery callback. The homogeneous kotlin combo exercises both ends
+    of the Kotlin LXMF implementation simultaneously — the most
+    regression-prone path.
     """
     if "lxmf_trio" not in metafunc.fixturenames:
         return
@@ -118,8 +148,22 @@ def pytest_generate_tests(metafunc):
     # would skip the interop assertions entirely, which defeats the
     # point of cross-impl testing. Same pattern as tests/wire/conftest.py.
     peers = sorted(set(impls) | {"reference"})
-    # Middle slot is pinned to "lxmd" (the Python lxmd subprocess).
-    trios = [(sender, "lxmd", receiver) for sender in peers for receiver in peers]
+
+    # Decide which middle-slot label to emit based on the fixture the
+    # test asked for. A test that pulls in BOTH fixtures (not a real
+    # pattern, but defensive) would get the propagation-appropriate
+    # label because lxmd is the more-constrained case.
+    if "lxmf_3peer" in metafunc.fixturenames:
+        middle = "lxmd"
+    elif "lxmf_transport_3peer" in metafunc.fixturenames:
+        middle = "reference"
+    else:
+        # Test took lxmf_trio but neither topology fixture — fall back
+        # to the propagation label so the test's fixture choice is the
+        # thing that fails, not the parametrization.
+        middle = "lxmd"
+
+    trios = [(sender, middle, receiver) for sender in peers for receiver in peers]
 
     ids = [f"{a}->{b}->{c}" for a, b, c in trios]
     metafunc.parametrize("lxmf_trio", trios, ids=ids, scope="function")
@@ -345,6 +389,53 @@ class _LxmfPeer:
         )
         return bytes.fromhex(resp["message_hash"]) if resp.get("message_hash") else b""
 
+    def send_opportunistic(
+        self,
+        recipient_delivery_dest_hash: bytes,
+        content: str,
+        title: str = "",
+        fields: dict | None = None,
+    ) -> bytes:
+        """Send an LXMessage with OPPORTUNISTIC delivery (single-packet).
+
+        The bridge accepts the same tagged-dict field shape as
+        send_direct. Bytes inside field values use the ``{"bytes":
+        "<hex>"}`` wrapper; see lxmfFieldValueFromJson (Kotlin) /
+        _decode_field_value_from_params (Python) for the full shape.
+        """
+        assert self.lxmf_handle, "lxmf_start must be called first"
+        params = {
+            "handle": self.lxmf_handle,
+            "recipient_delivery_dest_hash": recipient_delivery_dest_hash.hex(),
+            "content": content,
+            "title": title,
+        }
+        if fields is not None:
+            params["fields"] = fields
+        resp = self.bridge.execute("lxmf_send_opportunistic", **params)
+        return bytes.fromhex(resp["message_hash"]) if resp.get("message_hash") else b""
+
+    def send_direct(
+        self,
+        recipient_delivery_dest_hash: bytes,
+        content: str,
+        title: str = "",
+        fields: dict | None = None,
+    ) -> bytes:
+        """Send an LXMessage with DIRECT delivery (link-based; payloads
+        > MDU use a Resource for multi-packet chunked transfer)."""
+        assert self.lxmf_handle, "lxmf_start must be called first"
+        params = {
+            "handle": self.lxmf_handle,
+            "recipient_delivery_dest_hash": recipient_delivery_dest_hash.hex(),
+            "content": content,
+            "title": title,
+        }
+        if fields is not None:
+            params["fields"] = fields
+        resp = self.bridge.execute("lxmf_send_direct", **params)
+        return bytes.fromhex(resp["message_hash"]) if resp.get("message_hash") else b""
+
     def sync_inbound(self, timeout_s: float = _SYNC_TIMEOUT_MS / 1000.0) -> int:
         """Ask the LXMRouter to fetch messages from its active propagation
         node. Blocks until the router's transfer state machine settles or
@@ -365,6 +456,59 @@ class _LxmfPeer:
         assert self.lxmf_handle, "lxmf_start must be called first"
         resp = self.bridge.execute("lxmf_poll_inbox", handle=self.lxmf_handle)
         return list(resp.get("messages", []))
+
+    def wait_for_inbox_count(
+        self, expected: int, timeout_s: float = 30.0
+    ) -> list:
+        """Poll the inbox (non-draining) until it has exactly ``expected``
+        messages, then drain and return them.
+
+        Why non-draining on the probe: opportunistic / direct delivery
+        doesn't have a sync_inbound call to block on. The router's
+        delivery callback enqueues onto the inbox asynchronously after
+        packet reception / link transfer completes. A naive poll_inbox
+        would drain mid-arrival and report 0 before the delivery
+        callback has fired.
+
+        The shape here mirrors wait_for_stored_message_count from the
+        propagation path: wait until the count is exactly ``expected``,
+        linger briefly to catch duplicates, then drain + return. A
+        duplicate that arrives WITHIN the linger window flips the
+        count to expected+1 and the final check fails — which is what
+        we want, per the tight-assertions memo.
+
+        Implementation detail: the bridge's lxmf_poll_inbox drains
+        atomically, so we can't "peek at count" without draining.
+        Instead we drain-and-accumulate in a local buffer; once the
+        accumulated count matches ``expected``, we linger and do ONE
+        more drain to catch duplicates.
+
+        Returns the accumulated list on success. Raises AssertionError
+        on timeout or on count!=expected after the final check; tests
+        that need a non-raising variant can catch and inspect.
+        """
+        assert self.lxmf_handle, "lxmf_start must be called first"
+        accumulated: list = []
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            fresh = self.poll_inbox()
+            accumulated.extend(fresh)
+            if len(accumulated) >= expected:
+                break
+            time.sleep(0.2)
+
+        # Linger for a poll cycle (>0.2s) so any just-arriving duplicate
+        # still lands and flips the final count. 1s gives ~5x the poll
+        # cadence. Costs <1s on happy path.
+        time.sleep(1.0)
+        accumulated.extend(self.poll_inbox())
+
+        assert len(accumulated) == expected, (
+            f"{self.role_label} inbox count = {len(accumulated)}, "
+            f"expected exactly {expected} within {timeout_s}s. "
+            f"Inbox: {accumulated!r}"
+        )
+        return accumulated
 
     def stop(self):
         # Teardown order: lxmd subprocess first (if any), then in-process
@@ -387,6 +531,95 @@ class _LxmfPeer:
                 pass
             self.lxmf_handle = None
         self._wire.stop()
+
+
+def _start_lxmf_peers_and_wait_for_paths(
+    sender: "_LxmfPeer",
+    receiver: "_LxmfPeer",
+    extra_path_hashes: tuple[bytes, ...] = (),
+):
+    """Bring up in-process LXMRouters on the two endpoint peers,
+    stagger their announces, and wait for path convergence.
+
+    Extracted so `lxmf_3peer` (propagation) and `lxmf_transport_3peer`
+    (opportunistic / direct) can share this core without copy-paste.
+    The only difference between the two topologies is what the middle
+    peer is doing (lxmd subprocess vs. plain transport) — the
+    endpoint announce sequencing is identical.
+
+    Args:
+        sender: the peer that will send LXMessages (already wired at
+            the TCP layer via start_tcp_client).
+        receiver: the peer that will receive LXMessages (already
+            wired at the TCP layer via start_tcp_client).
+        extra_path_hashes: additional destination hashes both endpoints
+            must learn paths to (e.g. the propagation node hash).
+            The receiver's delivery hash is always waited on for the
+            sender, so it doesn't need to be in here.
+
+    Raises:
+        AssertionError: if any path fails to converge within
+            _SYNC_TIMEOUT_MS.
+
+    Why stagger the lxmf_start calls: if both announces hit the middle
+    peer in the same tick, RNS's Transport rate-limiter on the spawned
+    TCPInterface for each client queues the second-direction
+    rebroadcast. In the specific sequence "sender announces then
+    receiver announces in the same jiffy" the receiver's announce
+    never reaches the sender's spawned interface queue before the
+    rebroadcast retry limit fires. Empirically a 3s gap is enough for
+    the rebroadcast chain to complete cleanly; tighter gaps (<1s) leave
+    the sender without a path to the receiver. Matches the wire-layer
+    multihop fixtures.
+    """
+    sender.lxmf_start(display_name="conformance-sender")
+    time.sleep(_INTER_ANNOUNCE_STAGGER_SEC)
+    receiver.lxmf_start(display_name="conformance-receiver")
+
+    # Let announces settle on all sides. The sender needs the
+    # receiver's delivery announce so Identity.recall succeeds in
+    # lxmf_send_*. The propagation path convergence, if requested,
+    # needs the lxmd announce to traverse LocalClientInterface ->
+    # LocalServerInterface -> TCPServerInterface -> both clients, so
+    # give it a generous window.
+    time.sleep(_ANNOUNCE_PROPAGATION_SEC)
+
+    # Sender must know the receiver's delivery destination.
+    assert sender.poll_path(
+        receiver.delivery_dest_hash, timeout_ms=_SYNC_TIMEOUT_MS
+    ), (
+        f"{sender.role_label} did not learn a path to "
+        f"{receiver.role_label}'s delivery destination "
+        f"({receiver.delivery_dest_hash.hex()}) within "
+        f"{_SYNC_TIMEOUT_MS}ms; topology didn't converge."
+    )
+
+    # Opportunistic isn't 100% symmetric — the sender emits a delivery
+    # packet addressed to the receiver, which doesn't require the
+    # receiver to have a reverse path. But DIRECT requires a link,
+    # which involves round-trips; and the direct/opportunistic tests
+    # share a fixture, so wait for a reverse path too. (For the
+    # propagation fixture, the receiver's reverse-path requirement is
+    # implicit in sync_inbound's link to the prop node; reference
+    # doesn't need the receiver to know about the sender directly.)
+    assert receiver.poll_path(
+        sender.delivery_dest_hash, timeout_ms=_SYNC_TIMEOUT_MS
+    ), (
+        f"{receiver.role_label} did not learn a path to "
+        f"{sender.role_label}'s delivery destination "
+        f"({sender.delivery_dest_hash.hex()}) within "
+        f"{_SYNC_TIMEOUT_MS}ms; topology didn't converge."
+    )
+
+    for h in extra_path_hashes:
+        assert sender.poll_path(h, timeout_ms=_SYNC_TIMEOUT_MS), (
+            f"{sender.role_label} did not learn a path to "
+            f"{h.hex()} within {_SYNC_TIMEOUT_MS}ms."
+        )
+        assert receiver.poll_path(h, timeout_ms=_SYNC_TIMEOUT_MS), (
+            f"{receiver.role_label} did not learn a path to "
+            f"{h.hex()} within {_SYNC_TIMEOUT_MS}ms."
+        )
 
 
 @pytest.fixture
@@ -464,54 +697,12 @@ def lxmf_3peer(lxmf_trio):
             startup_timeout_sec=30.0,
         )
 
-        # Step 4: sender + receiver in-process LXMRouters. Each announces
-        # its delivery destination as part of lxmf_start. We STAGGER these:
-        # if both announces hit the middle peer in the same tick, RNS's
-        # Transport rate-limiter on the spawned TCPInterface for each
-        # client ends up queuing the second-direction rebroadcast, and in
-        # the specific sequence "sender announces then receiver announces
-        # in the same jiffy" the receiver's announce never reaches the
-        # sender's spawned interface queue before the rebroadcast retry
-        # limit fires. Empirically a 3s gap between the two lxmf_start
-        # calls is enough for the rebroadcast chain to complete cleanly;
-        # tighter gaps (<1s) leave sender without a path to receiver.
-        sender.lxmf_start(display_name="conformance-sender")
-        time.sleep(_INTER_ANNOUNCE_STAGGER_SEC)
-        receiver.lxmf_start(display_name="conformance-receiver")
-
-        # Step 5: let announces settle on all sides. The sender needs
-        # the receiver's delivery announce so Identity.recall succeeds
-        # in lxmf_send_propagated. The sender and receiver both need
-        # the propagation node's announce so set_outbound_propagation_node
-        # can find its identity for link establishment. The propagation
-        # node's announce has to traverse lxmd → LocalClientInterface →
-        # LocalServerInterface (wire bridge) → TCPServerInterface → both
-        # clients, so give it a generous window.
-        time.sleep(_ANNOUNCE_PROPAGATION_SEC)
-
-        # Guard: if the sender's path table never learned the receiver's
-        # delivery hash, the test below is going to fail for a
-        # meaningless reason (no path, not "propagation didn't work").
-        # Surface this explicitly so the failure diagnosis is crisp.
-        assert sender.poll_path(
-            receiver.delivery_dest_hash, timeout_ms=_SYNC_TIMEOUT_MS
-        ), (
-            f"{sender.role_label} did not learn a path to "
-            f"{receiver.role_label}'s delivery destination "
-            f"({receiver.delivery_dest_hash.hex()}) within "
-            f"{_SYNC_TIMEOUT_MS}ms; topology didn't converge."
-        )
-        assert sender.poll_path(
-            pn_hash, timeout_ms=_SYNC_TIMEOUT_MS
-        ), (
-            f"{sender.role_label} did not learn a path to the "
-            f"propagation node ({pn_hash.hex()}) within {_SYNC_TIMEOUT_MS}ms."
-        )
-        assert receiver.poll_path(
-            pn_hash, timeout_ms=_SYNC_TIMEOUT_MS
-        ), (
-            f"{receiver.role_label} did not learn a path to the "
-            f"propagation node ({pn_hash.hex()}) within {_SYNC_TIMEOUT_MS}ms."
+        # Steps 4-5: endpoint LXMRouter startup + announce + path
+        # convergence. Shared with lxmf_transport_3peer. Propagation
+        # needs BOTH endpoints to know the prop-node hash; pass it as
+        # an extra wait target.
+        _start_lxmf_peers_and_wait_for_paths(
+            sender, receiver, extra_path_hashes=(pn_hash,)
         )
 
         # Step 6-7: point sender + receiver at the propagation node.
@@ -521,6 +712,95 @@ def lxmf_3peer(lxmf_trio):
         yield sender, prop_node, receiver
     finally:
         for peer in (sender, prop_node, receiver):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
+@pytest.fixture
+def lxmf_transport_3peer(lxmf_trio):
+    """Three bridge subprocesses wired up as sender → transport → receiver
+    with the middle peer acting as a plain RNS transport (no lxmd, no
+    propagation node). Exercises OPPORTUNISTIC and DIRECT delivery.
+
+    Topology:
+
+        sender (TCPClient)                 receiver (TCPClient)
+               \\                                  /
+                `----> transport (TCPServer) <---'
+                       enable_transport=true
+
+    The middle peer doesn't run an LXMRouter of its own — it's JUST a
+    packet mover. Any delivery between sender and receiver flows
+    through its Transport layer, exactly like Columba traffic crossing
+    an rnsd transport hop to reach Sideband.
+
+    Setup sequence:
+      1. transport brings up TCPServer (share_instance=False, plain
+         transport-mode RNS).
+      2. sender + receiver bring up TCPClients targeting that port.
+      3. sender.lxmf_start, receiver.lxmf_start (staggered) — each
+         attaches an in-process LXMRouter and announces its delivery
+         destination.
+      4. Wait for paths between endpoints to converge.
+
+    Yields (sender, receiver) — the middle peer is NOT yielded because
+    the opportunistic/direct tests don't assert on it (unlike the
+    propagation fixture, which yields prop_node for stored-message
+    count assertions). The transport peer still exists inside the
+    fixture scope and is torn down in the finalizer.
+    """
+    sender_impl, middle_impl, receiver_impl = lxmf_trio
+
+    # Transport fixture uses a plain Python reference middle. If the
+    # parametrization hands us anything else, fail loud — a follow-up
+    # PR that widens this would need to extend the resolver, not just
+    # sneak a different impl label past this guard.
+    if middle_impl != "reference":
+        pytest.fail(
+            f"lxmf_transport_3peer fixture only supports "
+            f"middle_impl='reference', got {middle_impl!r}."
+        )
+
+    bridges = [
+        BridgeClient(
+            _resolve_command_for_trio(sender_impl),
+            env=_env_for(sender_impl),
+        ),
+        BridgeClient(
+            _resolve_command_for_trio("reference"),
+            env=_env_for("reference"),
+        ),
+        BridgeClient(
+            _resolve_command_for_trio(receiver_impl),
+            env=_env_for(receiver_impl),
+        ),
+    ]
+    sender = _LxmfPeer(bridges[0], role_label=f"sender({sender_impl})")
+    transport = _LxmfPeer(bridges[1], role_label=f"transport({middle_impl})")
+    receiver = _LxmfPeer(bridges[2], role_label=f"receiver({receiver_impl})")
+
+    try:
+        # Step 1-2: wire layer. Transport middle is a plain
+        # enable_transport=true RNS; no share_instance, no lxmd.
+        port = transport.start_tcp_server(share_instance=False)
+        sender.start_tcp_client(target_port=port)
+        receiver.start_tcp_client(target_port=port)
+        time.sleep(_SETTLE_SEC)
+
+        # Steps 3-4: endpoint LXMRouter startup + announce + path
+        # convergence. No extra hashes beyond the endpoints themselves.
+        _start_lxmf_peers_and_wait_for_paths(sender, receiver)
+
+        yield sender, receiver
+    finally:
+        for peer in (sender, transport, receiver):
             try:
                 peer.stop()
             except Exception:

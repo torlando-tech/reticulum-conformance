@@ -118,7 +118,7 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     )
 
     received = receiver.resource_poll(dest_hash, timeout_ms=_RESOURCE_TIMEOUT_MS)
-    assert payload in received, (
+    assert received == [payload], (
         f"{receiver.role_label} did not receive the 256-byte resource "
         f"from {sender.role_label}. Got {len(received)} resource(s): "
         f"{[r[:20].hex() + '...' for r in received]}."
@@ -144,7 +144,7 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     )
 
     received = receiver.resource_poll(dest_hash, timeout_ms=_RESOURCE_TIMEOUT_MS)
-    assert payload in received, (
+    assert received == [payload], (
         f"{receiver.role_label} did not reassemble the {len(payload)}-byte "
         f"resource from {sender.role_label}. Sender reported "
         f"success={send_resp.get('success')} status={send_resp.get('status')}, "
@@ -179,7 +179,7 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     )
 
     received = receiver.resource_poll(dest_hash, timeout_ms=_RESOURCE_TIMEOUT_MS)
-    assert payload in received, (
+    assert received == [payload], (
         f"{receiver.role_label} did not reassemble the {len(payload)}-byte "
         f"IFAC-protected resource from {sender.role_label}."
     )
@@ -206,7 +206,7 @@ def test_large_resource_multihop(wire_trio, wire_3peer):
     )
 
     received = receiver.resource_poll(dest_hash, timeout_ms=60_000)
-    assert payload in received, (
+    assert received == [payload], (
         f"{receiver.role_label} did not reassemble the {len(payload)}-byte "
         f"resource from {sender.role_label}."
     )

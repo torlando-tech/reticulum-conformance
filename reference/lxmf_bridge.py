@@ -649,10 +649,10 @@ def cmd_lxmf_sync_inbound(params):
     """Ask this peer's LXMRouter to fetch stored messages from its
     configured outbound propagation node.
 
-    Blocks until the transfer finishes (COMPLETE / FAILED / timeout).
-    Returns the number of messages retrieved — NOT necessarily delivered
-    to the callback yet. Callers should follow with lxmf_poll_inbox to
-    actually drain the delivered messages.
+    Blocks until the transfer finishes (COMPLETE / FAILED / timeout) AND
+    the delivery callbacks for the transferred messages have populated
+    the inbox — so callers can immediately poll_inbox and see the full
+    set of received messages without racing the router's worker threads.
 
     params:
         handle (str): lxmf_start handle.
@@ -674,9 +674,7 @@ def cmd_lxmf_sync_inbound(params):
 
     LXMF = _get_lxmf()
     router = inst["router"]
-    router.request_messages_from_propagation_node(inst["identity"])
 
-    # Wait for the transfer state machine to settle into a terminal state.
     # Python LXMF's state names are prefixed PR_* as module-level ints.
     terminal_states = {
         LXMF.LXMRouter.PR_COMPLETE,
@@ -684,20 +682,54 @@ def cmd_lxmf_sync_inbound(params):
         LXMF.LXMRouter.PR_NO_IDENTITY_RCVD,
         LXMF.LXMRouter.PR_NO_ACCESS,
     }
+
+    # Snapshot the inbox size BEFORE we kick off the transfer. The poll
+    # loop below waits for new messages to actually land in the inbox,
+    # not just for the transfer state machine to report a count — this
+    # closes two races at once:
+    #   1. Stale terminal state: `propagation_transfer_state` may still
+    #      be PR_COMPLETE from a previous sync. Even though LXMRouter.
+    #      request_messages_from_propagation_node synchronously
+    #      transitions the state on the common path (link active or
+    #      re-establishing), a fast first poll otherwise has no guard
+    #      against reading the previous transfer's PR_COMPLETE.
+    #   2. Callback drain: delivery callbacks run on the router's own
+    #      threads; the transfer reaching PR_COMPLETE doesn't guarantee
+    #      the callbacks have fired yet. The previous `time.sleep(0.3)`
+    #      after the state settled was an empirical constant with no
+    #      guaranteed relationship to callback completion time.
+    with inst["inbox_lock"]:
+        inbox_size_before = len(inst["inbox"])
+
+    router.request_messages_from_propagation_node(inst["identity"])
+
     deadline = time.time() + (timeout_ms / 1000.0)
+    observed_non_terminal = False
     while time.time() < deadline:
         state = router.propagation_transfer_state
-        if state in terminal_states:
-            break
-        time.sleep(0.1)
+        if state not in terminal_states:
+            observed_non_terminal = True
+        # Only consider a terminal state final if we've observed the
+        # transfer leave the initial state at least once (defeats (1)).
+        # Exception: request_messages_from_propagation_node set the
+        # state synchronously on the common path, so if the FIRST poll
+        # already shows a non-terminal state, we're mid-transfer and
+        # the flag catches up on the next iteration.
+        if state in terminal_states and observed_non_terminal:
+            last_result = int(router.propagation_transfer_last_result or 0)
+            expected_inbox_size = inbox_size_before + last_result
+            with inst["inbox_lock"]:
+                current_inbox_size = len(inst["inbox"])
+            # Wait for the delivery callbacks to have caught up with the
+            # transfer count. This is the callback-drain guarantee (2):
+            # we return only when poll_inbox will actually see the
+            # messages that sync_inbound reports.
+            if current_inbox_size >= expected_inbox_size:
+                break
+        time.sleep(0.05)
 
     final_state = router.propagation_transfer_state
     last_result = int(router.propagation_transfer_last_result or 0)
-
-    # Let any freshly-decrypted messages hit the delivery callback before
-    # we return — callbacks run on the router's own threads and the caller
-    # is about to poll the inbox.
-    time.sleep(0.3)
 
     return {
         "messages_received": last_result,

@@ -851,7 +851,6 @@ def cmd_lxmf_stop(params):
     # process. We just clean up our own bookkeeping here.
     storage_path = inst.get("storage_path")
     if storage_path and os.path.isdir(storage_path):
-        import shutil
         shutil.rmtree(storage_path, ignore_errors=True)
 
     return {"stopped": True}

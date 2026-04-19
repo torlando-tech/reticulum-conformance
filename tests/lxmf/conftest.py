@@ -26,7 +26,6 @@ See reference/lxmf_bridge.py and conformance-bridge/src/main/kotlin/
 Lxmf.kt for the command surface these fixtures drive.
 """
 
-import glob
 import os
 import secrets
 import shutil

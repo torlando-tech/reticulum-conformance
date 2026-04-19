@@ -386,10 +386,25 @@ def cmd_lxmf_spawn_daemon_propagation_node(params):
                     pass
             reader_done.set()
 
+    # Thread start is the only place _tail_lxmd.finally runs, and that's
+    # the only place lxmd_logfile is closed. If Thread.start itself raises
+    # (OS thread-limit, memory pressure), _tail_lxmd never runs and the
+    # logfile leaks. Also handle lxmd_proc in the same guard so a thread-
+    # start failure doesn't leak the subprocess pipe either.
     reader_thread = threading.Thread(
         target=_tail_lxmd, name=f"lxmd-tail-{wire_handle}", daemon=True
     )
-    reader_thread.start()
+    try:
+        reader_thread.start()
+    except Exception:
+        if lxmd_logfile:
+            try:
+                lxmd_logfile.close()
+            except Exception:
+                pass
+        _terminate_lxmd(lxmd_proc)
+        _cleanup_lxmd_dir(lxmd_config_dir)
+        raise
 
     # Wait for the startup line, the process exiting early, or timeout.
     deadline = time.time() + startup_timeout_sec
@@ -701,6 +716,15 @@ def cmd_lxmf_sync_inbound(params):
     with inst["inbox_lock"]:
         inbox_size_before = len(inst["inbox"])
 
+    # Snapshot the pre-call state. A terminal state that DIFFERS from
+    # this pre-call value means the state machine actually transitioned
+    # (e.g. PR_COMPLETE -> PR_FAILED on an immediately-rejected link),
+    # so we don't need to see a non-terminal state first to accept it.
+    # This closes a slow-failure path where LXMF goes straight to a
+    # terminal state without ever leaving the initial one — previously
+    # the loop burned the full timeout_ms before returning the failure.
+    state_before = router.propagation_transfer_state
+
     router.request_messages_from_propagation_node(inst["identity"])
 
     deadline = time.time() + (timeout_ms / 1000.0)
@@ -709,13 +733,18 @@ def cmd_lxmf_sync_inbound(params):
         state = router.propagation_transfer_state
         if state not in terminal_states:
             observed_non_terminal = True
-        # Only consider a terminal state final if we've observed the
-        # transfer leave the initial state at least once (defeats (1)).
-        # Exception: request_messages_from_propagation_node set the
-        # state synchronously on the common path, so if the FIRST poll
-        # already shows a non-terminal state, we're mid-transfer and
-        # the flag catches up on the next iteration.
-        if state in terminal_states and observed_non_terminal:
+        # Only consider a terminal state final if either:
+        #   (a) we've observed the transfer leave the initial state at
+        #       least once (common happy path: state goes
+        #       LINK_ESTABLISHED -> REQUESTING_MESSAGES -> PR_COMPLETE,
+        #       defeating the stale PR_COMPLETE race), or
+        #   (b) the current terminal state differs from the one observed
+        #       before request_messages_from_propagation_node was called
+        #       — this catches fast-failure paths that go straight to a
+        #       new terminal state without passing through any
+        #       non-terminal state first, so we fail fast instead of
+        #       burning the full timeout budget.
+        if state in terminal_states and (observed_non_terminal or state != state_before):
             last_result = int(router.propagation_transfer_last_result or 0)
             expected_inbox_size = inbox_size_before + last_result
             with inst["inbox_lock"]:

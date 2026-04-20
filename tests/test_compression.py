@@ -28,7 +28,10 @@ _BZ2_MAGIC_HEX = "425a68"
 def test_bz2_compress(sut):
     data = random_hex(100)
     compressed = sut.execute("bz2_compress", data=data)["compressed"]
-    assert compressed.startswith(_BZ2_MAGIC_HEX), (
+    # Case-insensitive magic check: bridges may return mixed-case hex, and
+    # the rest of the suite normalises via assert_hex_equal for the same
+    # reason.
+    assert compressed.lower().startswith(_BZ2_MAGIC_HEX), (
         f"SUT bz2_compress output does not begin with bz2 magic "
         f"{_BZ2_MAGIC_HEX!r}: got {compressed[:16]!r}"
     )

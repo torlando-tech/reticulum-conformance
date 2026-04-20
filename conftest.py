@@ -6,6 +6,8 @@ Tests compare SUT output against reference output to verify conformance.
 """
 
 import os
+import warnings
+
 import pytest
 
 from bridge_client import BridgeClient
@@ -55,7 +57,6 @@ def resolve_command(impl_name):
 
     legacy_cmd = os.environ.get("CONFORMANCE_BRIDGE_CMD")
     if legacy_cmd:
-        import warnings
         warnings.warn(
             "CONFORMANCE_BRIDGE_CMD is deprecated because it applies to "
             f"every peer regardless of impl (peer requested: {impl_name!r}). "

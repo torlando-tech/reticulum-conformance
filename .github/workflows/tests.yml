@@ -1,0 +1,89 @@
+name: Conformance Tests
+
+# Runs the conformance suite on every PR to this repo so a failing test
+# can't land on main and poison downstream consumers (reticulum-kt,
+# reticulum-swift). This mirrors reticulum-kt's conformance job so PR
+# authors here see the same signal CI will emit after merge.
+#
+# Per-impl bridge env vars (CONFORMANCE_KOTLIN_BRIDGE_CMD etc.) are
+# required — the legacy CONFORMANCE_BRIDGE_CMD global override silently
+# forces every peer to the same bridge, masking any xfail keyed off
+# transport_impl / sender_impl / receiver_impl.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-conformance
+
+      - uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/reticulum-kt
+          path: reticulum-kt
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          path: Reticulum
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          path: LXMF
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install pytest
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Kotlin conformance bridge
+        working-directory: reticulum-kt
+        run: ./gradlew :conformance-bridge:shadowJar
+
+      - name: Run cross-impl conformance tests (--impl=kotlin)
+        working-directory: reticulum-conformance
+        env:
+          # Per-impl bridge commands. Kotlin peers use the JAR built
+          # above; reference peers use the default Python bridge
+          # configured in conftest.py BRIDGE_COMMANDS. DO NOT set the
+          # legacy CONFORMANCE_BRIDGE_CMD — it applies globally and
+          # silently breaks cross-impl parametrization.
+          CONFORMANCE_KOTLIN_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+        # tests/lxmf/ is owned by LXMF-kt's CI (different bridge),
+        # matching reticulum-kt's conformance workflow's exclusion.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=kotlin -v --tb=short
+
+      - name: Run reference-only baseline
+        # Sanity check: the Python reference should always pass every
+        # test on its own, with no xfails. A red here means either a
+        # test is broken or something drifted in Python RNS — either
+        # way a signal worth catching before shipping.
+        working-directory: reticulum-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --reference-only -v --tb=short

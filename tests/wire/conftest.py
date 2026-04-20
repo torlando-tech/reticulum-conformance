@@ -79,29 +79,152 @@ class _WirePeer:
         self.identity_hash: bytes | None = None
         self.port: int | None = None
 
-    def start_tcp_server(self, network_name: str, passphrase: str) -> int:
-        resp = self.bridge.execute(
-            "wire_start_tcp_server",
-            network_name=network_name,
-            passphrase=passphrase,
-        )
+    def start_tcp_server(
+        self,
+        network_name: str,
+        passphrase: str,
+        mode: str | None = None,
+    ) -> int:
+        kwargs: dict = {"network_name": network_name, "passphrase": passphrase}
+        if mode is not None:
+            kwargs["mode"] = mode
+        resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
         self.port = int(resp["port"])
         return self.port
 
     def start_tcp_client(
-        self, network_name: str, passphrase: str, target_host: str, target_port: int
+        self,
+        network_name: str,
+        passphrase: str,
+        target_host: str,
+        target_port: int,
+        mode: str | None = None,
     ):
-        resp = self.bridge.execute(
-            "wire_start_tcp_client",
-            network_name=network_name,
-            passphrase=passphrase,
-            target_host=target_host,
-            target_port=target_port,
-        )
+        kwargs: dict = {
+            "network_name": network_name,
+            "passphrase": passphrase,
+            "target_host": target_host,
+            "target_port": target_port,
+        }
+        if mode is not None:
+            kwargs["mode"] = mode
+        resp = self.bridge.execute("wire_start_tcp_client", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
+
+    def set_interface_mode(self, mode: str):
+        """Runtime-mutate the configured interface's mode on this peer.
+
+        Applies to the primary interface and any currently-spawned
+        children (server case). Prefer passing `mode=` to `start_tcp_*`
+        where possible — this helper is for tests that need a mode
+        transition mid-test.
+        """
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_set_interface_mode",
+            handle=self.handle,
+            mode=mode,
+        )
+
+    def request_path(self, destination_hash: bytes):
+        """Fire a path-request packet for `destination_hash` unconditionally."""
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_request_path",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+    def read_path_entry(self, destination_hash: bytes) -> dict | None:
+        """Return the path_table entry as a dict, or None if absent.
+
+        Dict keys: timestamp, expires (both ms-since-epoch), hops,
+        next_hop (hex str), receiving_interface_name (str or None).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_read_path_entry",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        if not resp.get("found"):
+            return None
+        return {
+            "timestamp": int(resp["timestamp"]),
+            "expires": int(resp["expires"]),
+            "hops": int(resp["hops"]),
+            "next_hop": resp["next_hop"],
+            "receiving_interface_name": resp.get("receiving_interface_name"),
+        }
+
+    def has_discovery_path_request(self, destination_hash: bytes) -> bool:
+        """Observable: has this transport forwarded a path request for dest?"""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_has_discovery_path_request",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        return bool(resp.get("found"))
+
+    def has_announce_table_entry(self, destination_hash: bytes) -> bool:
+        """Observable: is there a scheduled re-emission in announce_table?
+
+        Used to detect whether a cached-announce path-response was
+        enqueued (presence) or refused (absence) in response to a PR.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_has_announce_table_entry",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        return bool(resp.get("found"))
+
+    def read_announce_table_timestamp(self, destination_hash: bytes) -> int | None:
+        """Return announce_table[dest].timestamp (ms), or None if absent.
+
+        Path-request answering replaces the entry with a fresh timestamp.
+        Comparing before/after distinguishes "B answered the PR" (ts
+        advances) from "B refused / loop-prevention fired" (ts unchanged).
+
+        Note: Python and Kotlin restore held_announces at different points
+        in the PR-answer flow, so this observable is impl-sensitive. Prefer
+        `tx_bytes` for cross-impl "did B send anything" checks.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_read_announce_table_timestamp",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        if not resp.get("found"):
+            return None
+        return int(resp["timestamp"])
+
+    def tx_bytes(self) -> int:
+        """Return total TX bytes across this peer's configured interface
+        and its spawned children. Model-agnostic "did this peer emit?"
+        signal, independent of announce_table timing quirks.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_tx_bytes", handle=self.handle)
+        return int(resp["tx_bytes"])
+
+    def read_path_random_hash(self, destination_hash: bytes) -> bytes | None:
+        """Return the cached announce's 10-byte random_hash, or None if no path."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_read_path_random_hash",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        if not resp.get("found"):
+            return None
+        return bytes.fromhex(resp["random_hash"])
 
     def announce(self, app_name: str, aspects: list, app_data: bytes = b"") -> bytes:
         assert self.handle, "start_* must be called first"

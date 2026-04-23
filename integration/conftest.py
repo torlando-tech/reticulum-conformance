@@ -30,7 +30,7 @@ def peer_cmd(request):
         return cmd
     # Try auto-detect Swift PipePeer
     home = os.path.expanduser("~")
-    swift_peer = os.path.join(home, "repos/reticulum-swift-lib/.build/release/PipePeer")
+    swift_peer = os.path.join(home, "repos/reticulum-swift/.build/release/PipePeer")
     if os.path.exists(swift_peer):
         return swift_peer
     pytest.skip("No pipe peer binary found. Build with: swift build -c release --product PipePeer")

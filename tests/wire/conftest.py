@@ -62,6 +62,7 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("wire_pair", pairs, ids=ids, scope="function")
 
     _parametrize_wire_trio(metafunc)
+    _parametrize_wire_hub(metafunc)
 
 
 class _WirePeer:
@@ -329,6 +330,26 @@ class _WirePeer:
         )
         return [bytes.fromhex(p) for p in resp.get("resources", [])]
 
+    def get_received_packets(self, since_seq: int = 0) -> dict:
+        """Return the inbound-tap packet list for this bridge process.
+
+        Every packet that the bridge handed to Transport.inbound — including
+        those that arrived on spawned TCPServerInterface children — is
+        recorded here. Tests use this to prove a hub did NOT forward a
+        packet to a peer that shouldn't have received it.
+
+        Returns:
+          {"packets": [{seq, timestamp_ms, raw_hex, packet_type,
+                        destination_hash_hex, context, interface_name}],
+           "highest_seq": int}
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_get_received_packets",
+            handle=self.handle,
+            since_seq=since_seq,
+        )
+
     def stop(self):
         if self.handle is None:
             return
@@ -405,6 +426,83 @@ def wire_3peer(wire_trio):
         yield sender, transport, receiver
     finally:
         for peer in (sender, transport, receiver):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
+def _parametrize_wire_hub(metafunc):
+    """Parametrize 4-peer hub-isolation tests over the TRANSPORT impl only.
+
+    Sender/receiver/witness are pinned to the reference so the oracle is
+    stable. What we're proving is: given a known-correct set of endpoints,
+    does the middle hub fan packets out incorrectly? That question is a
+    property of the hub impl alone, so parameterizing across S/R/W would
+    just multiply work without adding signal. Each test runs once per
+    impl under test (e.g. "kotlin-hub", "reference-hub").
+    """
+    if "wire_hub_impl" not in metafunc.fixturenames:
+        return
+    impls = get_impl_list(metafunc.config) or []
+    peers = sorted(set(impls) | {"reference"})
+    ids = [f"{impl}-hub" for impl in peers]
+    metafunc.parametrize("wire_hub_impl", peers, ids=ids, scope="function")
+
+
+@pytest.fixture
+def wire_hub_impl(request):
+    """Impl under test for the middle hub in the 4-peer fixture."""
+    return request.param
+
+
+@pytest.fixture
+def wire_hub_isolation(wire_hub_impl):
+    """Four freshly-spawned bridges arranged as a star through one hub.
+
+    Topology::
+
+              sender (TCPClient, reference)
+                        \\
+                         v
+                transport (TCPServer, wire_hub_impl)
+                        ^ ^
+                       /   \\
+          receiver ---'     '--- witness
+          (TCPClient,           (TCPClient,
+           reference)            reference)
+
+    All three leaves share the transport as their only interface; the
+    transport is the only peer that listens. This is the minimum
+    topology that can distinguish "hub routed correctly to receiver"
+    from "hub incorrectly fanned out to witness too".
+
+    Yields (sender, transport, receiver, witness) as `_WirePeer` objects.
+    Caller is responsible for all start_tcp_* calls — the fixture only
+    spawns bridges and handles teardown.
+    """
+    hub_impl = wire_hub_impl
+    sender_impl = receiver_impl = witness_impl = "reference"
+    bridges = [
+        BridgeClient(resolve_command(sender_impl), env=_env_for(sender_impl)),
+        BridgeClient(resolve_command(hub_impl), env=_env_for(hub_impl)),
+        BridgeClient(resolve_command(receiver_impl), env=_env_for(receiver_impl)),
+        BridgeClient(resolve_command(witness_impl), env=_env_for(witness_impl)),
+    ]
+    sender = _WirePeer(bridges[0], role_label=f"sender({sender_impl})")
+    transport = _WirePeer(bridges[1], role_label=f"transport({hub_impl})")
+    receiver = _WirePeer(bridges[2], role_label=f"receiver({receiver_impl})")
+    witness = _WirePeer(bridges[3], role_label=f"witness({witness_impl})")
+
+    try:
+        yield sender, transport, receiver, witness
+    finally:
+        for peer in (sender, transport, receiver, witness):
             try:
                 peer.stop()
             except Exception:

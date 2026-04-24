@@ -83,56 +83,71 @@ def _install_inbound_tap():
     unconditionally.
     """
     global _inbound_tap_installed
-    if _inbound_tap_installed:
-        return
     RNS = _get_rns()
-    original_inbound = RNS.Transport.inbound
 
-    def _tapped_inbound(raw, interface=None):
-        global _inbound_tap_seq
+    # Read-check-swap under the tap lock so two concurrent callers can't
+    # both capture the original and stack two tap wrappers around it,
+    # which would double-record every packet.
+    with _inbound_tap_lock:
+        if _inbound_tap_installed:
+            return
+        original_inbound = RNS.Transport.inbound
+
+        def _tapped_inbound(raw, interface=None):
+            _record_and_forward(raw, interface, original_inbound)
+
+        RNS.Transport.inbound = _tapped_inbound
+        _inbound_tap_installed = True
+
+
+def _record_and_forward(raw, interface, original_inbound):
+    """Tap body extracted so _install_inbound_tap's critical section stays
+    small and easy to reason about under the lock.
+    """
+    global _inbound_tap_seq
+    try:
+        now_ms = int(time.time() * 1000)
+        packet_type = None
+        dest_hash_hex = None
+        context = None
+        # Header byte layout (RNS wire spec — Packet.py constants):
+        # the low 2 bits of byte 0 encode the packet type
+        # (DATA=0, ANNOUNCE=1, LINKREQUEST=2, PROOF=3). The mask
+        # 0b00000011 captures exactly bits 0-1. Other header flags
+        # (HEADER_TYPE, context flag, etc.) live in the remaining
+        # bits; we don't parse those here — tests that need them
+        # grep `raw_hex` directly.
+        if raw and len(raw) >= 2:
+            header = raw[0]
+            packet_type = header & 0b00000011
+            # Destination hash follows the header (+ optional IFAC bytes —
+            # we skip IFAC parsing since tests that care about dest match
+            # on raw_hex directly). raw[2:18] is dest hash in the no-IFAC
+            # case; best-effort.
+            if len(raw) >= 18:
+                dest_hash_hex = raw[2:18].hex()
+            if len(raw) >= 19:
+                context = raw[18]
+        iface_name = None
         try:
-            now_ms = int(time.time() * 1000)
-            packet_type = None
-            dest_hash_hex = None
-            context = None
-            # Header byte layout (RNS wire spec): HFFCCPPP where PPP is the
-            # packet type (bits 0-2). Extracting just these fields keeps us
-            # from re-implementing full Packet parsing in the tap; tests can
-            # still grep raw_hex for deeper inspection.
-            if raw and len(raw) >= 2:
-                header = raw[0]
-                packet_type = header & 0b00000011
-                # Destination hash follows header (+ optional IFAC bytes,
-                # but for raw comparison in tests we skip IFAC — tests that
-                # care about dest match on raw_hex directly).
-                # raw[2:18] is dest hash when no IFAC; best-effort only.
-                if len(raw) >= 18:
-                    dest_hash_hex = raw[2:18].hex()
-                if len(raw) >= 19:
-                    context = raw[18]
-            iface_name = None
-            try:
-                iface_name = str(interface) if interface is not None else None
-            except Exception:
-                iface_name = None
-            with _inbound_tap_lock:
-                _inbound_tap_seq += 1
-                _inbound_tap_buffer.append({
-                    "seq": _inbound_tap_seq,
-                    "timestamp_ms": now_ms,
-                    "raw_hex": raw.hex() if raw else "",
-                    "packet_type": packet_type,
-                    "destination_hash_hex": dest_hash_hex,
-                    "context": context,
-                    "interface_name": iface_name,
-                })
+            iface_name = str(interface) if interface is not None else None
         except Exception:
-            # The tap must never break routing. Swallow and carry on.
-            pass
-        return original_inbound(raw, interface)
-
-    RNS.Transport.inbound = _tapped_inbound
-    _inbound_tap_installed = True
+            iface_name = None
+        with _inbound_tap_lock:
+            _inbound_tap_seq += 1
+            _inbound_tap_buffer.append({
+                "seq": _inbound_tap_seq,
+                "timestamp_ms": now_ms,
+                "raw_hex": raw.hex() if raw else "",
+                "packet_type": packet_type,
+                "destination_hash_hex": dest_hash_hex,
+                "context": context,
+                "interface_name": iface_name,
+            })
+    except Exception:
+        # The tap must never break routing. Swallow and carry on.
+        pass
+    return original_inbound(raw, interface)
 
 
 def _get_rns():

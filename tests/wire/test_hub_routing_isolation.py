@@ -36,15 +36,15 @@ parameterizes only the hub (`wire_hub_impl`). What we're probing is a
 property of the hub's routing logic, so the leaves being stable makes
 the oracle unambiguous.
 
-Three scenarios are covered, each targeting a distinct class of fan-out:
+Two scenarios are covered, each targeting a distinct class of fan-out:
 
-  1. Link DATA  — the symptom seen in production (rnsd-equivalent
-                  hub duplicating in-link app traffic to every peer).
-  2. Path response packets — metadata path-response fan-out would leak
-                  which destinations are reachable where.
-  3. PR-triggered announce responses — PR-response fan-out could
-                  inform non-asking peers of addresses they never
-                  requested.
+  1. Link DATA — the symptom seen in production (rnsd-equivalent hub
+                 duplicating in-link app traffic to every peer).
+  2. Path-response — metadata path-response fan-out would leak which
+                 destinations are reachable where. The sender fires a
+                 PR for receiver's dest; a correct hub replies only to
+                 the asker, so no path-response for receiver should
+                 land at the witness.
 
 Each scenario asserts: the witness's tap buffer contains zero packets
 whose raw_hex embeds the receiver's destination-hash bytes OR the
@@ -226,58 +226,14 @@ def test_path_request_response_does_not_leak_to_witness(wire_hub_isolation):
     )
 
 
-def test_unsolicited_announce_does_not_duplicate_to_witness(wire_hub_isolation):
-    """Scenario 3 — Announce fan-out hygiene.
-
-    Announces legitimately propagate to every peer on every interface —
-    that's the broadcast semantic. What the witness must not see is
-    **duplicates** of the same announce (one copy per peer would indicate
-    a per-child inbound fan-out loop).
-
-    Each unique announce (keyed by (dest_hash, random_hash) because RNS
-    announces embed a 10-byte randomness) should appear in the witness
-    tap exactly once.
-    """
-    sender, transport, receiver, witness, dest_hash = _setup_four_peer_topology(
-        wire_hub_isolation
-    )
-
-    time.sleep(0.5)
-
-    # Count distinct announce packets received at the witness keyed by
-    # the receiver's dest hash. RNS announce packet_type == 2 (per the
-    # header encoding extracted by the tap).
-    resp = witness.get_received_packets(since_seq=0)
-    packets = resp.get("packets", [])
-
-    dest_hex = dest_hash.hex()
-    announces_for_receiver = [
-        p for p in packets
-        if p.get("destination_hash_hex") == dest_hex
-        and p.get("packet_type") == 2
-    ]
-
-    # A legitimate announce will arrive once at the witness (broadcast
-    # across the hub's one interface, landing on the witness's single
-    # inbound socket). More than one occurrence is a fan-out bug —
-    # either the hub spawned-child loop or the parent retransmit.
-    # Group by full raw_hex so we don't falsely flag a later re-announce
-    # (which would have a different timestamp/signature).
-    seen = {}
-    duplicates = []
-    for p in announces_for_receiver:
-        key = p.get("raw_hex")
-        if key in seen:
-            duplicates.append((seen[key], p))
-        else:
-            seen[key] = p
-
-    assert not duplicates, (
-        f"{witness.role_label} received {len(duplicates)} duplicate "
-        f"announce(s) for {receiver.role_label}'s destination via "
-        f"{transport.role_label}. A correctly-routing hub delivers a "
-        f"given announce once per interface. Duplicates indicate a "
-        f"fan-out loop (inbound per-child or outbound parent replay). "
-        f"First duplicate: seq {duplicates[0][0]['seq']} vs seq "
-        f"{duplicates[0][1]['seq']}."
-    )
+# Note: an earlier draft of this file had a third scenario that tried to
+# detect announce fan-out by counting duplicate announces at the witness.
+# It was dropped because announces broadcast legitimately, and the
+# buggy fan-out copies arrived with different raw bytes than the
+# broadcast copy (transport layering bumps hops/wrapping), so a
+# raw_hex-keyed dedup can't distinguish fan-out from legit broadcast
+# without impl-specific parsing. The two scenarios above already
+# catch the fan-out by detecting leaks of receiver-addressed DATA and
+# path-response bytes at the witness — which is the concrete harm the
+# fan-out caused. Leaving this note so a future contributor doesn't
+# re-derive the same vacuous test.

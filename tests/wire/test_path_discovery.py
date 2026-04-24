@@ -112,14 +112,6 @@ def _start_three_peer_topology(
 # ---------------------------------------------------------------------------
 
 
-_ISSUE_46_REASON = (
-    "reticulum-kt TCPServerInterface fans out inbound packets to all other "
-    "connected clients, so C's PR leaks to A and A generates a fresh announce "
-    "with a new random_hash that overwrites B's cached entry. "
-    "See https://github.com/torlando-tech/reticulum-kt/issues/46."
-)
-
-
 def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
     """When B (transport) answers a PR for a destination it has cached,
     the re-emitted announce MUST be the cached announce — identifiable
@@ -166,24 +158,11 @@ def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
     )
     time.sleep(_SETTLE_SEC)
 
-    # Sanity: C must not have learned about A yet. On Python, B does
-    # not spontaneously retransmit cached announces on new connections,
-    # so this holds. On Kotlin, B's TCPServerInterface fans out every
-    # announce received from any peer to every other peer — the
-    # `sender->kotlin-server->receiver` topology may leak A's original
-    # announce to C on connect, which would short-circuit this test.
-    # We only assert this precondition AFTER the positive-side setup
-    # (A announced, B cached) so a vacuous-pass if xfail-below lands is
-    # impossible.
+    # Sanity: C must not have learned about A yet. Neither Python nor
+    # Kotlin spontaneously retransmits cached announces on new
+    # connections (Kotlin used to, via the TCPServerInterface fan-out
+    # behind reticulum-kt#46, fixed by torlando-tech/reticulum-kt#52).
     prior_entry = receiver.read_path_entry(dest_hash)
-
-    # reticulum-kt#46: Kotlin's TCPServerInterface fan-out leaks C's PR
-    # to A, triggering A to generate a fresh announce that overwrites
-    # B's cached entry. This violates the cached-packet invariant the
-    # test asserts. See issue for full trace + fix proposal.
-    _sender_impl, transport_impl, _receiver_impl = wire_trio
-    if transport_impl == "kotlin":
-        pytest.xfail(_ISSUE_46_REASON)
 
     assert prior_entry is None, (
         f"C ({receiver.role_label}) already has a path to "

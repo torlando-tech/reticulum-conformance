@@ -27,7 +27,6 @@ receiver_impl) triples the link-multihop test uses.
 import secrets
 import time
 
-import pytest
 
 
 _SETTLE_SEC = 1.5
@@ -37,19 +36,6 @@ _PATH_POLL_TIMEOUT_MS = 10000
 
 _APP_NAME = "resourceinterop"
 _ASPECTS = ["test"]
-
-
-def _xfail_kotlin_receiver(wire_trio, reason_suffix=""):
-    """Same follow-up bug as test_link_multihop's xfail helper, scoped
-    here to resource reassembly on Kotlin-receiver topologies.
-    """
-    _sender, _transport, receiver = wire_trio
-    if receiver == "kotlin":
-        pytest.xfail(
-            f"reticulum-kt link-inbound / resource-reassembly reliability on "
-            f"multi-hop receive (separate from sender-side fixes)"
-            f"{reason_suffix}"
-        )
 
 
 def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
@@ -106,7 +92,6 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     one or more RESOURCE data packets → RESOURCE_PROOF. If this fails,
     the Resource API round-trip is broken even in the trivial case.
     """
-    _xfail_kotlin_receiver(wire_trio)
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(256)
@@ -130,7 +115,6 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     multiple link DATA packets. ~16 KB mirrors the size Columba was
     sending when the image bug surfaced (2 × 8175-byte chunks).
     """
-    _xfail_kotlin_receiver(wire_trio)
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(16 * 1024)
@@ -162,7 +146,6 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     This is the bug that shows up in production for Columba image
     sends.
     """
-    _xfail_kotlin_receiver(wire_trio, " with IFAC")
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(
         wire_3peer, ifac=True
     )
@@ -191,7 +174,6 @@ def test_large_resource_multihop(wire_trio, wire_3peer):
     ~8 KB MDU ≈ 32 packets, stress-tests back-to-back link DATA
     transmission + reassembly.
     """
-    _xfail_kotlin_receiver(wire_trio, " under large-resource burst")
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(256 * 1024)

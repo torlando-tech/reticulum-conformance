@@ -24,7 +24,7 @@ from bridge_client import BridgeClient
 # Scheduled for removal once downstream CI migrates to the per-impl vars.
 BRIDGE_COMMANDS = {
     "reference": "python3 {root}/reference/bridge_server.py",
-    "swift": "{root}/../reticulum-swift-lib/.build/release/ConformanceBridge",
+    "swift": "{root}/../reticulum-swift/.build/release/ConformanceBridge",
     "kotlin": "java -jar {root}/../reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar",
 }
 

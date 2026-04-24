@@ -5,13 +5,13 @@ let package = Package(
     name: "SwiftBridge",
     platforms: [.macOS(.v13)],
     dependencies: [
-        .package(path: "../../../reticulum-swift-lib"),
+        .package(path: "../../../reticulum-swift"),
     ],
     targets: [
         .executableTarget(
             name: "SwiftBridge",
             dependencies: [
-                .product(name: "ReticulumSwift", package: "reticulum-swift-lib"),
+                .product(name: "ReticulumSwift", package: "reticulum-swift"),
             ]
         )
     ]

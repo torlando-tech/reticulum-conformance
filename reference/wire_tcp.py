@@ -55,6 +55,7 @@ import socket
 import tempfile
 import threading
 import time
+from collections import deque
 
 
 _shared_wire_rns = None
@@ -62,6 +63,76 @@ _shared_wire_config_dir = None
 
 _instances = {}
 _instances_lock = threading.Lock()
+
+# Inbound packet tap: every frame that enters RNS.Transport.inbound from any
+# interface (including spawned TCPServerInterface children) is buffered here.
+# Used by conformance tests to prove that hub nodes don't fan out packets to
+# peers that shouldn't see them.
+_INBOUND_TAP_CAP = 1024
+_inbound_tap_buffer: deque = deque(maxlen=_INBOUND_TAP_CAP)
+_inbound_tap_seq = 0
+_inbound_tap_lock = threading.Lock()
+_inbound_tap_installed = False
+
+
+def _install_inbound_tap():
+    """Wrap RNS.Transport.inbound to record every received packet.
+
+    Safe to call multiple times; second+ calls are no-ops. Idempotent via
+    _inbound_tap_installed guard so _ensure_wire_rns_started can call it
+    unconditionally.
+    """
+    global _inbound_tap_installed
+    if _inbound_tap_installed:
+        return
+    RNS = _get_rns()
+    original_inbound = RNS.Transport.inbound
+
+    def _tapped_inbound(raw, interface=None):
+        global _inbound_tap_seq
+        try:
+            now_ms = int(time.time() * 1000)
+            packet_type = None
+            dest_hash_hex = None
+            context = None
+            # Header byte layout (RNS wire spec): HFFCCPPP where PPP is the
+            # packet type (bits 0-2). Extracting just these fields keeps us
+            # from re-implementing full Packet parsing in the tap; tests can
+            # still grep raw_hex for deeper inspection.
+            if raw and len(raw) >= 2:
+                header = raw[0]
+                packet_type = header & 0b00000011
+                # Destination hash follows header (+ optional IFAC bytes,
+                # but for raw comparison in tests we skip IFAC — tests that
+                # care about dest match on raw_hex directly).
+                # raw[2:18] is dest hash when no IFAC; best-effort only.
+                if len(raw) >= 18:
+                    dest_hash_hex = raw[2:18].hex()
+                if len(raw) >= 19:
+                    context = raw[18]
+            iface_name = None
+            try:
+                iface_name = str(interface) if interface is not None else None
+            except Exception:
+                iface_name = None
+            with _inbound_tap_lock:
+                _inbound_tap_seq += 1
+                _inbound_tap_buffer.append({
+                    "seq": _inbound_tap_seq,
+                    "timestamp_ms": now_ms,
+                    "raw_hex": raw.hex() if raw else "",
+                    "packet_type": packet_type,
+                    "destination_hash_hex": dest_hash_hex,
+                    "context": context,
+                    "interface_name": iface_name,
+                })
+        except Exception:
+            # The tap must never break routing. Swallow and carry on.
+            pass
+        return original_inbound(raw, interface)
+
+    RNS.Transport.inbound = _tapped_inbound
+    _inbound_tap_installed = True
 
 
 def _get_rns():
@@ -223,6 +294,7 @@ def _ensure_wire_rns_started(config_dir: str):
         configdir=config_dir,
         loglevel=ll,
     )
+    _install_inbound_tap()
     return _shared_wire_rns
 
 
@@ -1058,6 +1130,26 @@ def cmd_wire_stop(params):
     return {"stopped": True}
 
 
+def cmd_wire_get_received_packets(params):
+    """Return packets captured by the inbound tap on this bridge process.
+
+    Params:
+      since_seq (int, default 0): return only packets with seq > since_seq.
+
+    Returns:
+      {packets: [...], highest_seq: int}
+
+    The handle param is ignored — the tap is process-global (matches the
+    process-global RNS singleton). Tests with multiple instances per process
+    can still filter by interface_name if they need to.
+    """
+    since_seq = int(params.get("since_seq", 0))
+    with _inbound_tap_lock:
+        highest_seq = _inbound_tap_seq
+        packets = [p for p in _inbound_tap_buffer if p["seq"] > since_seq]
+    return {"packets": packets, "highest_seq": highest_seq}
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -1077,5 +1169,6 @@ WIRE_COMMANDS = {
     "wire_link_poll": cmd_wire_link_poll,
     "wire_resource_send": cmd_wire_resource_send,
     "wire_resource_poll": cmd_wire_resource_poll,
+    "wire_get_received_packets": cmd_wire_get_received_packets,
     "wire_stop": cmd_wire_stop,
 }

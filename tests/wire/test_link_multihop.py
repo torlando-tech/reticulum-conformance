@@ -42,26 +42,6 @@ Kotlin-sender triples are the diagnostic targets.
 import secrets
 import time
 
-import pytest
-
-
-def _xfail_kotlin_receiver_multihop(wire_trio, reason_suffix=""):
-    """Mark the test as expected-to-fail when Kotlin is the receiver in a
-    multi-hop link topology.
-
-    Under burst transmission (multiple link data packets in rapid
-    succession), reticulum-kt's Link-inbound handler currently loses
-    packets (e.g., 4/5 arrive). This is a separate bug from the
-    sender-side HEADER_2 wrapping issue this test's primary variant
-    targets, and has not been fixed here.
-    """
-    _sender, _transport, receiver = wire_trio
-    if receiver == "kotlin":
-        pytest.xfail(
-            f"reticulum-kt Link-inbound packet loss on multi-hop receive "
-            f"(separate from the sender-side fix){reason_suffix}"
-        )
-
 
 # Allow generous time budgets — link establishment involves multiple
 # round-trips plus the default RNS handshake timing (PATHFINDER + link
@@ -142,7 +122,6 @@ def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     receiver's link packet callback never fires. link_poll then
     returns empty.
     """
-    _xfail_kotlin_receiver_multihop(wire_trio)
     sender, transport, receiver, dest_hash = _setup_three_peer_topology(wire_3peer)
 
     link_id = sender.link_open(
@@ -184,7 +163,6 @@ def test_link_data_roundtrip_multiple_packets(wire_trio, wire_3peer):
     gets routed correctly (e.g. if a fix only updated the first TX but
     not later ones via an outdated path cache entry).
     """
-    _xfail_kotlin_receiver_multihop(wire_trio, " under burst send")
     sender, transport, receiver, dest_hash = _setup_three_peer_topology(wire_3peer)
 
     link_id = sender.link_open(

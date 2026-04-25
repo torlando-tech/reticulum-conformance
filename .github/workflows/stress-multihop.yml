@@ -1,0 +1,112 @@
+name: Stress Multihop Flake Rate
+
+# Approach 3 from the post-#52/#53/#54 race investigation: a non-blocking
+# canary that runs the multihop link + resource suite N times to detect
+# regressions in flake rate. Doesn't catch a specific seam (Approach 1 /
+# tests/wire/test_link_post_prove_invariant.py does that for the post-prove
+# invariant), but catches "something else started racing" without us having
+# to predict what.
+#
+# The job is `continue-on-error: true` and gated to a label so it doesn't
+# block PRs — it produces a flake-rate count that maintainers can eyeball
+# in the workflow logs. Tracked baseline: ~3 of 5 full-suite runs flake
+# (60%) per reticulum-kt#56's stress data.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, labeled]
+  schedule:
+    # Nightly run so trends are visible without needing PR labels.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  stress:
+    # Only run on PRs when explicitly labeled, OR on schedule, OR manual.
+    # Avoids spending CI minutes on every PR push.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      contains(github.event.pull_request.labels.*.name, 'stress-test')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true  # Non-blocking: this is a signal, not a gate.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-conformance
+
+      # External repos are intentionally floated against `main` (rather
+      # than a pinned SHA/tag) because the canary's purpose is to catch
+      # regressions surfacing from upstream HEADs — pinning would defeat
+      # that. If a breaking upstream commit makes the canary noisy, bump
+      # the `ref:` here to the last-known-good SHA and triage.
+      - uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/reticulum-kt
+          ref: main
+          path: reticulum-kt
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          ref: master
+          path: Reticulum
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          ref: master
+          path: LXMF
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install pytest
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Kotlin conformance bridge
+        working-directory: reticulum-kt
+        run: ./gradlew :conformance-bridge:shadowJar
+
+      - name: Stress run — multihop suite × 10
+        working-directory: reticulum-conformance
+        env:
+          CONFORMANCE_KOTLIN_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+        run: |
+          set +e
+          fail_count=0
+          pass_count=0
+          for i in $(seq 1 10); do
+            echo "=== Stress run $i / 10 ==="
+            python3 -m pytest \
+              tests/wire/test_link_multihop.py \
+              tests/wire/test_resource_multihop.py \
+              --impl=kotlin -q --tb=line
+            if [ $? -eq 0 ]; then
+              pass_count=$((pass_count + 1))
+            else
+              fail_count=$((fail_count + 1))
+            fi
+          done
+          echo ""
+          echo "::notice::Stress multihop flake rate: $fail_count of 10 runs failed ($pass_count clean)"
+          # Exit 0 (continue-on-error doubles down): the value is the
+          # ::notice:: line, visible in the workflow summary.
+          exit 0

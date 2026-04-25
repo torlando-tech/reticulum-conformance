@@ -278,6 +278,26 @@ class _WirePeer:
         )
         return bytes.fromhex(resp["link_id"])
 
+    def set_race_inducer(self, seam: str, delay_ms: int):
+        """Set a test-only race-inducer hook in the production code under test.
+
+        Used to deterministically widen narrow race windows so a regression
+        at a specific seam fails reliably instead of intermittently. Currently
+        instrumented seams (Kotlin only — Python no-ops):
+
+          "post-prove" — sleeps in receiver-side validateRequest after
+                         link.prove() returns, to verify that all bookkeeping
+                         needed for inbound DATA dispatch has completed by the
+                         time prove() returns (the invariant fixed in #54).
+        """
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_set_race_inducer",
+            handle=self.handle,
+            seam=seam,
+            delay_ms=int(delay_ms),
+        )
+
     def link_send(self, link_id: bytes, data: bytes):
         assert self.handle, "start_* must be called first"
         self.bridge.execute(

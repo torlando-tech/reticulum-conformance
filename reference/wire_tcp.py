@@ -1185,5 +1185,11 @@ WIRE_COMMANDS = {
     "wire_resource_send": cmd_wire_resource_send,
     "wire_resource_poll": cmd_wire_resource_poll,
     "wire_get_received_packets": cmd_wire_get_received_packets,
+    "wire_set_race_inducer": lambda params: {
+        # Python reference doesn't have the race we're inducing. Accept the
+        # command but no-op so cross-impl tests can call it uniformly.
+        "seam": params.get("seam"),
+        "delay_ms": int(params.get("delay_ms", 0)),
+    },
     "wire_stop": cmd_wire_stop,
 }

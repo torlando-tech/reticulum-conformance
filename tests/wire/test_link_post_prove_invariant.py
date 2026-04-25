@@ -33,6 +33,8 @@ invariant on a Python receiver would be vacuous (no inducer fires).
 import secrets
 import time
 
+import pytest
+
 
 _APP_NAME = "linkpostprove"
 _ASPECTS = ["test"]
@@ -65,9 +67,6 @@ def _setup_three_peer_topology(wire_3peer):
     return sender, transport, receiver, dest_hash
 
 
-import pytest
-
-
 _RESIDUAL_BUG_URL = "https://github.com/torlando-tech/reticulum-kt/issues/56"
 _RESIDUAL_BUG_REASON = (
     "reticulum-kt#56 residual: destination.linkEstablished callback fires "
@@ -80,13 +79,8 @@ _RESIDUAL_BUG_REASON = (
 
 @pytest.mark.xfail(strict=False, reason=_RESIDUAL_BUG_REASON)
 def test_first_data_arrives_during_induced_post_prove_window(wire_trio, wire_3peer):
-    # Inducer is Kotlin-only — Python receiver no-ops the bridge command,
-    # so verifying the invariant on a Python receiver would be vacuous.
-    _sender_impl, _transport_impl, receiver_impl = wire_trio
-    if receiver_impl != "kotlin":
-        pytest.skip("post-prove inducer is Kotlin-only; skipping non-kotlin receiver")
     """Sender sends DATA immediately after link establishment; receiver is
-    stuck in a 500ms post-prove sleep. The DATA must still be delivered.
+    stuck in a 2000ms post-prove sleep. The DATA must still be delivered.
 
     Regression test for reticulum-kt#54. Pre-fix, registerLink ran AFTER
     prove() — so the link was not in activeLinks during the induced window
@@ -95,6 +89,11 @@ def test_first_data_arrives_during_induced_post_prove_window(wire_trio, wire_3pe
     the DATA is dispatched correctly even though validateRequest is still
     sleeping.
     """
+    # Inducer is Kotlin-only — Python receiver no-ops the bridge command,
+    # so verifying the invariant on a Python receiver would be vacuous.
+    _sender_impl, _transport_impl, receiver_impl = wire_trio
+    if receiver_impl != "kotlin":
+        pytest.skip("post-prove inducer is Kotlin-only; skipping non-kotlin receiver")
     # Standard 3-peer setup: sender announces a path to receiver via
     # transport, sender opens a link to receiver's destination.
     sender, transport, receiver, dest_hash = _setup_three_peer_topology(

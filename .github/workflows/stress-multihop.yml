@@ -39,19 +39,27 @@ jobs:
         with:
           path: reticulum-conformance
 
+      # External repos are intentionally floated against `main` (rather
+      # than a pinned SHA/tag) because the canary's purpose is to catch
+      # regressions surfacing from upstream HEADs — pinning would defeat
+      # that. If a breaking upstream commit makes the canary noisy, bump
+      # the `ref:` here to the last-known-good SHA and triage.
       - uses: actions/checkout@v4
         with:
           repository: torlando-tech/reticulum-kt
+          ref: main
           path: reticulum-kt
 
       - uses: actions/checkout@v4
         with:
           repository: markqvist/Reticulum
+          ref: master
           path: Reticulum
 
       - uses: actions/checkout@v4
         with:
           repository: markqvist/LXMF
+          ref: master
           path: LXMF
 
       - name: Set up JDK 21
@@ -66,7 +74,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install pytest pytest-repeat
+        run: pip install pytest
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4

@@ -16,7 +16,6 @@ kotlin} for sender + receiver.
 
 import secrets
 
-import pytest
 
 
 # LXMF FIELD_FILE_ATTACHMENTS: key 5 per LXMF spec. Canonical wire shape
@@ -36,31 +35,11 @@ _TITLE_FILE = "Direct file attachment test"
 _ATTACHMENT_SIZE_BYTES = 2048
 
 
-def _xfail_kotlin_receiver_multipacket_duplicate(lxmf_trio):
-    """Mark the test as expected-to-fail when Kotlin is the receiver in
-    a multi-packet (Resource) DIRECT delivery test.
-
-    Bug: LXMF-kt delivers the same LXMessage twice when it arrives via
-    the Resource path, because its inbound-link wiring fires both
-    link.setPacketCallback and link.setResourceConcludedCallback on
-    resource-based delivery, and the `transientId` dedup in
-    processInboundDelivery is perpetually no-op
-    (LXMessage.transientId is declared private-set but never assigned
-    on the unpack path — see LXMessage.kt:63, LXMRouter.kt:1368).
-
-    Tracked in https://github.com/torlando-tech/LXMF-kt/issues/8.
-    Matches the loose-xfail pattern from tests/wire/test_link_multihop.py
-    (_xfail_kotlin_receiver_multihop). GitHub issue tracks the fix;
-    once closed, remove the pytest.xfail() call manually so the test
-    runs as a regular assertion again. (In-body pytest.xfail() raises
-    XFailed unconditionally, so there's no automatic XPASS flip.)
-    """
-    _sender, _middle, receiver = lxmf_trio
-    if receiver == "kotlin":
-        pytest.xfail(
-            "LXMF-kt receiver delivers multi-packet DIRECT LXMessage "
-            "twice — https://github.com/torlando-tech/LXMF-kt/issues/8"
-        )
+# LXMF-kt#8 (DIRECT multi-packet double-delivery) was fixed by
+# LXMF-kt#14 + #16, included from v0.0.8 of the LXMF-kt artifact that
+# reticulum-kt's conformance-bridge consumes. The receiver=kotlin
+# variants of test_direct_with_file_attachment_multipacket below now
+# pass without the prior xfail gate.
 
 
 def test_direct_text_round_trip(lxmf_trio, lxmf_transport_3peer):
@@ -124,13 +103,6 @@ def test_direct_with_file_attachment_multipacket(lxmf_trio, lxmf_transport_3peer
     the canonical wire format that all LXMF impls agree on when
     encoding attachments for transport.
     """
-    # Gate the kotlin-receiver case on the duplicate-delivery bug.
-    # Note: pytest resolves fixtures before the test body runs, so this
-    # call does not skip fixture setup — it only short-circuits the
-    # assertions below. Loose-xfail pattern matching
-    # tests/wire/test_link_multihop.py.
-    _xfail_kotlin_receiver_multipacket_duplicate(lxmf_trio)
-
     sender, receiver = lxmf_transport_3peer
 
     content = f"direct file {secrets.token_hex(4)}"

@@ -424,6 +424,18 @@ class ThreeNodeSession:
             FLAG = 0x7E
             ESC = 0x7D
             ESC_MASK = 0x20
+            # Required by RNS.Reticulum._add_interface (Reticulum.py:780),
+            # which reads `interface.DEFAULT_IFAC_SIZE` whenever no explicit
+            # `ifac_size` is passed. Every concrete RNS interface declares
+            # one (SerialInterface.py / AX25KISSInterface.py = 8;
+            # UDPInterface / BackboneInterface = 16). Without it,
+            # _add_interface raises AttributeError and Node B's setup in
+            # ThreeNodeSession aborts, cascading into "A should emit ready"
+            # failures in test_path_request_pipe.py because A's subprocess
+            # never sees the other end of the pipe come up. Match the
+            # serial-class default of 8 since this is a stdio pipe, not
+            # a UDP-style network interface.
+            DEFAULT_IFAC_SIZE = 8
 
             def __init__(self, iname, ipin, ipout, imode):
                 super().__init__()

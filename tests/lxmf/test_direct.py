@@ -17,7 +17,6 @@ kotlin} for sender + receiver.
 import secrets
 
 
-
 # LXMF FIELD_FILE_ATTACHMENTS: key 5 per LXMF spec. Canonical wire shape
 # (see memory/lxmf-attachment-format-variance.md): list of 2-element
 # positional tuples, [[filename_str, data_bytes], ...]. This test

@@ -356,6 +356,14 @@ def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):
         FLAG = 0x7E
         ESC = 0x7D
         ESC_MASK = 0x20
+        # Required by RNS.Reticulum._add_interface (Reticulum.py:966).
+        # See the matching attribute on three_node_session._HdlcPipe.
+        # Without this, A's `_add_interface` call raises AttributeError
+        # silently before A reaches `emit({"type": "ready"})`, and the
+        # session-level "A should emit ready" assertion fails after a
+        # 20s timeout. Match the serial-class default of 8 since this
+        # is a stdio pipe, not a UDP-style network interface.
+        DEFAULT_IFAC_SIZE = 8
 
         def __init__(self):
             super().__init__()

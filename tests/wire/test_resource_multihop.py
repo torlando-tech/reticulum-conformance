@@ -27,8 +27,6 @@ receiver_impl) triples the link-multihop test uses.
 import secrets
 import time
 
-
-
 _SETTLE_SEC = 1.5
 _LINK_TIMEOUT_MS = 15000
 _RESOURCE_TIMEOUT_MS = 30000

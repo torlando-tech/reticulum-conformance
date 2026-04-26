@@ -499,18 +499,33 @@ def cmd_wire_listen(params):
     On link establishment, attach a packet callback that buffers received
     bytes into an in-memory queue keyed by destination_hash. Also accept
     any Resource transfers on the link and buffer their reassembled data.
-    Tests poll via wire_link_poll (single-packet data) or
-    wire_resource_poll (completed resources).
+    Tests poll via wire_link_poll (single-packet data over an
+    established Link), wire_opportunistic_poll (single-packet data
+    delivered opportunistically to the SINGLE destination, not via a
+    Link), or wire_resource_poll (completed resources). The link and
+    opportunistic buffers are kept separate so callers of one are never
+    silently fed packets from the other path.
 
     Intended for the receiver-side peer in multi-hop link tests. The
     sender uses wire_link_open to establish the link, then either
     wire_link_send (single packet) or wire_resource_send (arbitrary-size
     data chunked via the Resource API).
+
+    Optional params:
+      proof_strategy (str): one of "none" (default), "all". When set to
+        "all", calls destination.set_proof_strategy(PROVE_ALL) so this
+        destination auto-emits a PROOF on every received DATA packet.
+        Required when this peer is the receiver side of an opportunistic-
+        delivery test (sender's PacketReceipt only fires if a valid proof
+        comes back). Python's per-destination default is PROVE_NONE; this
+        param exists so the receiver-side observable matches whatever
+        symmetric bridge command the other impls expose.
     """
     RNS = _get_rns()
     handle = params["handle"]
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
+    proof_strategy_str = (params.get("proof_strategy") or "none").lower()
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -526,10 +541,35 @@ def cmd_wire_listen(params):
         *aspects,
     )
 
-    # Per-destination receive buffers.
-    recv_buffer = []         # single-packet link data
-    resource_buffer = []     # completed resources (bytes)
+    if proof_strategy_str == "all":
+        destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
+    elif proof_strategy_str != "none":
+        raise ValueError(
+            f"Unsupported proof_strategy={proof_strategy_str!r}; "
+            f"expected 'none' or 'all'"
+        )
+
+    # Per-destination receive buffers. Link DATA and opportunistic DATA are
+    # kept in separate buffers so a test that uses both surfaces (e.g. opens
+    # a Link AND has an opportunistic listener on the same destination) can
+    # drain each independently without races. wire_link_poll reads
+    # recv_buffer; wire_opportunistic_poll reads opportunistic_buffer. Both
+    # share the same recv_lock — the lock guards the entire listener record,
+    # which is cheap given the low contention on these in-memory deques.
+    recv_buffer = []                # single-packet link DATA (over an established Link)
+    opportunistic_buffer = []       # opportunistic DATA addressed directly to the SINGLE destination
+    resource_buffer = []            # completed resources (bytes)
     recv_lock = threading.Lock()
+
+    # Opportunistic-DATA callback on the destination itself. Fires for any
+    # DATA packet addressed to this SINGLE destination that wasn't routed
+    # through a Link — i.e. the opportunistic-delivery path. Buffered into
+    # opportunistic_buffer (separate from link recv_buffer) so callers of
+    # wire_link_poll never see opportunistic traffic and vice versa.
+    def on_opportunistic_packet(message, _packet):
+        with recv_lock:
+            opportunistic_buffer.append(bytes(message))
+    destination.set_packet_callback(on_opportunistic_packet)
 
     def on_link_established(link):
         def on_packet(message, packet):
@@ -563,6 +603,7 @@ def cmd_wire_listen(params):
         "destination": destination,
         "identity": identity,
         "recv_buffer": recv_buffer,
+        "opportunistic_buffer": opportunistic_buffer,
         "resource_buffer": resource_buffer,
         "recv_lock": recv_lock,
     }
@@ -573,6 +614,104 @@ def cmd_wire_listen(params):
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
     }
+
+
+def cmd_wire_send_opportunistic(params):
+    """Send an opportunistic SINGLE-destination DATA packet and wait for
+    delivery proof.
+
+    Mirrors what apps like LXMF do for opportunistic delivery: construct
+    an OUT SINGLE destination from a previously-received announce, build
+    a DATA packet (which auto-encrypts via Identity.encrypt), call
+    .send() to get a PacketReceipt, then wait for the receipt to fire
+    DELIVERED (the receiver's auto-proof must arrive and validate).
+
+    Params:
+      handle (str): bridge handle returned by wire_start_tcp_*
+      destination_hash (hex str): 16-byte SINGLE destination hash
+      app_name (str): destination app_name (must match listener)
+      aspects (list[str]): destination aspects (must match listener)
+      data (hex str): plaintext payload (will be encrypted by RNS)
+      timeout_ms (int, default 5000): how long to wait for the receipt
+        to fire DELIVERED before reporting timeout
+
+    Returns:
+      {sent: bool, delivered: bool, status: str}
+        status ∈ {"delivered", "timeout", "send_failed"}
+
+    Note: Identity.recall requires that an announce for `destination_hash`
+    has already been processed by Transport. Receiver should have called
+    wire_listen first, and the caller should poll wire_poll_path before
+    invoking this to make sure the announce has propagated.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data") or "")
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; ensure an "
+            f"announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    delivered = threading.Event()
+
+    def on_delivered(_receipt):
+        delivered.set()
+
+    def on_timeout(_receipt):
+        # Distinguish a CULLED receipt (no proof returned within receipt
+        # timeout) from successful delivery. We deliberately don't set
+        # the event here — main thread also polls receipt.status.
+        pass
+
+    packet = RNS.Packet(out_destination, payload)
+    # Receipt-timeout-budget on the receipt itself: leave RNS's default
+    # in place (it scales with hop count via TIMEOUT_PER_HOP). Our
+    # wait-for-event is what bounds the test wall-clock; if the
+    # receipt times out internally it'll set FAILED/CULLED status which
+    # we observe at the end.
+    receipt = packet.send()
+    if receipt is None or receipt is False:
+        return {"sent": False, "delivered": False, "status": "send_failed"}
+
+    receipt.set_delivery_callback(on_delivered)
+    receipt.set_timeout_callback(on_timeout)
+
+    fired = delivered.wait(timeout=timeout_ms / 1000.0)
+    if fired or receipt.status == RNS.PacketReceipt.DELIVERED:
+        status = "delivered"
+        delivered_flag = True
+    else:
+        # Receipt didn't resolve in our window. The status field will
+        # be SENT (still pending), CULLED (RNS internal timeout), or
+        # FAILED. All three mean "no valid proof arrived".
+        status = "timeout"
+        delivered_flag = False
+
+    # Keep the destination/identity alive for the receipt's lifetime so
+    # GC doesn't tear them down before a late proof arrives.
+    inst["destinations"].append((identity, out_destination))
+
+    return {"sent": True, "delivered": delivered_flag, "status": status}
 
 
 def cmd_wire_link_open(params):
@@ -786,11 +925,15 @@ def cmd_wire_resource_poll(params):
 
 
 def cmd_wire_link_poll(params):
-    """Poll the receive buffer for a listening destination.
+    """Poll the link-DATA receive buffer for a listening destination.
 
-    Returns all packets received since the last poll (drained). Blocks up
-    to timeout_ms waiting for at least one packet; returns whatever is
-    present at deadline even if empty.
+    Returns all link-DATA packets received since the last poll (drained).
+    Opportunistic-DATA packets (addressed to the SINGLE destination
+    directly, not routed through a Link) live in a separate buffer and
+    are drained via wire_opportunistic_poll — wire_link_poll callers
+    only ever see link-DATA traffic. Blocks up to timeout_ms waiting for
+    at least one packet; returns whatever is present at deadline even
+    if empty.
     """
     handle = params["handle"]
     destination_hash = bytes.fromhex(params["destination_hash"])
@@ -819,6 +962,50 @@ def cmd_wire_link_poll(params):
     with listener["recv_lock"]:
         out = [p.hex() for p in listener["recv_buffer"]]
         listener["recv_buffer"].clear()
+    return {"packets": out}
+
+
+def cmd_wire_opportunistic_poll(params):
+    """Poll the opportunistic-DATA buffer for a listening destination.
+
+    Mirrors wire_link_poll but drains opportunistic-DATA packets (DATA
+    packets addressed directly to the SINGLE destination, not routed
+    through a Link). This is the receiver-side observable for
+    opportunistic delivery — counterpart to the sender-side
+    wire_send_opportunistic command.
+
+    Kept as a separate command from wire_link_poll so a single test that
+    uses both surfaces (opens a Link AND receives opportunistic DATA on
+    the same destination) can drain each unambiguously. Existing
+    wire_link_poll callers see no opportunistic traffic, and vice versa.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        with listener["recv_lock"]:
+            if listener["opportunistic_buffer"]:
+                out = [p.hex() for p in listener["opportunistic_buffer"]]
+                listener["opportunistic_buffer"].clear()
+                return {"packets": out}
+        time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        out = [p.hex() for p in listener["opportunistic_buffer"]]
+        listener["opportunistic_buffer"].clear()
     return {"packets": out}
 
 
@@ -1179,9 +1366,11 @@ WIRE_COMMANDS = {
     "wire_tx_bytes": cmd_wire_tx_bytes,
     "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
     "wire_listen": cmd_wire_listen,
+    "wire_send_opportunistic": cmd_wire_send_opportunistic,
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,
     "wire_link_poll": cmd_wire_link_poll,
+    "wire_opportunistic_poll": cmd_wire_opportunistic_poll,
     "wire_resource_send": cmd_wire_resource_send,
     "wire_resource_poll": cmd_wire_resource_poll,
     "wire_get_received_packets": cmd_wire_get_received_packets,

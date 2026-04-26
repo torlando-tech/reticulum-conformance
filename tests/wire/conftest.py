@@ -248,16 +248,61 @@ class _WirePeer:
         )
         return bool(resp.get("found"))
 
-    def listen(self, app_name: str, aspects: list) -> bytes:
-        """Register an IN destination that accepts incoming Links."""
+    def listen(
+        self,
+        app_name: str,
+        aspects: list,
+        proof_strategy: str | None = None,
+    ) -> bytes:
+        """Register an IN destination that accepts incoming Links.
+
+        proof_strategy: optional, "all" sets the destination to auto-emit
+          a PROOF on every received DATA packet. Python's destination
+          default is PROVE_NONE, so this MUST be set when a Python peer
+          is the receiver in an opportunistic-delivery test (otherwise
+          no auto-proof is emitted and the sender's PacketReceipt
+          times out). Bridges for impls whose `wire_listen` already
+          auto-proves SINGLE DATA unconditionally may ignore the param.
+        """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_listen",
+        kwargs: dict = {
+            "handle": self.handle,
+            "app_name": app_name,
+            "aspects": list(aspects),
+        }
+        if proof_strategy is not None:
+            kwargs["proof_strategy"] = proof_strategy
+        resp = self.bridge.execute("wire_listen", **kwargs)
+        return bytes.fromhex(resp["destination_hash"])
+
+    def send_opportunistic(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        data: bytes,
+        timeout_ms: int = 5000,
+    ) -> dict:
+        """Send an opportunistic SINGLE-destination DATA packet and wait
+        for the delivery proof.
+
+        Returns the bridge's response dict:
+          {"sent": bool, "delivered": bool, "status": str}
+        where status is "delivered", "timeout", or "send_failed". The
+        receiver must have a SINGLE destination at `destination_hash`
+        with proof emission enabled — for the Python bridge that means
+        proof_strategy="all" on wire_listen (default is PROVE_NONE).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_opportunistic",
             handle=self.handle,
+            destination_hash=destination_hash.hex(),
             app_name=app_name,
             aspects=list(aspects),
+            data=data.hex(),
+            timeout_ms=timeout_ms,
         )
-        return bytes.fromhex(resp["destination_hash"])
 
     def link_open(
         self,

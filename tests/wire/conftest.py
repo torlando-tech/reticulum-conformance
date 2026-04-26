@@ -333,10 +333,37 @@ class _WirePeer:
         )
 
     def link_poll(self, destination_hash: bytes, timeout_ms: int = 5000) -> list:
-        """Drain all link data received on `destination_hash` since last poll."""
+        """Drain all link DATA received on `destination_hash` since last poll.
+
+        Returns ONLY single-packet data that arrived over an established
+        Link to this destination. Opportunistic-DATA delivered directly
+        to the SINGLE destination is buffered separately — drain via
+        `opportunistic_poll`. The split exists so a test that uses both
+        surfaces never accidentally sees the wrong stream.
+        """
         assert self.handle, "start_* must be called first"
         resp = self.bridge.execute(
             "wire_link_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("packets", [])]
+
+    def opportunistic_poll(
+        self, destination_hash: bytes, timeout_ms: int = 5000
+    ) -> list:
+        """Drain all opportunistic DATA received on `destination_hash`.
+
+        Counterpart to `link_poll`: returns only DATA packets that
+        arrived as opportunistic delivery (addressed directly to the
+        SINGLE destination, not routed through a Link). Used by
+        opportunistic-delivery tests to confirm the receiver actually
+        saw the payload.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_opportunistic_poll",
             handle=self.handle,
             destination_hash=destination_hash.hex(),
             timeout_ms=timeout_ms,

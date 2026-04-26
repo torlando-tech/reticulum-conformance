@@ -219,7 +219,7 @@ def test_opportunistic_proof_destination_type(wire_pair, wire_peers):
     # only inspect packets received *after* the DATA emission. This
     # avoids picking up the receiver's announce ANNOUNCE packet (which
     # also has destination-type bits but encodes a different invariant).
-    pre = sender.bridge.execute("wire_get_received_packets", since_seq=0)
+    pre = sender.get_received_packets(since_seq=0)
     base_seq = int(pre.get("highest_seq", 0))
 
     payload = b"opportunistic-proof-no-ifac"
@@ -259,9 +259,7 @@ def test_opportunistic_proof_destination_type(wire_pair, wire_peers):
     # whose dest hash isn't a known incidental hash and assert there's
     # exactly one. In practice on a 2-peer no-traffic loopback that's
     # the proof we sent.
-    found = sender.bridge.execute(
-        "wire_get_received_packets", since_seq=base_seq
-    )
+    found = sender.get_received_packets(since_seq=base_seq)
     proofs = [
         pkt for pkt in found.get("packets", [])
         if (pkt.get("packet_type") == _PACKET_TYPE_PROOF)

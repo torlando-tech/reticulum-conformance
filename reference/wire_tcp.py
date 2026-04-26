@@ -499,8 +499,12 @@ def cmd_wire_listen(params):
     On link establishment, attach a packet callback that buffers received
     bytes into an in-memory queue keyed by destination_hash. Also accept
     any Resource transfers on the link and buffer their reassembled data.
-    Tests poll via wire_link_poll (single-packet data) or
-    wire_resource_poll (completed resources).
+    Tests poll via wire_link_poll (single-packet data over an
+    established Link), wire_opportunistic_poll (single-packet data
+    delivered opportunistically to the SINGLE destination, not via a
+    Link), or wire_resource_poll (completed resources). The link and
+    opportunistic buffers are kept separate so callers of one are never
+    silently fed packets from the other path.
 
     Intended for the receiver-side peer in multi-hop link tests. The
     sender uses wire_link_open to establish the link, then either
@@ -545,19 +549,26 @@ def cmd_wire_listen(params):
             f"expected 'none' or 'all'"
         )
 
-    # Per-destination receive buffers.
-    recv_buffer = []         # single-packet link data (link DATA OR opportunistic DATA)
-    resource_buffer = []     # completed resources (bytes)
+    # Per-destination receive buffers. Link DATA and opportunistic DATA are
+    # kept in separate buffers so a test that uses both surfaces (e.g. opens
+    # a Link AND has an opportunistic listener on the same destination) can
+    # drain each independently without races. wire_link_poll reads
+    # recv_buffer; wire_opportunistic_poll reads opportunistic_buffer. Both
+    # share the same recv_lock — the lock guards the entire listener record,
+    # which is cheap given the low contention on these in-memory deques.
+    recv_buffer = []                # single-packet link DATA (over an established Link)
+    opportunistic_buffer = []       # opportunistic DATA addressed directly to the SINGLE destination
+    resource_buffer = []            # completed resources (bytes)
     recv_lock = threading.Lock()
 
     # Opportunistic-DATA callback on the destination itself. Fires for any
     # DATA packet addressed to this SINGLE destination that wasn't routed
     # through a Link — i.e. the opportunistic-delivery path. Buffered into
-    # the same recv_buffer as link data; tests that need to disambiguate
-    # can register the listener on a different app_name.
+    # opportunistic_buffer (separate from link recv_buffer) so callers of
+    # wire_link_poll never see opportunistic traffic and vice versa.
     def on_opportunistic_packet(message, _packet):
         with recv_lock:
-            recv_buffer.append(bytes(message))
+            opportunistic_buffer.append(bytes(message))
     destination.set_packet_callback(on_opportunistic_packet)
 
     def on_link_established(link):
@@ -592,6 +603,7 @@ def cmd_wire_listen(params):
         "destination": destination,
         "identity": identity,
         "recv_buffer": recv_buffer,
+        "opportunistic_buffer": opportunistic_buffer,
         "resource_buffer": resource_buffer,
         "recv_lock": recv_lock,
     }
@@ -913,11 +925,15 @@ def cmd_wire_resource_poll(params):
 
 
 def cmd_wire_link_poll(params):
-    """Poll the receive buffer for a listening destination.
+    """Poll the link-DATA receive buffer for a listening destination.
 
-    Returns all packets received since the last poll (drained). Blocks up
-    to timeout_ms waiting for at least one packet; returns whatever is
-    present at deadline even if empty.
+    Returns all link-DATA packets received since the last poll (drained).
+    Opportunistic-DATA packets (addressed to the SINGLE destination
+    directly, not routed through a Link) live in a separate buffer and
+    are drained via wire_opportunistic_poll — wire_link_poll callers
+    only ever see link-DATA traffic. Blocks up to timeout_ms waiting for
+    at least one packet; returns whatever is present at deadline even
+    if empty.
     """
     handle = params["handle"]
     destination_hash = bytes.fromhex(params["destination_hash"])
@@ -946,6 +962,50 @@ def cmd_wire_link_poll(params):
     with listener["recv_lock"]:
         out = [p.hex() for p in listener["recv_buffer"]]
         listener["recv_buffer"].clear()
+    return {"packets": out}
+
+
+def cmd_wire_opportunistic_poll(params):
+    """Poll the opportunistic-DATA buffer for a listening destination.
+
+    Mirrors wire_link_poll but drains opportunistic-DATA packets (DATA
+    packets addressed directly to the SINGLE destination, not routed
+    through a Link). This is the receiver-side observable for
+    opportunistic delivery — counterpart to the sender-side
+    wire_send_opportunistic command.
+
+    Kept as a separate command from wire_link_poll so a single test that
+    uses both surfaces (opens a Link AND receives opportunistic DATA on
+    the same destination) can drain each unambiguously. Existing
+    wire_link_poll callers see no opportunistic traffic, and vice versa.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        with listener["recv_lock"]:
+            if listener["opportunistic_buffer"]:
+                out = [p.hex() for p in listener["opportunistic_buffer"]]
+                listener["opportunistic_buffer"].clear()
+                return {"packets": out}
+        time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        out = [p.hex() for p in listener["opportunistic_buffer"]]
+        listener["opportunistic_buffer"].clear()
     return {"packets": out}
 
 
@@ -1310,6 +1370,7 @@ WIRE_COMMANDS = {
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,
     "wire_link_poll": cmd_wire_link_poll,
+    "wire_opportunistic_poll": cmd_wire_opportunistic_poll,
     "wire_resource_send": cmd_wire_resource_send,
     "wire_resource_poll": cmd_wire_resource_poll,
     "wire_get_received_packets": cmd_wire_get_received_packets,

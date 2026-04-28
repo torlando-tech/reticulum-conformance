@@ -6,10 +6,12 @@ over stdin/stdout. This client manages the subprocess lifecycle and
 provides a clean API for sending commands and receiving responses.
 """
 
+import collections
 import json
-import subprocess
 import os
 import signal
+import subprocess
+import threading
 import time
 
 
@@ -56,6 +58,20 @@ class BridgeClient:
             bufsize=1,
         )
 
+        # Drain stderr in a background thread. Without this, verbose stderr
+        # output from a bridge (e.g. reticulum-kt's per-packet Transport
+        # tracing) fills the OS pipe buffer (~64 KB) mid-test and the bridge
+        # subprocess BLOCKS on its next stderr write, stalling everything
+        # downstream — manifests as Resource transfers freezing after a
+        # handful of forwarded packets and the sender timing out with
+        # status=FAILED. The drained tail is kept in a small ring buffer so
+        # error messages can still surface bridge stderr context on failure.
+        self._stderr_tail = collections.deque(maxlen=200)
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True
+        )
+        self._stderr_thread.start()
+
         # Wait for READY signal
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -63,11 +79,30 @@ class BridgeClient:
             if line == "READY":
                 return
             if not line and self._proc.poll() is not None:
-                stderr = self._proc.stderr.read()
                 raise BridgeError(
-                    f"Bridge process exited before READY: {stderr}"
+                    f"Bridge process exited before READY: {self._stderr_snapshot()}"
                 )
         raise BridgeError(f"Bridge did not send READY within {timeout}s")
+
+    def _drain_stderr(self):
+        """Background drainer for the bridge's stderr pipe.
+
+        Reads line-by-line and stashes the last N lines for diagnostic use.
+        Critical for any bridge that logs verbosely on stderr — without it
+        the kernel pipe buffer fills and the bridge blocks mid-operation.
+        """
+        try:
+            for line in iter(self._proc.stderr.readline, ""):
+                if not line:
+                    break
+                self._stderr_tail.append(line)
+        except Exception:
+            pass
+
+    def _stderr_snapshot(self):
+        """Return the last few hundred lines of bridge stderr for error
+        context. Drains any in-flight content first."""
+        return "".join(self._stderr_tail)
 
     def execute(self, command, **params):
         """
@@ -101,9 +136,9 @@ class BridgeClient:
         while True:
             response_line = self._proc.stdout.readline()
             if not response_line:
-                stderr = self._proc.stderr.read()
                 raise BridgeError(
-                    f"Bridge closed stdout (stderr: {stderr})", command=command
+                    f"Bridge closed stdout (stderr: {self._stderr_snapshot()})",
+                    command=command,
                 )
             if response_line.strip().startswith("{"):
                 break

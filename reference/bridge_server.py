@@ -3149,7 +3149,7 @@ def cmd_rns_start(params):
 
     # Suppress RNS logging to avoid polluting JSON output on stdout
     # RNS logs go to stdout by default which breaks the bridge protocol
-    RNS.loglevel = RNS.LOG_CRITICAL
+    RNS.loglevel = int(os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL)))
 
     # Pre-create config file to:
     # 1. Prevent Reticulum from detecting/connecting to any running shared instance
@@ -3165,10 +3165,10 @@ def cmd_rns_start(params):
             f.write("  share_instance = No\n")
             f.write("\n[interfaces]\n")
 
-    # Start Reticulum with transport enabled (minimal logging)
+    # Start Reticulum with transport enabled (loglevel env-overridable)
     _rns_instance = RNS.Reticulum(
         configdir=config_path,
-        loglevel=RNS.LOG_CRITICAL  # Only log critical errors
+        loglevel=int(os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL)))
     )
 
     # Create TCP server interface using configuration dict
@@ -4778,6 +4778,13 @@ def main():
     # Signal ready
     print("READY", flush=True)
 
+    # After READY, reroute stdout to stderr so RNS.log() (which writes to
+    # sys.stdout by default) doesn't pollute the JSON-RPC channel — and
+    # so its diagnostics are actually visible when wrapping the bridge
+    # for stderr capture.
+    _stdout_for_rpc = sys.stdout
+    sys.stdout = sys.stderr
+
     # Process commands
     for line in sys.stdin:
         line = line.strip()
@@ -4787,14 +4794,14 @@ def main():
         try:
             request = json.loads(line)
             response = handle_request(request)
-            print(json.dumps(response), flush=True)
+            print(json.dumps(response), flush=True, file=_stdout_for_rpc)
         except json.JSONDecodeError as e:
             error_response = {
                 'id': 'parse_error',
                 'success': False,
                 'error': f"JSON parse error: {e}"
             }
-            print(json.dumps(error_response), flush=True)
+            print(json.dumps(error_response), flush=True, file=_stdout_for_rpc)
 
 
 if __name__ == '__main__':

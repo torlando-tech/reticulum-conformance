@@ -39,17 +39,35 @@ _APP_NAME = "resourceinterop"
 _ASPECTS = ["test"]
 
 
-def _xfail_kotlin_receiver(wire_trio, reason_suffix=""):
-    """Same follow-up bug as test_link_multihop's xfail helper, scoped
-    here to resource reassembly on Kotlin-receiver topologies.
+def _xfail_kotlin_large_burst(wire_trio):
+    """Bug B in reticulum-kt: Resource transfers fail at payloads >= ~96 KB
+    when kotlin participates in any role except pure sender-with-reference-
+    receiver. Bisected to a cliff between 64 KB (passes) and 96 KB (fails);
+    fail mode is sender-reported status=7 FAILED. The smaller-payload
+    variants (test_small_*, test_chunked_*) all pass on every kotlin
+    topology — the previous _xfail_kotlin_receiver helper was stale and
+    masked this size-dependent regression for everything below the cliff.
+    Tracked separately; remove this once the kotlin Resource code path
+    handles large bursts cleanly.
     """
-    _sender, _transport, receiver = wire_trio
-    if receiver == "kotlin":
-        pytest.xfail(
-            f"reticulum-kt link-inbound / resource-reassembly reliability on "
-            f"multi-hop receive (separate from sender-side fixes)"
-            f"{reason_suffix}"
-        )
+    sender, transport, receiver = wire_trio
+    if "kotlin" in (sender, transport, receiver):
+        # Empirically at 256 KB, only two kotlin trios pass:
+        #   - kotlin→reference→reference (kotlin sender, all-reference rest)
+        #   - kotlin→kotlin→kotlin (all-kotlin — bug doesn't trigger when
+        #     every hop speaks the same buggy implementation)
+        # Every cross-impl trio fails. Likely sender/receiver windowing or
+        # request-cycle mismatch between kotlin and reference.
+        passing = {
+            ("kotlin", "reference", "reference"),
+            ("kotlin", "kotlin", "kotlin"),
+        }
+        if (sender, transport, receiver) not in passing:
+            pytest.xfail(
+                "reticulum-kt Bug B: Resource transfer fails at payloads "
+                ">= ~96 KB on most kotlin topologies (sender status=7 FAILED). "
+                "Cliff bisected between 64 KB (PASS) and 96 KB (FAIL)."
+            )
 
 
 def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
@@ -106,7 +124,6 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     one or more RESOURCE data packets → RESOURCE_PROOF. If this fails,
     the Resource API round-trip is broken even in the trivial case.
     """
-    _xfail_kotlin_receiver(wire_trio)
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(256)
@@ -130,7 +147,6 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     multiple link DATA packets. ~16 KB mirrors the size Columba was
     sending when the image bug surfaced (2 × 8175-byte chunks).
     """
-    _xfail_kotlin_receiver(wire_trio)
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(16 * 1024)
@@ -162,7 +178,6 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     This is the bug that shows up in production for Columba image
     sends.
     """
-    _xfail_kotlin_receiver(wire_trio, " with IFAC")
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(
         wire_3peer, ifac=True
     )
@@ -191,7 +206,7 @@ def test_large_resource_multihop(wire_trio, wire_3peer):
     ~8 KB MDU ≈ 32 packets, stress-tests back-to-back link DATA
     transmission + reassembly.
     """
-    _xfail_kotlin_receiver(wire_trio, " under large-resource burst")
+    _xfail_kotlin_large_burst(wire_trio)
     sender, receiver, dest_hash, link_id = _setup_three_peer_topology(wire_3peer)
 
     payload = secrets.token_bytes(256 * 1024)

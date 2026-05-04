@@ -183,6 +183,16 @@ REGISTER_COMMAND(packet_hash, {
     int header_type = (flags & 0b01000000) >> 6;
     uint8_t masked = flags & 0b00001111;
 
+    // Match the per-header-type minimum-size guards already used by
+    // packet_unpack / packet_parse_header. Without this a HEADER_2 packet
+    // shorter than 18 bytes would slice raw.begin() + 18 — past raw.end()
+    // — and feed an invalid range to insert(), which is UB.
+    size_t min_size = (header_type == 1) ? (2 + DST_LEN + DST_LEN + 1)
+                                         : (2 + DST_LEN + 1);
+    if (raw.size() < min_size) {
+        throw std::runtime_error("packet_hash: packet too short for header type");
+    }
+
     bridge::Bytes hashable;
     hashable.push_back(masked);
     if (header_type == 1) {

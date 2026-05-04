@@ -66,6 +66,17 @@ REGISTER_COMMAND(link_id_from_packet, {
     int header_type = (flags & 0b01000000) >> 6;
     uint8_t masked = flags & 0b00001111;
 
+    // HEADER_2 path slices raw.begin() + 2 + DST_LEN (offset 18) — without
+    // a size guard, a 3..17-byte packet with the header-type-1 bit set
+    // would form an iterator past raw.end() and feed it to insert(), which
+    // is UB. packet_unpack and packet_parse_header check the same lower
+    // bound — apply it here too.
+    size_t min_size = (header_type == 1) ? (2 + DST_LEN + DST_LEN + 1)
+                                         : (2 + DST_LEN + 1);
+    if (raw.size() < min_size) {
+        throw std::runtime_error("link_id_from_packet: packet too short for header type");
+    }
+
     bridge::Bytes hashable;
     hashable.push_back(masked);
     size_t header_len;

@@ -56,6 +56,9 @@ REGISTER_COMMAND(ifac_compute, {
     if (ifac_key.size() != 64) {
         throw std::runtime_error("ifac_compute: ifac_key must be 64 bytes");
     }
+    if (ifac_size <= 0) {
+        throw std::runtime_error("ifac_compute: ifac_size must be positive");
+    }
     bridge::Bytes ed_key(ifac_key.begin() + 32, ifac_key.end());
     auto sig = ed25519_sign(ed_key, packet_data);
     if ((int)sig.size() < ifac_size) {
@@ -103,10 +106,18 @@ REGISTER_COMMAND(ifac_mask_packet, {
     if (raw.size() < 2) {
         throw std::runtime_error("ifac_mask_packet: packet too short");
     }
+    if (ifac_size <= 0) {
+        throw std::runtime_error("ifac_mask_packet: ifac_size must be positive");
+    }
 
     // Compute IFAC tag over original packet data.
     bridge::Bytes ed_key(ifac_key.begin() + 32, ifac_key.end());
     auto sig = ed25519_sign(ed_key, raw);
+    if ((size_t)ifac_size > sig.size()) {
+        // ifac_size larger than the underlying Ed25519 signature (64 bytes)
+        // — guard against pointer underflow / UB.
+        throw std::runtime_error("ifac_mask_packet: ifac_size exceeds signature length");
+    }
     bridge::Bytes ifac(sig.end() - ifac_size, sig.end());
 
     // Build result: [flags|0x80][hops][ifac][rest...]
@@ -139,6 +150,9 @@ REGISTER_COMMAND(ifac_unmask_packet, {
     if (ifac_key.size() != 64) {
         throw std::runtime_error("ifac_unmask_packet: ifac_key must be 64 bytes");
     }
+    if (ifac_size <= 0) {
+        return bridge::json{{"valid", false}, {"unmasked", ""}};
+    }
     if (masked.size() < (size_t)(2 + ifac_size)) {
         return bridge::json{{"valid", false}, {"unmasked", ""}};
     }
@@ -164,6 +178,11 @@ REGISTER_COMMAND(ifac_unmask_packet, {
     // Recompute expected IFAC over original packet data and compare.
     bridge::Bytes ed_key(ifac_key.begin() + 32, ifac_key.end());
     auto sig = ed25519_sign(ed_key, original);
+    if ((size_t)ifac_size > sig.size()) {
+        // ifac_size > Ed25519 signature length (64) — would underflow
+        // the sig.end() - ifac_size arithmetic. Reject as invalid.
+        return bridge::json{{"valid", false}, {"unmasked_packet", bridge::to_hex(original)}, {"ifac", bridge::to_hex(ifac)}};
+    }
     bridge::Bytes expected(sig.end() - ifac_size, sig.end());
     bool ok = expected.size() == ifac.size()
               && bridge::consttime_memequal(expected.data(), ifac.data(), ifac_size);

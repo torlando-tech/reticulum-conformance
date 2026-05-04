@@ -136,18 +136,12 @@ REGISTER_COMMAND(pkcs7_pad, {
 })
 
 REGISTER_COMMAND(pkcs7_unpad, {
+    // Delegate to the bridge helper so the spec-correct full-padding check
+    // (every byte == padlen) is applied here too. Inlining the check would
+    // drift from the helper.
     auto data = bridge::hex_param(p, "data");
-    if (data.empty()) {
-        throw std::runtime_error("pkcs7_unpad: empty input");
-    }
-    size_t padlen = data.back();
-    if (padlen == 0 || padlen > 16 || padlen > data.size()) {
-        throw std::runtime_error("pkcs7_unpad: invalid padding length");
-    }
-    return bridge::json{{
-        "unpadded",
-        bridge::to_hex(bridge::Bytes(data.begin(), data.end() - padlen)),
-    }};
+    auto unpadded = bridge::pkcs7_unpad(data);
+    return bridge::json{{"unpadded", bridge::to_hex(unpadded)}};
 })
 
 // === X25519 (Curve25519 ECDH) ===

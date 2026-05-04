@@ -67,7 +67,11 @@ REGISTER_COMMAND(token_encrypt, {
 REGISTER_COMMAND(token_decrypt, {
     auto key = bridge::hex_param(p, "key");
     auto token = bridge::hex_param(p, "token");
-    if (token.size() < 16 + 32) {
+    // Minimum valid token = iv(16) + at least one AES-CBC block(16) + hmac(32).
+    // A 48-byte token (iv + hmac, zero-byte ciphertext) would otherwise reach
+    // AES_256_CBC::decrypt with empty input, then pkcs7_unpad with zero
+    // bytes — both of which crash or throw further downstream.
+    if (token.size() < 16 + 16 + 32) {
         throw std::runtime_error("token_decrypt: token too short");
     }
     bridge::Bytes signing_key, encryption_key;
@@ -92,7 +96,8 @@ REGISTER_COMMAND(token_decrypt, {
 REGISTER_COMMAND(token_verify_hmac, {
     auto key = bridge::hex_param(p, "key");
     auto token = bridge::hex_param(p, "token");
-    if (token.size() < 16 + 32) {
+    // Same minimum as token_decrypt — iv + 1 AES block + hmac = 64 bytes.
+    if (token.size() < 16 + 16 + 32) {
         return bridge::json{{"valid", false}};
     }
     bridge::Bytes signing_key, encryption_key;

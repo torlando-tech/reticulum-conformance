@@ -120,8 +120,13 @@ REGISTER_COMMAND(identity_encrypt, {
     auto derived = RNS::Cryptography::hkdf(64, shared, to_rns(id_hash), RNS::Bytes());
 
     // Token = AES-256-CBC over plaintext with HMAC-SHA256 prefix.
-    bridge::Bytes signing_key(from_rns(derived).begin(), from_rns(derived).begin() + 32);
-    bridge::Bytes encryption_key(from_rns(derived).begin() + 32, from_rns(derived).end());
+    // Materialise the derived key once before slicing — calling
+    // from_rns(derived) twice would produce two distinct heap-allocated
+    // temporaries and the range constructor would cross allocation
+    // boundaries (UB).
+    bridge::Bytes derived_key = from_rns(derived);
+    bridge::Bytes signing_key(derived_key.begin(), derived_key.begin() + 32);
+    bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
     auto iv = bridge::hex_param_or_empty(p, "iv");
     if (iv.size() != 16) {
@@ -178,8 +183,11 @@ REGISTER_COMMAND(identity_decrypt, {
     auto shared = x25519_priv_obj->exchange(to_rns(eph_pub));
     auto derived = RNS::Cryptography::hkdf(64, shared, to_rns(id_hash), RNS::Bytes());
 
-    bridge::Bytes signing_key(from_rns(derived).begin(), from_rns(derived).begin() + 32);
-    bridge::Bytes encryption_key(from_rns(derived).begin() + 32, from_rns(derived).end());
+    // Materialise the derived key once before slicing — see identity_encrypt
+    // for the same UB-avoidance pattern.
+    bridge::Bytes derived_key = from_rns(derived);
+    bridge::Bytes signing_key(derived_key.begin(), derived_key.begin() + 32);
+    bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
     if (token.size() < 16 + 32) {
         throw std::runtime_error("identity_decrypt: token too short");

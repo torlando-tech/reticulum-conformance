@@ -79,7 +79,7 @@ REGISTER_COMMAND(token_decrypt, {
     bridge::Bytes signed_parts(token.begin(), token.end() - 32);
 
     auto hmac_calc = bridge::hmac_sha256(signing_key, signed_parts);
-    if (memcmp(hmac_recv.data(), hmac_calc.data(), 32) != 0) {
+    if (!bridge::consttime_memequal(hmac_recv.data(), hmac_calc.data(), 32)) {
         throw std::runtime_error("token_decrypt: HMAC verification failed");
     }
 
@@ -101,6 +101,6 @@ REGISTER_COMMAND(token_verify_hmac, {
     bridge::Bytes hmac_recv(token.end() - 32, token.end());
     bridge::Bytes signed_parts(token.begin(), token.end() - 32);
     auto hmac_calc = bridge::hmac_sha256(signing_key, signed_parts);
-    bool ok = memcmp(hmac_recv.data(), hmac_calc.data(), 32) == 0;
+    bool ok = bridge::consttime_memequal(hmac_recv.data(), hmac_calc.data(), 32);
     return bridge::json{{"valid", ok}};
 })

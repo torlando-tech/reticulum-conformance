@@ -42,7 +42,11 @@ jobs:
           path: LXMF
 
       - name: Set up CMake
-        uses: lukka/get-cmake@latest
+        # Pin to a specific lukka/get-cmake release rather than @latest so
+        # CI runs are reproducible — a breaking change upstream wouldn't
+        # silently flip our CMake version on the next push. Bump explicitly
+        # when we want a newer CMake.
+        uses: lukka/get-cmake@v4.3.2
 
       - name: Set up Python
         uses: actions/setup-python@v5

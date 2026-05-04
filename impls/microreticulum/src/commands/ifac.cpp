@@ -77,9 +77,15 @@ REGISTER_COMMAND(ifac_verify, {
     }
     bridge::Bytes ed_key(ifac_key.begin() + 32, ifac_key.end());
     auto sig = ed25519_sign(ed_key, packet_data);
-    bridge::Bytes computed(sig.end() - (int)expected.size(), sig.end());
+    if (expected.size() > sig.size()) {
+        // expected_ifac longer than the underlying Ed25519 signature (64
+        // bytes) — pointer arithmetic below would underflow. Reject as
+        // invalid IFAC rather than triggering UB.
+        return bridge::json{{"valid", false}};
+    }
+    bridge::Bytes computed(sig.end() - (ptrdiff_t)expected.size(), sig.end());
     bool ok = computed.size() == expected.size()
-              && memcmp(computed.data(), expected.data(), expected.size()) == 0;
+              && bridge::consttime_memequal(computed.data(), expected.data(), expected.size());
     return bridge::json{{"valid", ok}};
 })
 
@@ -160,7 +166,7 @@ REGISTER_COMMAND(ifac_unmask_packet, {
     auto sig = ed25519_sign(ed_key, original);
     bridge::Bytes expected(sig.end() - ifac_size, sig.end());
     bool ok = expected.size() == ifac.size()
-              && memcmp(expected.data(), ifac.data(), ifac_size) == 0;
+              && bridge::consttime_memequal(expected.data(), ifac.data(), ifac_size);
 
     return bridge::json{
         {"valid", ok},

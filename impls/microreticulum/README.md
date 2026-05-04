@@ -54,4 +54,4 @@ Both have spec-correct workarounds in `src/bridge.cpp` (`pkcs7_pad`/`pkcs7_unpad
 - **Tier 2B (deferred)**: TCP transport, link state machine, channel, resource transfer, msgpack-dependent commands.
 - **Tier 3 (deferred)**: LXMF bridge for `lxmf-conformance`.
 
-See `~/Documents/Obsidian/columba-vault/80 Assistant/Memory/pyxis/pyxis_microReticulum_testing_plan.md` for the full plan.
+The Tier 2A/2B/3 split, deselect set, and known-bug context for this bridge are tracked in the originating project's notes; ask the maintainer (or check `tests.yml` and `microreticulum.yml` for the current pass/skip surface).

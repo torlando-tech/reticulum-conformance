@@ -69,6 +69,12 @@ REGISTER_COMMAND(truncated_hash, {
 
 REGISTER_COMMAND(hkdf, {
     int length = bridge::int_param(p, "length");
+    // Mirror Python RNS/Cryptography/HKDF.py:41 — reject length < 1.
+    // Without this guard a negative `int` silently wraps to a huge `size_t`
+    // when cast below, asking the HKDF impl to allocate exabytes.
+    if (length <= 0) {
+        throw std::runtime_error("hkdf: length must be a positive integer");
+    }
     auto ikm = bridge::hex_param(p, "ikm");
     auto salt = bridge::hex_param_or_empty(p, "salt");
     auto info = bridge::hex_param_or_empty(p, "info");
@@ -83,11 +89,17 @@ REGISTER_COMMAND(aes_encrypt, {
     auto plaintext = bridge::hex_param(p, "plaintext");
     auto key = bridge::hex_param(p, "key");
     auto iv = bridge::hex_param(p, "iv");
+    // Mirror Python RNS/Cryptography/AES.py — AES_128_CBC requires len(key)==16,
+    // AES_256_CBC requires len(key)==32. Reject anything else (including
+    // 24-byte AES-192 attempts) rather than silently routing to AES-256
+    // and reading past the end of the supplied buffer.
     RNS::Bytes ct;
     if (key.size() == 16) {
         ct = RNS::Cryptography::AES_128_CBC::encrypt(to_rns(plaintext), to_rns(key), to_rns(iv));
-    } else {
+    } else if (key.size() == 32) {
         ct = RNS::Cryptography::AES_256_CBC::encrypt(to_rns(plaintext), to_rns(key), to_rns(iv));
+    } else {
+        throw std::runtime_error("aes_encrypt: key must be 16 or 32 bytes");
     }
     return bridge::json{{"ciphertext", bridge::to_hex(from_rns(ct))}};
 })
@@ -96,11 +108,14 @@ REGISTER_COMMAND(aes_decrypt, {
     auto ciphertext = bridge::hex_param(p, "ciphertext");
     auto key = bridge::hex_param(p, "key");
     auto iv = bridge::hex_param(p, "iv");
+    // See aes_encrypt above — same key-length invariant.
     RNS::Bytes pt;
     if (key.size() == 16) {
         pt = RNS::Cryptography::AES_128_CBC::decrypt(to_rns(ciphertext), to_rns(key), to_rns(iv));
-    } else {
+    } else if (key.size() == 32) {
         pt = RNS::Cryptography::AES_256_CBC::decrypt(to_rns(ciphertext), to_rns(key), to_rns(iv));
+    } else {
+        throw std::runtime_error("aes_decrypt: key must be 16 or 32 bytes");
     }
     return bridge::json{{"plaintext", bridge::to_hex(from_rns(pt))}};
 })

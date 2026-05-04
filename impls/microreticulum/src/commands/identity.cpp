@@ -191,7 +191,7 @@ REGISTER_COMMAND(identity_decrypt, {
     bridge::Bytes signed_parts(token.begin(), token.end() - 32);
     auto hmac_calc = bridge::hmac_sha256(signing_key, signed_parts);
     bool hmac_ok = (hmac_recv.size() == hmac_calc.size()) &&
-                   memcmp(hmac_recv.data(), hmac_calc.data(), hmac_recv.size()) == 0;
+                   bridge::consttime_memequal(hmac_recv.data(), hmac_calc.data(), hmac_recv.size());
     if (!hmac_ok) {
         throw std::runtime_error("identity_decrypt: HMAC verification failed");
     }

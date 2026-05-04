@@ -79,4 +79,11 @@ Bytes pkcs7_unpad(const Bytes& data);
 // double-feeds the message — see crypto.cpp hmac_sha256 WORKAROUND.)
 Bytes hmac_sha256(const Bytes& key, const Bytes& msg);
 
+// Constant-time byte comparison for MAC / authentication-tag verification.
+// Always reads `n` bytes regardless of mismatch position so the loop's
+// timing leaks no information about the position of the first differing
+// byte — equivalent to Python's hmac.compare_digest().
+// Returns true iff a[0..n] == b[0..n].
+bool consttime_memequal(const uint8_t* a, const uint8_t* b, size_t n);
+
 }  // namespace bridge

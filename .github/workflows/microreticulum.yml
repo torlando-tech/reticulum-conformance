@@ -27,6 +27,20 @@ jobs:
           path: pyxis
           submodules: recursive
 
+      # The reference (Python) bridge needs RNS + LXMF — same pattern as
+      # tests.yml. umsgpack is vendored inside Reticulum, not on PyPI.
+      - name: Checkout Reticulum
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          path: Reticulum
+
+      - name: Checkout LXMF
+        uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          path: LXMF
+
       - name: Set up CMake
         uses: lukka/get-cmake@latest
 
@@ -53,6 +67,8 @@ jobs:
         working-directory: reticulum-conformance
         env:
           CONFORMANCE_MICRORETICULUM_BRIDGE_CMD: ${{ github.workspace }}/reticulum-conformance/impls/microreticulum/build/microReticulumBridge
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         # Top-level conformance only — wire/behavioral/lxmf require Tier 2B
         # (transport layer) which is not yet implemented in the bridge.
         run: |

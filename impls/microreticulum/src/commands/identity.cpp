@@ -160,7 +160,11 @@ REGISTER_COMMAND(identity_decrypt, {
     if (priv.size() != 64) {
         throw std::runtime_error("identity_decrypt: private_key must be 64 bytes");
     }
-    if (ciphertext.size() < 32 + 16 + 32) {
+    // Minimum identity-encrypted blob = ephemeral_public(32) + iv(16) +
+    // at least one AES-CBC block(16) + hmac(32) = 96 bytes. An 80-byte
+    // input would otherwise leave an empty ct and crash AES_256_CBC::decrypt
+    // / pkcs7_unpad downstream.
+    if (ciphertext.size() < 32 + 16 + 16 + 32) {
         throw std::runtime_error("identity_decrypt: ciphertext too short");
     }
 
@@ -189,7 +193,10 @@ REGISTER_COMMAND(identity_decrypt, {
     bridge::Bytes signing_key(derived_key.begin(), derived_key.begin() + 32);
     bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
-    if (token.size() < 16 + 32) {
+    // Same minimum as token_decrypt — iv(16) + at least one AES block(16)
+    // + hmac(32) = 64 bytes. The outer ciphertext.size() guard already
+    // covers this, but keep it explicit for the inner token slice.
+    if (token.size() < 16 + 16 + 32) {
         throw std::runtime_error("identity_decrypt: token too short");
     }
     bridge::Bytes iv(token.begin(), token.begin() + 16);

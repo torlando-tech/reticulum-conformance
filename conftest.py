@@ -26,6 +26,7 @@ BRIDGE_COMMANDS = {
     "reference": "python3 {root}/reference/bridge_server.py",
     "swift": "{root}/../reticulum-swift/.build/release/ConformanceBridge",
     "kotlin": "java -jar {root}/../reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar",
+    "microreticulum": "{root}/impls/microreticulum/build/microReticulumBridge",
 }
 
 # Per-impl env var names. When set, override BRIDGE_COMMANDS[impl].
@@ -33,6 +34,7 @@ PER_IMPL_CMD_ENV = {
     "reference": "CONFORMANCE_REFERENCE_BRIDGE_CMD",
     "swift": "CONFORMANCE_SWIFT_BRIDGE_CMD",
     "kotlin": "CONFORMANCE_KOTLIN_BRIDGE_CMD",
+    "microreticulum": "CONFORMANCE_MICRORETICULUM_BRIDGE_CMD",
 }
 
 # Root directory of the conformance suite

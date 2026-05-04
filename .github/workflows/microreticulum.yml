@@ -1,0 +1,64 @@
+name: microReticulum bridge
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  microreticulum-conformance:
+    name: Build bridge + run conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout reticulum-conformance
+        uses: actions/checkout@v4
+        with:
+          path: reticulum-conformance
+
+      # The bridge builds against pyxis's pinned microReticulum fork
+      # (feat/t-deck branch). Adjust the path/repo if upstream attermann
+      # microReticulum is the target instead.
+      - name: Checkout pyxis (for microReticulum submodule)
+        uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/pyxis
+          path: pyxis
+          submodules: recursive
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest deps
+        working-directory: reticulum-conformance
+        run: pip install -r requirements.txt
+
+      - name: Configure CMake
+        working-directory: reticulum-conformance/impls/microreticulum
+        run: |
+          cmake -B build \
+            -DMICRORETICULUM_DIR=${{ github.workspace }}/pyxis/deps/microReticulum
+
+      - name: Build microReticulumBridge
+        working-directory: reticulum-conformance/impls/microreticulum
+        run: cmake --build build --parallel
+
+      - name: Run conformance tests
+        working-directory: reticulum-conformance
+        env:
+          CONFORMANCE_MICRORETICULUM_BRIDGE_CMD: ${{ github.workspace }}/reticulum-conformance/impls/microreticulum/build/microReticulumBridge
+        # Top-level conformance only — wire/behavioral/lxmf require Tier 2B
+        # (transport layer) which is not yet implemented in the bridge.
+        run: |
+          pytest tests/ \
+            --impl microreticulum \
+            --ignore=tests/wire \
+            --ignore=tests/behavioral \
+            --ignore=tests/lxmf \
+            -v

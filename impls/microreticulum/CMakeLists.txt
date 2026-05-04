@@ -14,7 +14,12 @@ include(FetchContent)
 FetchContent_Declare(
     crypto
     GIT_REPOSITORY https://github.com/attermann/Crypto.git
-    GIT_TAG master
+    # Pin to a specific commit rather than `master` so the build is
+    # reproducible — these primitives feed crypto correctness and silently
+    # picking up upstream churn would be a CI-stability and audit risk.
+    # Bump deliberately when we want a newer Crypto. (Initial commit on
+    # the attermann/Crypto fork, 2024-11-03.)
+    GIT_TAG da68972a4badb3d403556c7c5d348f24c5acb02c
 )
 FetchContent_MakeAvailable(crypto)
 

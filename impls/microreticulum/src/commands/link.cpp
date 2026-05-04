@@ -33,8 +33,11 @@ REGISTER_COMMAND(link_signalling_bytes, {
     int mtu = bridge::int_param(p, "mtu");
     int mode = (p.contains("mode") && !p["mode"].is_null()) ? p["mode"].get<int>() : 1;
 
+    // Cast `mode` to uint32_t before the left-shift — left-shifting a
+    // negative signed int is UB in C++17, and int_param can return any
+    // value the harness passes in.
     uint32_t value = ((uint32_t)mtu & MTU_BYTEMASK)
-                     + ((((uint32_t)(mode << 5)) & MODE_BYTEMASK) << 16);
+                     + ((((uint32_t)mode << 5) & MODE_BYTEMASK) << 16);
     bridge::Bytes signalling = {
         (uint8_t)((value >> 16) & 0xFF),
         (uint8_t)((value >> 8) & 0xFF),

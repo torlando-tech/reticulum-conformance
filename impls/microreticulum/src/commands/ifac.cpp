@@ -33,6 +33,13 @@ bridge::Bytes ed25519_sign(const bridge::Bytes& priv, const bridge::Bytes& messa
 
 bridge::Bytes hkdf_expand(int length, const bridge::Bytes& ikm,
                           const bridge::Bytes& salt, const bridge::Bytes& info) {
+    // Mirror the same guard the `hkdf` command handler applies: a negative
+    // int silently wraps to a huge size_t when cast, asking HKDF to
+    // allocate exabytes. Today's call sites pass result.size() / masked.size()
+    // (always non-negative) but defending the helper costs nothing.
+    if (length <= 0) {
+        throw std::runtime_error("hkdf_expand: length must be positive");
+    }
     return from_rns(RNS::Cryptography::hkdf(
         (size_t)length, to_rns(ikm), to_rns(salt), to_rns(info)));
 }

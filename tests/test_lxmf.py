@@ -131,10 +131,11 @@ def test_lxmf_stamp_replay_across_message_ids_rejected(sut, reference):
         stamp=stamp_a, target_cost=stamp_cost, workblock=wb_a,
     )
     assert self_check["valid"] is True, (
-        f"SUT-generated stamp does not validate against its own "
-        f"message_id's workblock on the SUT. The SUT's generate/"
-        f"validate code paths disagree internally — separate bug from "
-        f"the replay invariant under test."
+        f"SUT-generated stamp does not validate against the reference "
+        f"workblock for the same message_id on the SUT. Either the SUT's "
+        f"generate/validate paths disagree internally, OR the SUT and "
+        f"reference compute different workblocks for the same message_id "
+        f"(tested independently in test_lxmf_stamp_generate_validate)."
     )
 
     # The actual invariant: stamp_a MUST NOT validate against wb_b.

@@ -93,8 +93,6 @@ class BridgeClient:
         """
         try:
             for line in iter(self._proc.stderr.readline, ""):
-                if not line:
-                    break
                 self._stderr_tail.append(line)
         except Exception:
             pass

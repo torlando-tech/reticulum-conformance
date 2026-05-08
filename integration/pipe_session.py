@@ -103,6 +103,14 @@ class PipeSession:
             self.RNS.Transport.path_table = {}
             self.RNS.Transport.packet_hashlist = set()
             self.RNS.Transport.identity = None
+            # Reticulum 2026-05-05+ has a Transport._should_run kill switch that
+            # exit_handler() flips False; Transport.start() doesn't reset it, so
+            # the *next* Reticulum() in this process gets a dead jobloop and
+            # silently drops announces / path requests. Re-arm it here, since
+            # this harness deliberately creates multiple Reticulum instances
+            # per process. Upstream commit a3cd1ea8 introduced this state.
+            if hasattr(self.RNS.Transport, "_should_run"):
+                self.RNS.Transport._should_run = True
             self.reticulum = None
         if self._config_path:
             import shutil

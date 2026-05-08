@@ -269,6 +269,14 @@ class ThreeNodeSession:
             T.local_client_q_cache = []
             if hasattr(T, 'rate_table'):
                 T.rate_table = {}
+            # Reticulum 2026-05-05+ has a Transport._should_run kill switch that
+            # exit_handler() flips False; Transport.start() doesn't reset it, so
+            # the *next* Reticulum() in this process gets a dead jobloop and
+            # silently drops announces / path requests. Re-arm it here, since
+            # this harness deliberately creates multiple Reticulum instances
+            # per process. Upstream commit a3cd1ea8 introduced this state.
+            if hasattr(T, "_should_run"):
+                T._should_run = True
             self.b_reticulum = None
         if self._b_config_path:
             import shutil

@@ -8,6 +8,11 @@ against a reference implementation.
 import os
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
+
+
+__category_title__ = "Transport"
+__category_order__ = 13
 
 
 def random_packet_hex(length):
@@ -23,6 +28,10 @@ def random_packet_hex(length):
     return raw.hex()
 
 
+@conformance_case(
+    commands=["path_request_pack", "path_request_unpack"],
+    verifies="Path request packing (16-byte destination hash) matches; unpacking recovers destination_hash",
+)
 def test_path_request_pack_unpack(sut, reference):
     dest = random_hex(16)
     ref = reference.execute("path_request_pack", destination_hash=dest)
@@ -33,6 +42,10 @@ def test_path_request_pack_unpack(sut, reference):
     assert_hex_equal(res_u["destination_hash"], ref_u["destination_hash"])
 
 
+@conformance_case(
+    commands=["packet_hashlist_pack", "packet_hashlist_unpack"],
+    verifies="Packet hashlist msgpack serialization of 5 hashes matches; unpacking recovers all hashes",
+)
 def test_packet_hashlist_pack_unpack(sut, reference):
     hashes = [random_hex(32) for _ in range(5)]
     ref = reference.execute("packet_hashlist_pack", hashes=hashes)
@@ -45,6 +58,10 @@ def test_packet_hashlist_pack_unpack(sut, reference):
         assert_hex_equal(r, e)
 
 
+@conformance_case(
+    commands=["ifac_derive_key"],
+    verifies="IFAC key derivation from origin string (network_name + passphrase) matches",
+)
 def test_ifac_derive_key(sut, reference):
     ifac_origin = ("testnet" + "secret123").encode("utf-8").hex()
     ref = reference.execute("ifac_derive_key", ifac_origin=ifac_origin)
@@ -52,6 +69,10 @@ def test_ifac_derive_key(sut, reference):
     assert_hex_equal(res["ifac_key"], ref["ifac_key"])
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_compute", "ifac_verify"],
+    verifies="IFAC tag computation (Ed25519 signature-based) matches; both impls verify the tag as valid",
+)
 def test_ifac_compute_verify(sut, reference):
     ifac_origin = ("testnet" + "pass").encode("utf-8").hex()
     ref_key = reference.execute("ifac_derive_key", ifac_origin=ifac_origin)
@@ -77,6 +98,10 @@ def test_ifac_compute_verify(sut, reference):
     assert res_v["valid"] is True
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_mask_packet"],
+    verifies="IFAC masking transform produces byte-identical wire-format packets and sets the IFAC flag in byte 0",
+)
 def test_ifac_mask_packet(sut, reference):
     """IFAC masking produces identical wire-format packets."""
     ifac_origin = ("meshnet" + "hunter2").encode("utf-8").hex()
@@ -94,6 +119,10 @@ def test_ifac_mask_packet(sut, reference):
     assert len(masked) == len(bytes.fromhex(packet_data)) + 16
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_mask_packet", "ifac_unmask_packet"],
+    verifies="IFAC unmasking recovers the original packet bytes and validates the tag",
+)
 def test_ifac_unmask_packet(sut, reference):
     """IFAC unmasking recovers original packet and validates tag."""
     ifac_origin = ("meshnet" + "hunter2").encode("utf-8").hex()
@@ -114,6 +143,10 @@ def test_ifac_unmask_packet(sut, reference):
     assert_hex_equal(res["packet_data"], packet_data)
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_mask_packet", "ifac_unmask_packet"],
+    verifies="Cross-impl: SUT-masked packets unmask correctly on the reference, and reference-masked packets unmask correctly on the SUT",
+)
 def test_ifac_cross_mask_unmask(sut, reference):
     """SUT-masked packets can be unmasked by reference, and vice versa."""
     ifac_origin = ("crosstest" + "key456").encode("utf-8").hex()
@@ -135,6 +168,10 @@ def test_ifac_cross_mask_unmask(sut, reference):
     assert_hex_equal(sut_unmasked["packet_data"], packet_data)
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_mask_packet", "ifac_unmask_packet"],
+    verifies="A packet masked with one key is rejected when unmasked with a different key (negative control on IFAC enforcement)",
+)
 def test_ifac_wrong_key_rejected(sut, reference):
     """Packet masked with one key is rejected when unmasked with a different key."""
     origin_a = ("netA" + "passA").encode("utf-8").hex()
@@ -155,6 +192,10 @@ def test_ifac_wrong_key_rejected(sut, reference):
     assert res["valid"] is False
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_mask_packet", "ifac_unmask_packet"],
+    verifies="IFAC masking with the 8-byte radio-interface ifac_size produces matching wire bytes and round-trips correctly",
+)
 def test_ifac_mask_small_ifac_size(sut, reference):
     """IFAC masking works with 8-byte IFAC (radio interfaces)."""
     ifac_origin = ("rnode" + "radiokey").encode("utf-8").hex()

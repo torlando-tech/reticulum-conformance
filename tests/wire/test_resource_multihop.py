@@ -27,6 +27,12 @@ receiver_impl) triples the link-multihop test uses.
 import secrets
 import time
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 _SETTLE_SEC = 1.5
 _LINK_TIMEOUT_MS = 15000
@@ -84,6 +90,10 @@ def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
     return sender, receiver, dest_hash, link_id
 
 
+@conformance_case(
+    commands=["link_open", "resource_send", "resource_poll"],
+    verifies="A sub-MDU 256-byte Resource transfer over a multi-hop Link round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF",
+)
 def test_small_resource_multihop(wire_trio, wire_3peer):
     """A sub-MDU resource: exercises the Resource API without chunking.
 
@@ -109,6 +119,10 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=["link_open", "resource_send", "resource_poll"],
+    verifies="A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a multi-hop Link",
+)
 def test_chunked_resource_multihop(wire_trio, wire_3peer):
     """A larger resource that definitely requires chunking across
     multiple link DATA packets. ~16 KB mirrors the size Columba was
@@ -136,6 +150,10 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=["link_open", "resource_send", "resource_poll"],
+    verifies="A 16 KiB Resource round-trips intact over an IFAC-protected multi-hop Link — exercises per-packet IFAC masking on Resource chunks (Columba production config)",
+)
 def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     """Same as test_chunked_resource_multihop but with IFAC enabled on
     every peer. Every on-wire packet gets a 16-byte IFAC tag and XOR
@@ -167,6 +185,10 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=["link_open", "resource_send", "resource_poll"],
+    verifies="A 256 KiB Resource (~32 chunks) round-trips intact, stress-testing back-to-back link DATA transmission and reassembly",
+)
 def test_large_resource_multihop(wire_trio, wire_3peer):
     """A resource large enough to guarantee many link DATA packets even
     at the TCP interface's large MTU. 256 KB split into chunks of

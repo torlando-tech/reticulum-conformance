@@ -20,11 +20,20 @@ its true nature as an implementation-detail check, not a conformance one.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
+
+
+__category_title__ = "Compression"
+__category_order__ = 14
 
 # bz2 file magic: "BZh" (0x425a68) per https://en.wikipedia.org/wiki/Bzip2#File_format
 _BZ2_MAGIC_HEX = "425a68"
 
 
+@conformance_case(
+    commands=["bz2_compress"],
+    verifies="SUT bz2 output begins with the bz2 magic header and self-roundtrips (compress then decompress returns input)",
+)
 def test_bz2_compress(sut):
     data = random_hex(100)
     compressed = sut.execute("bz2_compress", data=data)["compressed"]
@@ -39,6 +48,10 @@ def test_bz2_compress(sut):
     assert_hex_equal(roundtrip, data)
 
 
+@conformance_case(
+    commands=["bz2_compress", "bz2_decompress"],
+    verifies="SUT decompression of reference-compressed bytes recovers the original input",
+)
 def test_bz2_decompress(sut, reference):
     data = random_hex(100)
     ref_c = reference.execute("bz2_compress", data=data)
@@ -48,6 +61,10 @@ def test_bz2_decompress(sut, reference):
     assert_hex_equal(res["decompressed"], data)
 
 
+@conformance_case(
+    commands=["bz2_compress", "bz2_decompress"],
+    verifies="Cross-impl: SUT-compressed bytes decompressed by reference recovers the original input",
+)
 def test_bz2_cross_decompress(sut, reference):
     """Compress with SUT, decompress with reference."""
     data = random_hex(200)

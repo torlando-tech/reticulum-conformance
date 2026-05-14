@@ -17,6 +17,11 @@ no state — so byte-equality across impls is the correct assertion.
 import hashlib
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
+
+
+__category_title__ = "IFAC"
+__category_order__ = 16
 
 
 def _ifac_origin_hex(network_name: str, passphrase: str) -> str:
@@ -31,6 +36,10 @@ def _ifac_origin_hex(network_name: str, passphrase: str) -> str:
     ).hex()
 
 
+@conformance_case(
+    commands=["ifac_derive_key"],
+    verifies="HKDF-derived 64-byte IFAC key and the IFAC_SALT constant match byte-for-byte across impls",
+)
 def test_ifac_derive_key(sut, reference):
     """HKDF-derived 64-byte IFAC key must match byte-for-byte.
 
@@ -45,6 +54,10 @@ def test_ifac_derive_key(sut, reference):
     assert_hex_equal(res["ifac_salt"], ref["ifac_salt"])
 
 
+@conformance_case(
+    commands=["ifac_derive_key", "ifac_compute"],
+    verifies="Fixed reticulum-kt#29 vector — packet=bytes(range(64)), network=testnet, pass=testpass — Ed25519 signature and IFAC tag match",
+)
 def test_ifac_compute_issue_29_vector(sut, reference):
     """Exact repro vector from reticulum-kt#29: ("testnet", "testpass",
     packet=bytes(range(64))). The reporter showed Kotlin's bytes diverge
@@ -64,6 +77,10 @@ def test_ifac_compute_issue_29_vector(sut, reference):
     assert_hex_equal(res["ifac"], ref["ifac"])
 
 
+@conformance_case(
+    commands=["ifac_compute"],
+    verifies="Random key + random 48-byte packet — Ed25519 signature and IFAC tag match across impls",
+)
 def test_ifac_compute_random(sut, reference):
     """Fuzz ifac_compute with random key+packet inputs.
 
@@ -77,6 +94,10 @@ def test_ifac_compute_random(sut, reference):
     assert_hex_equal(res["signature"], ref["signature"])
 
 
+@conformance_case(
+    commands=["ifac_compute"],
+    verifies="IFAC tags match across impls for every ifac_size in {1, 8, 16, 32, 64}",
+)
 def test_ifac_compute_variable_size(sut, reference):
     """ifac_size selects how many trailing signature bytes form the tag.
     Both impls must agree for every size production might use.
@@ -96,6 +117,10 @@ def test_ifac_compute_variable_size(sut, reference):
         )
 
 
+@conformance_case(
+    commands=["ifac_compute", "ifac_verify"],
+    verifies="SUT-computed IFAC tag verifies on the reference, and reference-computed tag verifies on the SUT (end-to-end interop pair)",
+)
 def test_ifac_verify_cross_impl(sut, reference):
     """End-to-end interop check: SUT-computed tag must validate under the
     reference, and vice-versa. This is the test that most directly models
@@ -135,6 +160,10 @@ def test_ifac_verify_cross_impl(sut, reference):
     )
 
 
+@conformance_case(
+    commands=["ifac_mask_packet"],
+    verifies="Full wire-format IFAC masking transform (Ed25519 sign + flag toggle + IFAC insert + HKDF mask + XOR) produces byte-identical masked packets and tags",
+)
 def test_ifac_mask_packet(sut, reference):
     """Full wire-format masking transform byte-equality.
 

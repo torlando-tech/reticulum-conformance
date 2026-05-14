@@ -5,8 +5,17 @@ by comparing SUT output against a reference implementation.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Channel"
+__category_order__ = 12
+
+
+@conformance_case(
+    commands=["envelope_pack", "envelope_unpack"],
+    verifies="Channel envelope packing ([MSGTYPE:2BE][SEQ:2BE][LEN:2BE][payload]) matches; unpacking recovers msgtype and data",
+)
 def test_envelope_pack_unpack(sut, reference):
     msgtype = 0x0001
     sequence = 0
@@ -25,6 +34,10 @@ def test_envelope_pack_unpack(sut, reference):
     assert_hex_equal(res_u["data"], ref_u["data"])
 
 
+@conformance_case(
+    commands=["stream_msg_pack", "stream_msg_unpack"],
+    verifies="Stream data message packing matches; unpacking recovers stream_id and data",
+)
 def test_stream_msg_pack_unpack(sut, reference):
     stream_id = 42
     data = random_hex(64)

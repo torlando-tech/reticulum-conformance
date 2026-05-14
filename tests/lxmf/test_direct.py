@@ -18,6 +18,12 @@ import secrets
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "LXMF Delivery"
+__category_order__ = 17
+
 
 # LXMF FIELD_FILE_ATTACHMENTS: key 5 per LXMF spec. Canonical wire shape
 # (see memory/lxmf-attachment-format-variance.md): list of 2-element
@@ -63,6 +69,10 @@ def _xfail_kotlin_receiver_multipacket_duplicate(lxmf_trio):
         )
 
 
+@conformance_case(
+    commands=["send_direct", "wait_for_inbox_count"],
+    verifies="A short text LXMessage delivered via DIRECT (single-packet, link-based) arrives at the receiver with exact content, title, and source",
+)
 def test_direct_text_round_trip(lxmf_trio, lxmf_transport_3peer):
     """Sender -> transport -> receiver, text-only direct-delivery
     message. Mirrors the opportunistic text test but goes over a
@@ -107,6 +117,10 @@ def test_direct_text_round_trip(lxmf_trio, lxmf_transport_3peer):
     )
 
 
+@conformance_case(
+    commands=["send_direct", "wait_for_inbox_count"],
+    verifies="A DIRECT LXMessage carrying a 2 KiB FIELD_FILE_ATTACHMENTS payload (forces multi-packet Resource transfer) arrives intact with exact filename and bytes",
+)
 def test_direct_with_file_attachment_multipacket(lxmf_trio, lxmf_transport_3peer):
     """Send a FIELD_FILE_ATTACHMENTS payload big enough to trigger
     Resource transfer. Asserts the exact filename + exact attachment

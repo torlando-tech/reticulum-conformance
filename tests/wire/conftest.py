@@ -19,6 +19,7 @@ import secrets
 
 import pytest
 
+from _rns_paths import resolve_lxmf_path, resolve_rns_path
 from bridge_client import BridgeClient
 from conftest import get_impl_list, resolve_command
 
@@ -28,14 +29,8 @@ def _env_for(impl: str) -> dict:
     if impl != "reference":
         return {}
     return {
-        "PYTHON_RNS_PATH": os.environ.get(
-            "PYTHON_RNS_PATH",
-            os.path.expanduser("~/repos/Reticulum"),
-        ),
-        "PYTHON_LXMF_PATH": os.environ.get(
-            "PYTHON_LXMF_PATH",
-            os.path.expanduser("~/repos/LXMF"),
-        ),
+        "PYTHON_RNS_PATH": resolve_rns_path(),
+        "PYTHON_LXMF_PATH": resolve_lxmf_path(),
     }
 
 
@@ -62,6 +57,7 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("wire_pair", pairs, ids=ids, scope="function")
 
     _parametrize_wire_trio(metafunc)
+    _parametrize_wire_shared_trio(metafunc)
 
 
 class _WirePeer:
@@ -84,15 +80,91 @@ class _WirePeer:
         network_name: str,
         passphrase: str,
         mode: str | None = None,
+        share_instance: bool = False,
+        share_instance_type: str | None = None,
     ) -> int:
+        """Bring up a TCPServerInterface on this peer.
+
+        share_instance=True additionally publishes this peer as a shared
+        Reticulum instance so other bridge processes (started via
+        `start_local_client(shared_instance_port=...)`) can attach as
+        local clients. The kotlin bridge only supports
+        share_instance_type='tcp' (LocalServerInterface listening on a
+        loopback port); the Python reference defaults to AF_UNIX and you
+        must pass share_instance_type='tcp' explicitly to make a master
+        that kotlin local-client peers can interop with.
+
+        When share_instance is True, the returned `shared_instance_port`
+        is stored on the peer (`self.shared_instance_port`) for the test
+        to pass into the local-client peer's start.
+        """
         kwargs: dict = {"network_name": network_name, "passphrase": passphrase}
         if mode is not None:
             kwargs["mode"] = mode
+        if share_instance:
+            kwargs["share_instance"] = True
+            if share_instance_type is not None:
+                kwargs["share_instance_type"] = share_instance_type
         resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
         self.port = int(resp["port"])
+        # Surface the shared-instance state for tests that need to chain a
+        # local-client peer onto this master. All None when
+        # share_instance=False or share_instance_type != "tcp".
+        self.shared_instance_port: int | None = (
+            int(resp["shared_instance_port"])
+            if "shared_instance_port" in resp
+            else None
+        )
+        self.instance_control_port: int | None = (
+            int(resp["instance_control_port"])
+            if "instance_control_port" in resp
+            else None
+        )
+        self.rpc_key: str | None = resp.get("rpc_key")
         return self.port
+
+    def start_local_client(
+        self,
+        shared_instance_port: int,
+        instance_control_port: int | None = None,
+        rpc_key: str | None = None,
+    ):
+        """Attach this peer as a shared-instance client of an already-running
+        master.
+
+        The master must have been brought up via
+        `start_tcp_server(share_instance=True, share_instance_type='tcp')`
+        — pass `master_peer.shared_instance_port`,
+        `master_peer.instance_control_port`, and `master_peer.rpc_key`
+        through. The control port and rpc_key are required for cross-
+        process Python↔Python topologies (the master's RPC listener is on
+        a non-default port and uses an authkey derived from a transport
+        identity the client doesn't share); without them, link
+        establishment fails with AuthenticationError on the client's first
+        _used_destination_data RPC. Kotlin clients don't make RPC calls so
+        these are no-ops on that side, but plumbing them through keeps the
+        helper polymorphic across impls.
+
+        Order matters: starting this peer before the master would result in
+        the connect attempt failing (Python falls back to standalone /
+        becomes its own master, kotlin throws).
+
+        No on-wire interface is configured for this peer; the only
+        attachment is the LocalClientInterface to the master. Outbound
+        announces, link requests, etc. exit through the master's TCP
+        interface (mirrors how Eridanus runs on a phone hosting Sideband).
+        """
+        kwargs: dict = {"shared_instance_port": int(shared_instance_port)}
+        if instance_control_port is not None:
+            kwargs["instance_control_port"] = int(instance_control_port)
+        if rpc_key is not None:
+            kwargs["rpc_key"] = rpc_key
+        resp = self.bridge.execute("wire_start_local_client", **kwargs)
+        self.handle = resp["handle"]
+        self.identity_hash = bytes.fromhex(resp["identity_hash"])
+        self.shared_instance_port: int | None = int(shared_instance_port)
 
     def start_tcp_client(
         self,
@@ -316,6 +388,26 @@ class _WirePeer:
             timeout_ms=timeout_ms,
         )
 
+    def resource_create(self, link_id: bytes, data: bytes) -> dict:
+        """Construct a real RNS.Resource on an established Link and report
+        the attributes the implementation computed — WITHOUT advertising or
+        sending it.
+
+        The honest, delegating replacement for the deleted synthetic
+        resource_* primitive commands: the bridge builds a real
+        RNS.Resource (full __init__, advertise=False so nothing hits the
+        wire) and reads back `hash`, `truncated_hash`, `random_hash`,
+        `expected_proof`, `hashmap`, `parts`, and the size/flag fields —
+        nothing is recomputed. Used by tests/wire/test_resource_invariants.py.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_create",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+        )
+
     def resource_poll(
         self, destination_hash: bytes, timeout_ms: int = 30000
     ) -> list:
@@ -343,6 +435,39 @@ class _WirePeer:
 def wire_pair(request):
     """Return (server_impl, client_impl) tuple from pytest_generate_tests."""
     return request.param
+
+
+def _parametrize_wire_shared_trio(metafunc):
+    """Parametrize 3-peer shared-instance tests.
+
+    Topology: A (local-client of B) → B (shared-instance master + TCP server,
+    SUT) ← C (TCP client + destination host).
+
+    The interesting axis is the master_impl (B) — the bug class we're
+    hunting (reticulum-kt's transport-mode H1→H2 mutation breaking
+    link_id) only triggers when a packet arrives at B's
+    LocalServerInterface and exits via TCP.
+
+    Pairing rule: local_client matches master_impl. The Python local-
+    client makes RPC calls to the master (`_used_destination_data` is
+    fired during link establishment, Reticulum.py:1135) which require a
+    Python-compatible multiprocessing.connection RPC listener on the
+    master — reticulum-kt doesn't have one, so a python-client →
+    kotlin-master pairing fails on AuthenticationError before the on-wire
+    link logic ever runs. That's a real feature gap but a different
+    investigation than the linkId one this test covers; pinning local_client
+    to the master's impl avoids confounding the two failure modes.
+    Remote stays on reference because the destination host's role (receive
+    LR, validate, respond LRPROOF) is well-trodden ground that's already
+    covered by the homogeneous-reference baseline.
+    """
+    if "wire_shared_trio" not in metafunc.fixturenames:
+        return
+    impls = get_impl_list(metafunc.config) or []
+    peers = sorted(set(impls) | {"reference"})
+    trios = [(master, master, "reference") for master in peers]
+    ids = [f"{master}-->{master}-->ref" for master, _, _ in trios]
+    metafunc.parametrize("wire_shared_trio", trios, ids=ids, scope="function")
 
 
 def _parametrize_wire_trio(metafunc):
@@ -448,6 +573,71 @@ def wire_peers(wire_pair):
             except Exception:
                 pass
         for b in (server_bridge, client_bridge):
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
+@pytest.fixture
+def wire_shared_trio(request):
+    """(local_client_impl, master_impl, remote_impl) from parametrization."""
+    return request.param
+
+
+@pytest.fixture
+def wire_shared_3peer(wire_shared_trio):
+    """Three freshly-spawned bridges arranged as
+    [local-client A] → [shared-instance master B (SUT)] ← [TCP-client C].
+
+    Topology:
+
+        local_client (A, LocalClientInterface)
+                          \\
+                           v   AF_UNIX/TCP loopback (shared instance)
+        shared_master (B, LocalServerInterface + TCPServerInterface)
+                           ^
+                           |   TCP loopback
+        remote_host (C, TCPClientInterface)
+
+    Mirrors the production case where Eridanus (A) connects via Carina or
+    Sideband (B, the shared-instance master on the phone) which then routes
+    out over a TCP interface to a remote rrcd hub on a Mac (C).
+
+    This fixture is opinionated about start order: B must be up before A
+    can attach as a client (otherwise A would either fail to connect, or
+    on Python's auto-detect path become its own master and silently break
+    the test topology). The fixture does not start anything for the caller
+    — call `master.start_tcp_server(share_instance=True,
+    share_instance_type='tcp')` first, then `local_client.start_local_client(
+    shared_instance_port=master.shared_instance_port)`, then `remote.
+    start_tcp_client(target_port=master.port)`.
+
+    Yields (local_client, master, remote) as `_WirePeer` objects.
+    """
+    local_impl, master_impl, remote_impl = wire_shared_trio
+    bridges = [
+        BridgeClient(resolve_command(local_impl), env=_env_for(local_impl)),
+        BridgeClient(resolve_command(master_impl), env=_env_for(master_impl)),
+        BridgeClient(resolve_command(remote_impl), env=_env_for(remote_impl)),
+    ]
+    local_client = _WirePeer(
+        bridges[0], role_label=f"local_client({local_impl})"
+    )
+    master = _WirePeer(bridges[1], role_label=f"master({master_impl})")
+    remote = _WirePeer(bridges[2], role_label=f"remote({remote_impl})")
+
+    try:
+        yield local_client, master, remote
+    finally:
+        # Tear down in reverse start-order so the local client doesn't
+        # observe the master vanishing mid-stop and emit error logs.
+        for peer in (local_client, remote, master):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
             try:
                 b.close()
             except Exception:

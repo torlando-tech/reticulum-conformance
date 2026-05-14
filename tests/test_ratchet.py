@@ -6,8 +6,17 @@ implementation.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Ratchet"
+__category_order__ = 10
+
+
+@conformance_case(
+    commands=["ratchet_id"],
+    verifies="Ratchet ID (first 10 bytes of SHA-256 of public key) matches",
+)
 def test_ratchet_id(sut, reference):
     pub = random_hex(32)
     ref = reference.execute("ratchet_id", ratchet_public=pub)
@@ -15,6 +24,10 @@ def test_ratchet_id(sut, reference):
     assert_hex_equal(res["ratchet_id"], ref["ratchet_id"])
 
 
+@conformance_case(
+    commands=["ratchet_public_from_private"],
+    verifies="X25519 public key derivation from ratchet private key matches",
+)
 def test_ratchet_public_from_private(sut, reference):
     priv = random_hex(32)
     ref = reference.execute("ratchet_public_from_private", ratchet_private=priv)
@@ -22,6 +35,10 @@ def test_ratchet_public_from_private(sut, reference):
     assert_hex_equal(res["ratchet_public"], ref["ratchet_public"])
 
 
+@conformance_case(
+    commands=["x25519_generate", "ratchet_derive_key"],
+    verifies="Ratchet key derivation (ECDH + HKDF with identity_hash as salt) produces matching shared_key and derived_key",
+)
 def test_ratchet_derive_key(sut, reference):
     # Generate proper X25519 keypairs via reference to ensure valid keys
     eph_seed = random_hex(32)
@@ -47,6 +64,10 @@ def test_ratchet_derive_key(sut, reference):
     assert_hex_equal(res["derived_key"], ref["derived_key"])
 
 
+@conformance_case(
+    commands=["ratchet_public_from_private", "ratchet_encrypt", "ratchet_decrypt"],
+    verifies="Cross-implementation: encrypt with reference using ratchet public key, decrypt with SUT using ratchet private key. Recovers original plaintext",
+)
 def test_ratchet_encrypt_decrypt(sut, reference):
     ratchet_priv = random_hex(32)
     ref_pub = reference.execute(

@@ -14,6 +14,7 @@ import secrets
 
 import pytest
 
+from _rns_paths import resolve_lxmf_path, resolve_rns_path
 from bridge_client import BridgeClient
 from conftest import get_impl_list, resolve_command
 
@@ -44,14 +45,8 @@ def behavioral(behavioral_impl):
     cmd = resolve_command(behavioral_impl)
     env = (
         {
-            "PYTHON_RNS_PATH": os.environ.get(
-                "PYTHON_RNS_PATH",
-                os.path.expanduser("~/repos/Reticulum"),
-            ),
-            "PYTHON_LXMF_PATH": os.environ.get(
-                "PYTHON_LXMF_PATH",
-                os.path.expanduser("~/repos/LXMF"),
-            ),
+            "PYTHON_RNS_PATH": resolve_rns_path(),
+            "PYTHON_LXMF_PATH": resolve_lxmf_path(),
         }
         if behavioral_impl == "reference"
         else {}

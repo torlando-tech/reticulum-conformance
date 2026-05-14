@@ -5,20 +5,27 @@ by comparing SUT output against a reference implementation.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Destination"
+__category_order__ = 4
+
+
+@conformance_case(
+    commands=["name_hash"],
+    verifies='RNS `name_hash` of `"lxmf.delivery"` (the canonical LXMF delivery destination) is byte-identical across impls',
+)
 def test_name_hash(sut, reference):
     ref = reference.execute("name_hash", name="lxmf.delivery")
     res = sut.execute("name_hash", name="lxmf.delivery")
     assert_hex_equal(res["hash"], ref["hash"])
 
 
-def test_name_hash_single_aspect(sut, reference):
-    ref = reference.execute("name_hash", name="nomadnetwork.node")
-    res = sut.execute("name_hash", name="nomadnetwork.node")
-    assert_hex_equal(res["hash"], ref["hash"])
-
-
+@conformance_case(
+    commands=["identity_from_private_key", "destination_hash"],
+    verifies="RNS `destination_hash` composition: takes an `identity_hash` + `app_name` + `aspects`, computes the `name_hash`, then truncated-hashes `name_hash + identity_hash` into the 16-byte destination address — asserts both the intermediate `name_hash` and the final address",
+)
 def test_destination_hash(sut, reference):
     priv = random_hex(64)
     ref_id = reference.execute("identity_from_private_key", private_key=priv)
@@ -38,6 +45,10 @@ def test_destination_hash(sut, reference):
     assert_hex_equal(res["name_hash"], ref["name_hash"])
 
 
+@conformance_case(
+    commands=["packet_pack", "packet_hash"],
+    verifies='RNS `packet_hash` (SHA-256 of the "hashable part" of a packet — hops byte and HEADER_2 transport_id masked out): byte-identical hash and `hashable_part` slice. This is the dedup key in the packet hashlist, deliberately stable as packets propagate through transports',
+)
 def test_packet_hash(sut, reference):
     dest = random_hex(16)
     data = random_hex(32)

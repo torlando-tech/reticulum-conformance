@@ -19,7 +19,8 @@ Environment variables:
   PIPE_PEER_MODE: Interface mode (default: "full")
   PIPE_PEER_PATH_REQUEST_DEST: Hex destination hash for path_request action
   PIPE_PEER_PATH_REQUEST_DEST_FILE: File to poll for destination hash (path_request)
-  PYTHON_RNS_PATH: Path to Python RNS source (default: ~/repos/Reticulum)
+  PYTHON_RNS_PATH: Override path to Python RNS source. If unset, the resolver
+    tries a sibling `Reticulum/` checkout and finally a pip-installed `RNS`.
 """
 import json
 import os
@@ -27,10 +28,15 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
-# Add RNS to path
-rns_path = os.environ.get("PYTHON_RNS_PATH", os.path.expanduser("~/repos/Reticulum"))
-sys.path.insert(0, rns_path)
+# This script is invoked as a subprocess (not via pytest), so we have to
+# put the repo root on sys.path ourselves before importing the resolver.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _rns_paths import resolve_rns_path  # noqa: E402
+
+# Make `import RNS` work in this process.
+sys.path.insert(0, resolve_rns_path())
 
 
 _BridgeMessageClass = None

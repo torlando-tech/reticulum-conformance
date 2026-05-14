@@ -125,27 +125,42 @@ def _normalize_mode(raw: str | None) -> str | None:
 
 def _write_ifac_ini(
     config_dir: str,
-    iface_name: str,
-    iface_block: str,
+    iface_name: str | None,
+    iface_block: str | None,
     network_name: str,
     passphrase: str,
     share_instance: bool = False,
     instance_name: str | None = None,
     mode: str | None = None,
+    shared_instance_type: str | None = None,
+    shared_instance_port: int | None = None,
+    instance_control_port: int | None = None,
+    rpc_key: str | None = None,
+    enable_transport: bool = True,
 ):
-    """Write a minimal RNS config with a single interface.
+    """Write a minimal RNS config.
 
     `iface_block` is the full interface type/target/port block; this helper
     adds the `[reticulum]` header, the shared IFAC fields (if any), and
-    wraps the interface block.
+    wraps the interface block. Pass `iface_name=None, iface_block=None` to
+    omit the `[interfaces]` section entirely — used by the
+    shared-instance-only client config (no on-wire interface, just attaches
+    to a local master via TCP loopback).
 
-    share_instance=True publishes this RNS as a shared instance (AF_UNIX
-    abstract socket) so out-of-process daemons like lxmd can attach via
-    `--rnsconfig <config_dir>` and ride this peer's Transport. Used by the
-    LXMF propagation-node peer so the daemon isn't a standalone Reticulum.
-    When True, instance_name MUST be set to a value unique to this bridge
-    process — the abstract socket namespace is global and default=="default"
-    collides across parallel bridges.
+    share_instance=True publishes this RNS as a shared instance so external
+    daemons (lxmd) or other in-process bridge peers can attach. When
+    shared_instance_type="tcp", the master listens on
+    127.0.0.1:shared_instance_port and clients connect by setting the same
+    type+port (cross-impl interop, since reticulum-kt's LocalClientInterface
+    is TCP-based on Android/macOS). When shared_instance_type is unset (or
+    "unix"), Python uses AF_UNIX abstract sockets keyed by instance_name —
+    that path is fine for Python↔Python but not portable to reticulum-kt.
+
+    enable_transport=False is required for shared-instance-client configs:
+    Python forbids enabling transport on a process that's connecting to an
+    upstream shared instance (Reticulum.py:418 sets __transport_enabled=False
+    after attach), and the config-time check there would otherwise refuse
+    the attach.
     """
     os.makedirs(config_dir, exist_ok=True)
     config_file = os.path.join(config_dir, "config")
@@ -166,29 +181,77 @@ def _write_ifac_ini(
         # sides — the same MODE_* constant is assigned.
         ifac_lines += f"    mode = {mode}\n"
 
-    if share_instance and not instance_name:
+    if share_instance and not instance_name and shared_instance_type != "tcp":
         raise ValueError(
-            "share_instance=True requires instance_name; leaving it at the "
-            "default 'default' would collide with parallel bridge processes."
+            "share_instance=True requires instance_name (AF_UNIX); leaving "
+            "it at the default 'default' would collide with parallel bridge "
+            "processes. shared_instance_type='tcp' is the alternative — port "
+            "is the namespace there."
         )
 
     share_value = "Yes" if share_instance else "No"
     instance_line = (
-        f"  instance_name = {instance_name}\n" if share_instance and instance_name else ""
+        f"  instance_name = {instance_name}\n"
+        if share_instance and instance_name and shared_instance_type != "tcp"
+        else ""
     )
+    type_line = (
+        f"  shared_instance_type = {shared_instance_type}\n"
+        if share_instance and shared_instance_type
+        else ""
+    )
+    port_line = (
+        f"  shared_instance_port = {shared_instance_port}\n"
+        if share_instance and shared_instance_port
+        else ""
+    )
+    # instance_control_port pins the RPC listener Python brings up at
+    # Reticulum.py:339 when is_shared_instance=True and use_af_unix=False.
+    # Default 37429 collides across parallel master processes — same
+    # rationale as the bind_port allocation, just for a different listener.
+    control_port_line = (
+        f"  instance_control_port = {instance_control_port}\n"
+        if share_instance and instance_control_port
+        else ""
+    )
+    # rpc_key pins the multiprocessing.connection authkey both sides use
+    # for the shared-instance RPC channel (Reticulum.py:1132). Without
+    # this, master and client derive distinct keys from their distinct
+    # transport identities (line 336-337) and the client's first RPC call
+    # — _used_destination_data, fired during link establishment — fails
+    # with AuthenticationError. In production this is invisible because
+    # the auto-detect path has both peers share a single configdir, hence
+    # a single transport identity, hence a matching derived key. Tests
+    # spawn the peers in distinct configdirs (separate bridge processes)
+    # so we have to pin the key explicitly.
+    rpc_key_line = (
+        f"  rpc_key = {rpc_key}\n"
+        if rpc_key
+        else ""
+    )
+    transport_value = "Yes" if enable_transport else "No"
+
+    interfaces_section = ""
+    if iface_name and iface_block:
+        interfaces_section = (
+            "\n[interfaces]\n"
+            f"  [[{iface_name}]]\n"
+            f"{iface_block}"
+            f"{ifac_lines}"
+        )
 
     with open(config_file, "w") as f:
         f.write(
             "[reticulum]\n"
-            "  enable_transport = Yes\n"
+            f"  enable_transport = {transport_value}\n"
             f"  share_instance = {share_value}\n"
             f"{instance_line}"
+            f"{type_line}"
+            f"{port_line}"
+            f"{control_port_line}"
+            f"{rpc_key_line}"
             "  respond_to_probes = No\n"
-            "\n"
-            "[interfaces]\n"
-            f"  [[{iface_name}]]\n"
-            f"{iface_block}"
-            f"{ifac_lines}"
+            f"{interfaces_section}"
         )
 
 
@@ -233,22 +296,52 @@ def cmd_wire_start_tcp_server(params):
     impls can use the same "tell me a usable port" contract. The
     returned `port` is what the client peer should connect to.
 
-    share_instance (bool, default False): publish this RNS as an AF_UNIX
-    shared instance so external daemons (lxmd) can attach via `--rnsconfig
-    <config_dir>` rather than spinning up their own Reticulum. Only the
-    middle peer in the LXMF propagation trio needs this — sender/receiver
-    run their LXMRouters in-process against the bridge's own Reticulum.
-    When True, a unique `instance_name` is auto-generated from the token
-    so parallel bridge subprocesses don't collide on the abstract socket.
+    share_instance (bool, default False): publish this RNS as a shared
+    instance so external daemons (lxmd) or wire local-client peers can
+    attach without spinning up their own Reticulum. The default mode is
+    AF_UNIX abstract sockets keyed by an auto-generated `instance_name`
+    (the LXMF-propagation use case). For cross-impl interop with
+    reticulum-kt — whose LocalClientInterface only speaks TCP loopback —
+    pass `share_instance_type="tcp"`; the master then listens on a
+    second free port that the response surfaces as `shared_instance_port`,
+    which `wire_start_local_client` consumes.
     """
     network_name = params.get("network_name") or ""
     passphrase = params.get("passphrase") or ""
     bind_port = int(params.get("bind_port", 0))
     share_instance = bool(params.get("share_instance", False))
+    share_instance_type = params.get("share_instance_type")
+    if share_instance_type is not None:
+        share_instance_type = str(share_instance_type).lower()
+        if share_instance_type not in ("tcp", "unix"):
+            raise ValueError(
+                f"share_instance_type must be 'tcp' or 'unix' (got {share_instance_type!r})"
+            )
     mode = _normalize_mode(params.get("mode"))
 
     if bind_port == 0:
         bind_port = _allocate_free_port()
+
+    # Allocate free ports for both the shared-instance LocalServerInterface
+    # (data path) and the RPC control listener (Reticulum.py:340) so parallel
+    # test runs don't collide. Python ignores these when use_af_unix=True
+    # (the AF_UNIX path keys by instance_name instead). On macOS / wherever
+    # use_af_unix() returns False, the defaults (37428/37429) are global and
+    # any second master would EADDRINUSE on the control port even if
+    # shared_instance_port was allocated freshly.
+    #
+    # rpc_key: the master and any local-client peer must use the same
+    # multiprocessing.connection authkey or the client's first RPC call
+    # (_used_destination_data, fired during link setup) raises
+    # AuthenticationError. Generate fresh per-master and surface it so
+    # wire_start_local_client can write it into the client's config.
+    shared_instance_port = None
+    instance_control_port = None
+    rpc_key_hex: str | None = None
+    if share_instance and share_instance_type == "tcp":
+        shared_instance_port = _allocate_free_port()
+        instance_control_port = _allocate_free_port()
+        rpc_key_hex = secrets.token_hex(32)
 
     config_dir = tempfile.mkdtemp(prefix="rns_wire_server_")
     # instance_name must be unique per bridge process: the AF_UNIX abstract
@@ -270,6 +363,10 @@ def cmd_wire_start_tcp_server(params):
         share_instance=share_instance,
         instance_name=instance_name if share_instance else None,
         mode=mode,
+        shared_instance_type=share_instance_type,
+        shared_instance_port=shared_instance_port,
+        instance_control_port=instance_control_port,
+        rpc_key=rpc_key_hex,
     )
 
     RNS = _get_rns()
@@ -287,11 +384,119 @@ def cmd_wire_start_tcp_server(params):
             "destinations": [],
             "share_instance": share_instance,
             "instance_name": instance_name if share_instance else None,
+            "share_instance_type": share_instance_type,
+            "shared_instance_port": shared_instance_port,
+            "instance_control_port": instance_control_port,
+            "rpc_key": rpc_key_hex,
+        }
+
+    response = {
+        "handle": handle,
+        "port": bind_port,
+        "identity_hash": identity_hash.hex(),
+    }
+    if share_instance:
+        response["instance_name"] = instance_name
+        if share_instance_type:
+            response["share_instance_type"] = share_instance_type
+        if shared_instance_port:
+            response["shared_instance_port"] = shared_instance_port
+        if instance_control_port:
+            response["instance_control_port"] = instance_control_port
+        if rpc_key_hex:
+            response["rpc_key"] = rpc_key_hex
+    return response
+
+
+def cmd_wire_start_local_client(params):
+    """Bring up RNS as a shared-instance client of an already-running master.
+
+    No on-wire interface is configured; the client's only attachment is the
+    local socket to the master. This is the originator side of the
+    `[local client] → [shared master + TCP] → [remote dest]` topology used
+    to exercise the master's transport-mode forwarding when a LINKREQUEST
+    arrives via a LocalServerInterface.
+
+    Required params:
+      shared_instance_port (int): the master's TCP shared-instance port,
+        as returned by wire_start_tcp_server when share_instance_type="tcp".
+
+    Optional params:
+      instance_control_port (int): the master's RPC control port. If
+        unset the client falls through to Python's default (37429), which
+        will collide with any other RNS process using defaults. Always
+        plumb the master's value through for parallel-test isolation.
+      rpc_key (hex str): the master's multiprocessing.connection authkey.
+        Without this, the client's first RPC call to the master fails with
+        AuthenticationError because both peers derived distinct keys from
+        their distinct transport identities. Always plumb the master's
+        rpc_key through.
+
+    Python's __start_local_interface (Reticulum.py:373) auto-detects the
+    role by trying LocalServerInterface first and falling back to
+    LocalClientInterface on bind failure — so the master MUST be started
+    before this is called, otherwise this peer would itself become the
+    master and the test topology would be wrong. The bridge sanity-checks
+    that the connect succeeded by asserting is_connected_to_shared_instance
+    after start; mismatch raises a clear error rather than letting a
+    silently-master-roled client confuse the test.
+    """
+    shared_instance_port = params.get("shared_instance_port")
+    if not shared_instance_port:
+        raise ValueError(
+            "wire_start_local_client requires shared_instance_port (the "
+            "master's TCP port from wire_start_tcp_server's response)"
+        )
+    shared_instance_port = int(shared_instance_port)
+    instance_control_port = params.get("instance_control_port")
+    if instance_control_port is not None:
+        instance_control_port = int(instance_control_port)
+    rpc_key = params.get("rpc_key")
+    if rpc_key is not None:
+        rpc_key = str(rpc_key)
+
+    config_dir = tempfile.mkdtemp(prefix="rns_wire_localclient_")
+    _write_ifac_ini(
+        config_dir,
+        iface_name=None,
+        iface_block=None,
+        network_name="",
+        passphrase="",
+        share_instance=True,
+        shared_instance_type="tcp",
+        shared_instance_port=shared_instance_port,
+        instance_control_port=instance_control_port,
+        rpc_key=rpc_key,
+        enable_transport=False,
+    )
+
+    RNS = _get_rns()
+    rns = _ensure_wire_rns_started(config_dir)
+
+    if not getattr(rns, "is_connected_to_shared_instance", False):
+        raise RuntimeError(
+            f"wire_start_local_client expected to attach as a shared-instance "
+            f"client on TCP port {shared_instance_port}, but ended up in role "
+            f"is_shared_instance={getattr(rns, 'is_shared_instance', None)} / "
+            f"is_standalone_instance={getattr(rns, 'is_standalone_instance', None)}. "
+            f"The master likely wasn't started first."
+        )
+
+    identity_hash = RNS.Transport.identity.hash
+
+    handle = secrets.token_hex(8)
+    with _instances_lock:
+        _instances[handle] = {
+            "rns": rns,
+            "config_dir": config_dir,
+            "identity_hash": identity_hash,
+            "role": "local_client",
+            "shared_instance_port": shared_instance_port,
+            "destinations": [],
         }
 
     return {
         "handle": handle,
-        "port": bind_port,
         "identity_hash": identity_hash.hex(),
     }
 
@@ -658,6 +863,68 @@ def cmd_wire_resource_send(params):
         "status": int(status_value) if status_value is not None else -1,
         "size": len(payload),
         "timed_out": False,
+    }
+
+
+def cmd_wire_resource_create(params):
+    """Construct a real RNS.Resource on an established outbound Link and
+    report its observable attributes — WITHOUT advertising or sending it.
+
+    This is the honest, delegating replacement for the deleted synthetic
+    resource_hash / resource_proof / resource_map_hash / resource_flags /
+    resource_build_hashmap / resource_adv_* / resource_find_part /
+    hashmap_pack commands. Those hand-rolled the hash compositions on top
+    of hashlib because the byte-level bridge can't reach RNS.Resource; two
+    of them had drifted from upstream (wrong operand order, truncated
+    proof) and the conformance suite stayed green anyway. This command
+    constructs the real object — real link, full real __init__ lifecycle —
+    and reads what RNS itself computed. Nothing here is recomputed.
+
+    `advertise=False` lets __init__ run to completion (random_hash + hash +
+    truncated_hash + expected_proof + the hashmap of real packed parts)
+    while keeping it inert — no advertisement, no transfer, no worker
+    threads, nothing on the wire.
+
+    Resource generates its own random_hash AND a separate data-stream
+    random prefix internally and fresh, so two calls with byte-identical
+    `data` return a different `hash` and different `parts`. The invariant
+    tests in tests/wire/test_resource_invariants.py assert exactly that —
+    on both the reference and the SUT.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Real RNS.Resource, real established link, full __init__ — just no
+    # advertise/send. Every field below is read straight off the object.
+    resource = RNS.Resource(payload, link, advertise=False)
+
+    return {
+        "hash": resource.hash.hex(),
+        "truncated_hash": resource.truncated_hash.hex(),
+        "random_hash": resource.random_hash.hex(),
+        "expected_proof": resource.expected_proof.hex(),
+        "hashmap": resource.hashmap.hex(),
+        "num_parts": len(resource.parts),
+        "encrypted": bool(resource.encrypted),
+        "compressed": bool(resource.compressed),
+        "split": bool(resource.split),
+        "size": resource.size,
+        "total_size": resource.total_size,
+        # Packed wire bytes of each part — for the "two resources from
+        # byte-identical input produce different encrypted output"
+        # invariant (the data-stream random prefix + per-token IV).
+        "parts": [p.raw.hex() for p in resource.parts],
     }
 
 
@@ -1061,6 +1328,7 @@ def cmd_wire_stop(params):
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
+    "wire_start_local_client": cmd_wire_start_local_client,
     "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
@@ -1076,6 +1344,7 @@ WIRE_COMMANDS = {
     "wire_link_send": cmd_wire_link_send,
     "wire_link_poll": cmd_wire_link_poll,
     "wire_resource_send": cmd_wire_resource_send,
+    "wire_resource_create": cmd_wire_resource_create,
     "wire_resource_poll": cmd_wire_resource_poll,
     "wire_stop": cmd_wire_stop,
 }

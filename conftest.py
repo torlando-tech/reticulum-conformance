@@ -10,6 +10,7 @@ import warnings
 
 import pytest
 
+from _rns_paths import resolve_lxmf_path, resolve_rns_path
 from bridge_client import BridgeClient
 
 # Bridge commands for each implementation.
@@ -119,14 +120,8 @@ def reference():
     """Reference implementation bridge (Python RNS)."""
     cmd = resolve_command("reference")
     env = {
-        "PYTHON_RNS_PATH": os.environ.get(
-            "PYTHON_RNS_PATH",
-            os.path.expanduser("~/repos/Reticulum"),
-        ),
-        "PYTHON_LXMF_PATH": os.environ.get(
-            "PYTHON_LXMF_PATH",
-            os.path.expanduser("~/repos/LXMF"),
-        ),
+        "PYTHON_RNS_PATH": resolve_rns_path(),
+        "PYTHON_LXMF_PATH": resolve_lxmf_path(),
     }
     client = BridgeClient(cmd, env=env)
     yield client
@@ -151,14 +146,8 @@ def sut_impl(request):
     env = {}
     if impl_name == "reference":
         env = {
-            "PYTHON_RNS_PATH": os.environ.get(
-                "PYTHON_RNS_PATH",
-                os.path.expanduser("~/repos/Reticulum"),
-            ),
-            "PYTHON_LXMF_PATH": os.environ.get(
-                "PYTHON_LXMF_PATH",
-                os.path.expanduser("~/repos/LXMF"),
-            ),
+            "PYTHON_RNS_PATH": resolve_rns_path(),
+            "PYTHON_LXMF_PATH": resolve_lxmf_path(),
         }
     client = BridgeClient(cmd, env=env)
     yield client

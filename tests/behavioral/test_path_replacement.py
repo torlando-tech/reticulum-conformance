@@ -20,12 +20,21 @@ stale one.
 import secrets
 import time
 
+from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     build_announce_from_destination,
     first_announce,
 )
 
 
+__category_title__ = "Transport Behavior"
+__category_order__ = 19
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "inject", "drain_tx"],
+    verifies="A stale PATH_RESPONSE announce (older emission timestamp, novel random_blob, more hops) does NOT replace a fresh direct-path entry — observable via the retransmitted announce's hops value",
+)
 def test_stale_path_response_does_not_overwrite_fresh_path(behavioral):
     """A PATH_RESPONSE-contextual announce with an older emission timestamp
     and more hops must NOT replace a fresh direct announce in the path table.

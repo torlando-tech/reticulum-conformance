@@ -36,6 +36,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 # Path expiry constants, in milliseconds since epoch (both sides agreed).
 # Matches Python Transport.PATHFINDER_E / AP_PATH_TIME / ROAMING_PATH_TIME
@@ -120,6 +126,10 @@ _ISSUE_46_REASON = (
 )
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "poll_path", "read_path_random_hash"],
+    verifies="When B answers a path request for a destination it cached, the re-emitted announce's random_hash bytes are byte-identical to the cached announce's (no regeneration on re-emit)",
+)
 def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
     """When B (transport) answers a PR for a destination it has cached,
     the re-emitted announce MUST be the cached announce — identifiable
@@ -234,6 +244,10 @@ _NON_DISCOVER_MODES = {"full", "point_to_point", "boundary"}
 _ALL_MODES_FOR_GATING = sorted(_DISCOVER_PATHS_FOR_MODES | _NON_DISCOVER_MODES)
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "request_path", "has_discovery_path_request"],
+    verifies="B forwards path requests for unknown destinations only when its receiving interface's mode is in DISCOVER_PATHS_FOR={access_point, gateway, roaming}, gated correctly for every parametrized mode",
+)
 @pytest.mark.parametrize("transport_mode", _ALL_MODES_FOR_GATING)
 def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
     """When C sends a PR for an UNKNOWN destination to B, B must only
@@ -309,6 +323,10 @@ def _tx_delta_after_pr(requester, transport_peer, dest_hash):
     return transport_peer.tx_bytes() - tx_before
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "tx_bytes", "read_path_entry"],
+    verifies="Under ROAMING mode, B refuses to answer a path request when the cached path's next-hop is the same interface that received the PR (loop-prevention rule fires)",
+)
 def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     """ROAMING loop prevention: when a PR arrives on an interface that
     is itself the `received_from` of the cached path, B must refuse to
@@ -380,6 +398,10 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     )
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "tx_bytes", "read_path_entry"],
+    verifies="Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn't vacuously passing because B never answers",
+)
 def test_roaming_loop_prevention_positive_companion(wire_peers):
     """Companion to the negative test above. Same 2-peer topology, but
     under FULL mode the loop-prevention rule does NOT apply, so B must
@@ -442,6 +464,10 @@ _EXPIRY_EXPECTATIONS = [
 _EXPIRY_JITTER_MS = 1000
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "read_path_entry"],
+    verifies="Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter",
+)
 @pytest.mark.parametrize(
     "mode,expected_delta_ms,label", _EXPIRY_EXPECTATIONS,
     ids=[label for _mode, _delta, label in _EXPIRY_EXPECTATIONS],

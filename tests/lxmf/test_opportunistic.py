@@ -25,6 +25,12 @@ import secrets
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "LXMF Delivery"
+__category_order__ = 17
+
 
 # LXMF field key for images. FIELD_IMAGE = 6 per LXMF spec (see
 # LXMF/Fields.py in the Python reference). Values are a 2-element
@@ -34,6 +40,10 @@ _TITLE_TEXT = "Opportunistic text test"
 _TITLE_IMAGE = "Opportunistic image test"
 
 
+@conformance_case(
+    commands=["send_opportunistic", "wait_for_inbox_count"],
+    verifies="A single-packet OPPORTUNISTIC LXMessage arrives at the receiver with exact content, title, source, and empty fields",
+)
 def test_opportunistic_text_round_trip(lxmf_trio, lxmf_transport_3peer):
     """Sender -> plain transport -> receiver, text-only opportunistic
     message. Three tight assertions: (1) send returns a message hash,
@@ -82,6 +92,10 @@ def test_opportunistic_text_round_trip(lxmf_trio, lxmf_transport_3peer):
     )
 
 
+@conformance_case(
+    commands=["send_opportunistic", "wait_for_inbox_count"],
+    verifies="An OPPORTUNISTIC LXMessage carrying a FIELD_IMAGE payload (format + ~64-byte image bytes) arrives with exact field shape",
+)
 def test_opportunistic_with_image_field(lxmf_trio, lxmf_transport_3peer):
     """Send a short text message with a FIELD_IMAGE attached. Asserts
     exact field payload on receipt.

@@ -23,10 +23,20 @@ Scope intentionally tight:
 import secrets
 import time
 
+from conformance import conformance_case
+
+
+__category_title__ = "LXMF Delivery"
+__category_order__ = 17
+
 
 _TITLE = "Propagation test"
 
 
+@conformance_case(
+    commands=["send_propagated", "wait_for_stored_message_count", "sync_inbound", "poll_inbox"],
+    verifies="A PROPAGATED LXMessage is stored exactly once on the lxmd propagation node, sync_inbound pulls exactly one message, and the receiver's inbox holds the matching content/title/source",
+)
 def test_propagated_delivery_round_trip(lxmf_trio, lxmf_3peer):
     """Sender → lxmd propagation node → receiver, with three tight
     assertions: (1) B's storage shows exactly 1 message, (2) C's

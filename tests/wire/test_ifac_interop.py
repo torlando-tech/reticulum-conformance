@@ -24,6 +24,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 def _fresh_credentials() -> tuple[str, str]:
     """Random but deterministic-looking (network_name, passphrase) pair.
@@ -49,6 +55,10 @@ _CONNECT_SETTLE_SEC = 0.75
 _POLL_TIMEOUT_MS = 5000
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "poll_path"],
+    verifies="An announce from a TCP client with matching IFAC credentials populates the server's path table (reticulum-kt#29 forward direction)",
+)
 def test_announce_propagates_with_ifac(wire_peers):
     """A client's announce must land in the server's path table when both
     sides have matching IFAC credentials.
@@ -82,6 +92,10 @@ def test_announce_propagates_with_ifac(wire_peers):
     )
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "poll_path"],
+    verifies="Reverse-direction IFAC: server-initiated announce reaches the TCP client (exercises TCPServerInterface child-interface IFAC inheritance)",
+)
 def test_announce_bidirectional(wire_peers):
     """Additionally verify the reverse direction: server announces, client
     learns the path. The one-direction test above covers client→server; this
@@ -112,6 +126,10 @@ def test_announce_bidirectional(wire_peers):
     )
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "poll_path"],
+    verifies="Negative control: when network_names match but passphrases differ, IFAC verification rejects the announce and no path is learned",
+)
 @pytest.mark.parametrize(
     "server_secret,client_secret",
     [

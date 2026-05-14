@@ -14,8 +14,26 @@ These tests exercise the complete chain that propagated LXMF messages use:
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Ratchet Lifecycle"
+__category_order__ = 11
+
+
+@conformance_case(
+    commands=[
+        "identity_from_private_key",
+        "name_hash",
+        "random_hash",
+        "destination_hash",
+        "ratchet_public_from_private",
+        "announce_sign",
+        "announce_pack",
+        "announce_unpack",
+    ],
+    verifies="An announce signed, packed, and unpacked with a ratchet public key round-trips byte-identically; ratchet field survives the wire",
+)
 def test_announce_with_ratchet_pack_unpack(sut, reference):
     """Announce data with ratchet packs/unpacks identically."""
     priv = random_hex(64)
@@ -97,6 +115,20 @@ def test_announce_with_ratchet_pack_unpack(sut, reference):
     assert_hex_equal(res_unp["ratchet"], ratchet_pub)
 
 
+@conformance_case(
+    commands=[
+        "identity_from_private_key",
+        "name_hash",
+        "random_hash",
+        "destination_hash",
+        "ratchet_public_from_private",
+        "announce_sign",
+        "announce_pack",
+        "announce_unpack",
+        "ratchet_id",
+    ],
+    verifies="Ratchet public key (and derived ratchet_id) extracted from a packed announce matches what was packed in",
+)
 def test_ratchet_extract_from_announce(sut, reference):
     """Ratchet extracted from announce matches what was packed."""
     priv = random_hex(64)
@@ -158,6 +190,15 @@ def test_ratchet_extract_from_announce(sut, reference):
     assert_hex_equal(res_rid["ratchet_id"], ref_rid["ratchet_id"])
 
 
+@conformance_case(
+    commands=[
+        "identity_from_private_key",
+        "ratchet_public_from_private",
+        "ratchet_encrypt",
+        "ratchet_decrypt",
+    ],
+    verifies="Full ratchet flow (identity → ratchet keypair → encrypt → decrypt) round-trips a plaintext in both cross-impl directions; the path propagated LXMF delivery depends on",
+)
 def test_ratchet_full_lifecycle_encrypt_decrypt(sut, reference):
     """Full lifecycle: create ratchet → announce → extract → encrypt → decrypt.
 
@@ -219,6 +260,10 @@ def test_ratchet_full_lifecycle_encrypt_decrypt(sut, reference):
     assert_hex_equal(ref_dec["plaintext"], plaintext)
 
 
+@conformance_case(
+    commands=["ratchet_public_from_private", "ratchet_encrypt", "ratchet_decrypt"],
+    verifies="Cross-impl ratchet encrypt/decrypt: SUT-encrypted ciphertext decrypts on the reference, and reference-encrypted ciphertext decrypts on the SUT",
+)
 def test_ratchet_cross_encrypt_decrypt(sut, reference):
     """Cross-implementation ratchet encrypt/decrypt in both directions."""
     ratchet_priv = random_hex(32)

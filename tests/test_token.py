@@ -5,8 +5,17 @@ SUT output against a reference implementation.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Token Encryption"
+__category_order__ = 3
+
+
+@conformance_case(
+    commands=["token_encrypt", "token_decrypt"],
+    verifies="RNS Token encrypt/decrypt round-trip (Fernet-like AES-256-CBC + HMAC-SHA256): given the same key, IV, and plaintext, both impls produce byte-identical tokens and decrypt back to the original",
+)
 def test_token_encrypt_decrypt(sut, reference):
     key = random_hex(64)  # 32B signing + 32B encryption
     plaintext = random_hex(48)
@@ -21,6 +30,10 @@ def test_token_encrypt_decrypt(sut, reference):
     assert_hex_equal(res_dec["plaintext"], plaintext)
 
 
+@conformance_case(
+    commands=["token_encrypt", "token_verify_hmac"],
+    verifies="Both impls verify the HMAC tag on a well-formed RNS Token as valid — positive control on the verify path",
+)
 def test_token_verify_hmac(sut, reference):
     key = random_hex(64)
     plaintext = random_hex(32)
@@ -32,6 +45,10 @@ def test_token_verify_hmac(sut, reference):
     assert res_v["valid"] is True
 
 
+@conformance_case(
+    commands=["token_encrypt", "token_decrypt"],
+    verifies="RNS Token cross-impl interop: tokens produced by either impl decrypt to the original plaintext on the other",
+)
 def test_token_cross_decrypt(sut, reference):
     """Encrypt with SUT, decrypt with reference and vice versa."""
     key = random_hex(64)

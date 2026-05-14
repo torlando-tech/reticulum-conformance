@@ -7,6 +7,8 @@ via PipeInterface (HDLC-framed stdin/stdout).
 import os
 import pytest
 
+from _rns_paths import resolve_rns_path
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -38,22 +40,12 @@ def peer_cmd(request):
 
 @pytest.fixture(scope="session")
 def rns_path():
-    """Find the Python RNS reference implementation."""
-    env = os.environ.get("PYTHON_RNS_PATH")
-    if env:
-        return env
-    home = os.path.expanduser("~")
-    for candidate in [
-        os.path.join(home, "repos/Reticulum"),
-        os.path.join(home, "repos/public/Reticulum"),
-    ]:
-        if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "RNS")):
-            return candidate
+    """Find the Python RNS reference implementation.
+
+    Skip (rather than fail) if RNS can't be located — the integration suite
+    treats Python RNS as an optional reference for pipe-based tests.
+    """
     try:
-        import importlib.util
-        spec = importlib.util.find_spec("RNS")
-        if spec and spec.origin:
-            return os.path.dirname(os.path.dirname(spec.origin))
-    except (ImportError, ValueError):
-        pass
-    pytest.skip("Cannot find Python RNS. Install with: pip install rns")
+        return resolve_rns_path()
+    except RuntimeError as e:
+        pytest.skip(str(e))

@@ -6,8 +6,17 @@ SUT output against a reference implementation.
 """
 
 from conftest import random_hex, assert_hex_equal
+from conformance import conformance_case
 
 
+__category_title__ = "Cryptographic Primitives"
+__category_order__ = 1
+
+
+@conformance_case(
+    commands=["sha256"],
+    verifies="SHA-256 of 64 random bytes is byte-identical across impls",
+)
 def test_sha256(sut, reference):
     data = random_hex(64)
     ref = reference.execute("sha256", data=data)
@@ -15,6 +24,10 @@ def test_sha256(sut, reference):
     assert_hex_equal(res["hash"], ref["hash"])
 
 
+@conformance_case(
+    commands=["sha512"],
+    verifies="SHA-512 of 64 random bytes is byte-identical across impls",
+)
 def test_sha512(sut, reference):
     data = random_hex(64)
     ref = reference.execute("sha512", data=data)
@@ -22,6 +35,10 @@ def test_sha512(sut, reference):
     assert_hex_equal(res["hash"], ref["hash"])
 
 
+@conformance_case(
+    commands=["hmac_sha256"],
+    verifies="HMAC-SHA256 of a random 32-byte key + 48-byte message is byte-identical",
+)
 def test_hmac_sha256(sut, reference):
     key = random_hex(32)
     message = random_hex(48)
@@ -30,6 +47,10 @@ def test_hmac_sha256(sut, reference):
     assert_hex_equal(res["hmac"], ref["hmac"])
 
 
+@conformance_case(
+    commands=["truncated_hash"],
+    verifies="RNS's 16-byte `truncated_hash` (`SHA-256[:16]`) is byte-identical — the building block for destination, packet, and ratchet IDs",
+)
 def test_truncated_hash(sut, reference):
     data = random_hex(64)
     ref = reference.execute("truncated_hash", data=data)
@@ -37,6 +58,10 @@ def test_truncated_hash(sut, reference):
     assert_hex_equal(res["hash"], ref["hash"])
 
 
+@conformance_case(
+    commands=["hkdf"],
+    verifies="HKDF with a salt, 64-byte output is byte-identical",
+)
 def test_hkdf(sut, reference):
     ikm = random_hex(32)
     salt = random_hex(16)
@@ -45,6 +70,10 @@ def test_hkdf(sut, reference):
     assert_hex_equal(res["derived_key"], ref["derived_key"])
 
 
+@conformance_case(
+    commands=["hkdf"],
+    verifies="HKDF with **no salt** (zero-salt path), 32-byte output is byte-identical",
+)
 def test_hkdf_no_salt(sut, reference):
     ikm = random_hex(32)
     ref = reference.execute("hkdf", length=32, ikm=ikm)
@@ -52,6 +81,10 @@ def test_hkdf_no_salt(sut, reference):
     assert_hex_equal(res["derived_key"], ref["derived_key"])
 
 
+@conformance_case(
+    commands=["hkdf"],
+    verifies="HKDF with salt **and an info-context label**, 48-byte output is byte-identical",
+)
 def test_hkdf_with_info(sut, reference):
     ikm = random_hex(32)
     salt = random_hex(16)
@@ -61,6 +94,10 @@ def test_hkdf_with_info(sut, reference):
     assert_hex_equal(res["derived_key"], ref["derived_key"])
 
 
+@conformance_case(
+    commands=["aes_encrypt", "aes_decrypt"],
+    verifies="AES-256-CBC round-trip: with both impls given the same key, IV, and plaintext, encryption produces byte-identical ciphertext and decryption recovers the original",
+)
 def test_aes_encrypt_decrypt(sut, reference):
     plaintext = random_hex(48)
     key = random_hex(32)
@@ -75,6 +112,10 @@ def test_aes_encrypt_decrypt(sut, reference):
     assert_hex_equal(res_dec["plaintext"], plaintext)
 
 
+@conformance_case(
+    commands=["pkcs7_pad", "pkcs7_unpad"],
+    verifies="PKCS7 pad/unpad round-trip on non-aligned data: padding is byte-identical and unpadding recovers the original",
+)
 def test_pkcs7_pad_unpad(sut, reference):
     data = random_hex(13)  # Not a multiple of 16
     ref = reference.execute("pkcs7_pad", data=data)
@@ -87,6 +128,10 @@ def test_pkcs7_pad_unpad(sut, reference):
     assert_hex_equal(res_unpad["unpadded"], data)
 
 
+@conformance_case(
+    commands=["x25519_generate"],
+    verifies="X25519 keypair generation from a deterministic seed yields byte-identical public key",
+)
 def test_x25519_generate(sut, reference):
     seed = random_hex(32)
     ref = reference.execute("x25519_generate", seed=seed)
@@ -94,6 +139,10 @@ def test_x25519_generate(sut, reference):
     assert_hex_equal(res["public_key"], ref["public_key"])
 
 
+@conformance_case(
+    commands=["x25519_generate", "x25519_public_from_private"],
+    verifies="Deriving an X25519 public key from a **raw private key** (no seed path) yields byte-identical output",
+)
 def test_x25519_public_from_private(sut, reference):
     seed = random_hex(32)
     ref = reference.execute("x25519_generate", seed=seed)
@@ -102,6 +151,10 @@ def test_x25519_public_from_private(sut, reference):
     assert_hex_equal(res["public_key"], ref2["public_key"])
 
 
+@conformance_case(
+    commands=["x25519_generate", "x25519_exchange"],
+    verifies="X25519 ECDH between two keypairs produces a byte-identical shared secret — the basis of link key derivation",
+)
 def test_x25519_exchange(sut, reference):
     seed_a = random_hex(32)
     seed_b = random_hex(32)
@@ -120,6 +173,10 @@ def test_x25519_exchange(sut, reference):
     assert_hex_equal(res["shared_secret"], ref["shared_secret"])
 
 
+@conformance_case(
+    commands=["ed25519_generate"],
+    verifies="Ed25519 keypair generation from a deterministic seed yields byte-identical public key",
+)
 def test_ed25519_generate(sut, reference):
     seed = random_hex(32)
     ref = reference.execute("ed25519_generate", seed=seed)
@@ -127,6 +184,10 @@ def test_ed25519_generate(sut, reference):
     assert_hex_equal(res["public_key"], ref["public_key"])
 
 
+@conformance_case(
+    commands=["ed25519_generate", "ed25519_sign", "ed25519_verify"],
+    verifies="Ed25519 sign+verify: signing is deterministic per RFC 8032 (same input → byte-identical signature) and both impls verify each other's signatures",
+)
 def test_ed25519_sign_verify(sut, reference):
     seed = random_hex(32)
     message = random_hex(64)
@@ -155,6 +216,10 @@ def test_ed25519_sign_verify(sut, reference):
     assert res_v["valid"] is True
 
 
+@conformance_case(
+    commands=["ed25519_generate", "ed25519_verify"],
+    verifies="Negative control: both impls reject a random (forged) Ed25519 signature",
+)
 def test_ed25519_verify_bad_sig(sut, reference):
     seed = random_hex(32)
     message = random_hex(64)

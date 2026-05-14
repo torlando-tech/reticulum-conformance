@@ -16,12 +16,21 @@ import time
 
 import pytest
 
+from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     build_announce_from_destination,
     first_announce,
 )
 
 
+__category_title__ = "Transport Behavior"
+__category_order__ = 19
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "inject", "drain_tx"],
+    verifies="An announce received with wire_hops=N is re-emitted on another interface with hops=N+1 (the per-hop +1 increment rule)",
+)
 def test_hop_increment_on_receive(behavioral):
     """Inject announce with wire_hops=3 on iface_a with transport enabled;
     the retransmission on iface_b should carry hops=4 (the received value
@@ -84,6 +93,10 @@ def test_hop_increment_on_receive(behavioral):
         behavioral.cleanup()
 
 
+@conformance_case(
+    commands=["start", "attach_mock_interface", "inject", "drain_tx"],
+    verifies="With enable_transport=False and no local clients, received announces are NOT re-emitted on any other interface (the transport gate enforces)",
+)
 def test_hop_increment_when_transport_disabled(behavioral):
     """With enable_transport=False and no local clients, Transport should NOT
     re-emit received announces on any other interface. (This is the gate

@@ -44,6 +44,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 def _xfail_kotlin_receiver_multihop(wire_trio, reason_suffix=""):
     """Mark the test as expected-to-fail when Kotlin is the receiver in a
@@ -108,6 +114,10 @@ def _setup_three_peer_topology(wire_3peer):
     return sender, transport, receiver, dest_hash
 
 
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "listen", "announce", "link_open"],
+    verifies="A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout",
+)
 def test_link_establishes_multihop(wire_3peer):
     """Baseline: a 2-hop Link must establish successfully across a transport.
 
@@ -132,6 +142,10 @@ def test_link_establishes_multihop(wire_3peer):
     )
 
 
+@conformance_case(
+    commands=["link_open", "link_send", "link_poll"],
+    verifies="Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender",
+)
 def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     """The real test: once the link is established, sent bytes must
     arrive at the receiver.
@@ -178,6 +192,10 @@ def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=["link_open", "link_send", "link_poll"],
+    verifies="Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches 'only first packet routes' regressions",
+)
 def test_link_data_roundtrip_multiple_packets(wire_trio, wire_3peer):
     """Extension: multiple consecutive sends must all arrive. This
     catches regressions where only the first post-establishment packet

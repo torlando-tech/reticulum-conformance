@@ -19,7 +19,7 @@ import secrets
 
 import pytest
 
-from _rns_paths import resolve_lxmf_path, resolve_rns_path
+from _rns_paths import resolve_rns_path
 from bridge_client import BridgeClient
 from conftest import get_impl_list, resolve_command
 
@@ -30,7 +30,6 @@ def _env_for(impl: str) -> dict:
         return {}
     return {
         "PYTHON_RNS_PATH": resolve_rns_path(),
-        "PYTHON_LXMF_PATH": resolve_lxmf_path(),
     }
 
 

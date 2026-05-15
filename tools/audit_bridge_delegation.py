@@ -61,15 +61,13 @@ from generate_tests_md import _categorize, collect_items  # noqa: E402
 COMMAND_MODULES = {
     "bridge_server.py": "COMMANDS",
     "wire_tcp.py": "WIRE_COMMANDS",
-    "lxmf_bridge.py": "LXMF_COMMANDS",
     "behavioral_transport.py": "BEHAVIORAL_COMMANDS",
 }
 
 # Module-global names whose presence in a handler body means it is operating on
-# a live RNS/LXMF instance rather than reconstructing anything.
+# a live RNS instance rather than reconstructing anything.
 LIVE_GLOBALS = {
-    "_rns_instance", "_lxmf_router", "_lxmf_identity", "_lxmf_destination",
-    "_received_messages", "_rns_module", "_instances", "_instances_lock",
+    "_rns_instance", "_rns_module", "_instances", "_instances_lock",
 }
 LIVE_CALLS = {"_get_full_rns", "_get_rns", "_ensure_minimal_rns"}
 
@@ -350,7 +348,6 @@ def main() -> int:
     live_backed_dirs: list[str] = []
     for filename, test_dir in (
         ("wire_tcp.py", "tests/wire/"),
-        ("lxmf_bridge.py", "tests/lxmf/"),
         ("behavioral_transport.py", "tests/behavioral/"),
     ):
         module_classes = {

@@ -79,8 +79,3 @@ def resolve_package_path(pkg: str, env_var: str) -> str:
 def resolve_rns_path() -> str:
     """Resolve the path to the upstream `RNS` package (see option C above)."""
     return resolve_package_path("RNS", "PYTHON_RNS_PATH")
-
-
-def resolve_lxmf_path() -> str:
-    """Resolve the path to the upstream `LXMF` package (see option C above)."""
-    return resolve_package_path("LXMF", "PYTHON_LXMF_PATH")

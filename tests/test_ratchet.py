@@ -1,8 +1,12 @@
 """Ratchet conformance tests.
 
-Tests ratchet ID computation, public key derivation, key derivation,
-and encrypt/decrypt by comparing SUT output against a reference
-implementation.
+Tests ratchet ID computation, public key derivation, and the
+encrypt/decrypt round-trip against RNS.Identity's real ratchet path. The
+prior synthetic test for the internal ratchet KDF (`ratchet_derive_key`)
+was removed — RNS exposes no standalone KDF entry point, so the bridge
+had to reimplement the composition; the property the KDF test pinned is
+now covered transitively by the encrypt/decrypt round-trip (if the KDF
+diverges, decrypt fails).
 """
 
 from conftest import random_hex, assert_hex_equal
@@ -15,7 +19,7 @@ __category_order__ = 10
 
 @conformance_case(
     commands=["ratchet_id"],
-    verifies="Ratchet ID (first 10 bytes of SHA-256 of public key) matches",
+    verifies="RNS ratchet ID (truncated_hash(ratchet_public)[:NAME_HASH_LENGTH//8] = 10 bytes) is byte-identical across impls",
 )
 def test_ratchet_id(sut, reference):
     pub = random_hex(32)
@@ -36,57 +40,81 @@ def test_ratchet_public_from_private(sut, reference):
 
 
 @conformance_case(
-    commands=["x25519_generate", "ratchet_derive_key"],
-    verifies="Ratchet key derivation (ECDH + HKDF with identity_hash as salt) produces matching shared_key and derived_key",
-)
-def test_ratchet_derive_key(sut, reference):
-    # Generate proper X25519 keypairs via reference to ensure valid keys
-    eph_seed = random_hex(32)
-    eph_keys = reference.execute("x25519_generate", seed=eph_seed)
-    eph_priv = eph_keys["private_key"]
-    ratchet_seed = random_hex(32)
-    ratchet_keys = reference.execute("x25519_generate", seed=ratchet_seed)
-    ratchet_pub = ratchet_keys["public_key"]
-    identity_hash = random_hex(16)
-    ref = reference.execute(
-        "ratchet_derive_key",
-        ephemeral_private=eph_priv,
-        ratchet_public=ratchet_pub,
-        identity_hash=identity_hash,
-    )
-    res = sut.execute(
-        "ratchet_derive_key",
-        ephemeral_private=eph_priv,
-        ratchet_public=ratchet_pub,
-        identity_hash=identity_hash,
-    )
-    assert_hex_equal(res["shared_key"], ref["shared_key"])
-    assert_hex_equal(res["derived_key"], ref["derived_key"])
-
-
-@conformance_case(
-    commands=["ratchet_public_from_private", "ratchet_encrypt", "ratchet_decrypt"],
-    verifies="Cross-implementation: encrypt with reference using ratchet public key, decrypt with SUT using ratchet private key. Recovers original plaintext",
+    commands=[
+        "identity_from_private_key",
+        "ratchet_public_from_private",
+        "ratchet_encrypt",
+        "ratchet_decrypt",
+    ],
+    verifies="RNS ratchet encrypt/decrypt cross-impl round-trip: a message encrypted on either impl using RNS.Identity.encrypt(ratchet=...) decrypts to the original on the other via RNS.Identity.decrypt(ratchets=[...]) — the full ratcheted unicast path",
 )
 def test_ratchet_encrypt_decrypt(sut, reference):
+    identity_priv = random_hex(64)
     ratchet_priv = random_hex(32)
-    ref_pub = reference.execute(
+    ref_id = reference.execute("identity_from_private_key", private_key=identity_priv)
+    ref_rpub = reference.execute(
         "ratchet_public_from_private", ratchet_private=ratchet_priv
     )
-    ratchet_pub = ref_pub["ratchet_public"]
-    identity_hash = random_hex(16)
+    public_key = ref_id["public_key"]
+    ratchet_public = ref_rpub["ratchet_public"]
     plaintext = random_hex(48)
-    # Encrypt with reference, decrypt with SUT
+
+    # Encrypt on reference, decrypt on SUT
     ref_enc = reference.execute(
         "ratchet_encrypt",
-        ratchet_public=ratchet_pub,
-        identity_hash=identity_hash,
+        public_key=public_key,
+        ratchet_public=ratchet_public,
         plaintext=plaintext,
     )
     res_dec = sut.execute(
         "ratchet_decrypt",
+        private_key=identity_priv,
         ratchet_private=ratchet_priv,
-        identity_hash=identity_hash,
         ciphertext=ref_enc["ciphertext"],
     )
     assert_hex_equal(res_dec["plaintext"], plaintext)
+
+    # Encrypt on SUT, decrypt on reference
+    res_enc = sut.execute(
+        "ratchet_encrypt",
+        public_key=public_key,
+        ratchet_public=ratchet_public,
+        plaintext=plaintext,
+    )
+    ref_dec = reference.execute(
+        "ratchet_decrypt",
+        private_key=identity_priv,
+        ratchet_private=ratchet_priv,
+        ciphertext=res_enc["ciphertext"],
+    )
+    assert_hex_equal(ref_dec["plaintext"], plaintext)
+
+
+@conformance_case(
+    commands=["identity_from_private_key", "ratchet_public_from_private", "ratchet_encrypt"],
+    verifies="Invariant: two ratchet encryptions of byte-identical plaintext for the same Identity + ratchet produce different ciphertext (RNS draws a fresh ephemeral X25519 key + AES IV per call) — deterministic ciphertext would leak plaintext equality",
+)
+def test_ratchet_encrypt_is_fresh_per_call(sut, reference):
+    identity_priv = random_hex(64)
+    ratchet_priv = random_hex(32)
+    ident = sut.execute("identity_from_private_key", private_key=identity_priv)
+    rpub = sut.execute(
+        "ratchet_public_from_private", ratchet_private=ratchet_priv
+    )
+    plaintext = random_hex(48)
+    first = sut.execute(
+        "ratchet_encrypt",
+        public_key=ident["public_key"],
+        ratchet_public=rpub["ratchet_public"],
+        plaintext=plaintext,
+    )
+    second = sut.execute(
+        "ratchet_encrypt",
+        public_key=ident["public_key"],
+        ratchet_public=rpub["ratchet_public"],
+        plaintext=plaintext,
+    )
+    assert first["ciphertext"] != second["ciphertext"], (
+        "two ratchet encryptions of identical plaintext produced identical "
+        "ciphertext — the ephemeral key / IV is being reused"
+    )

@@ -71,7 +71,7 @@ LIVE_GLOBALS = {
     "_rns_instance", "_lxmf_router", "_lxmf_identity", "_lxmf_destination",
     "_received_messages", "_rns_module", "_instances", "_instances_lock",
 }
-LIVE_CALLS = {"_get_full_rns", "_get_rns"}
+LIVE_CALLS = {"_get_full_rns", "_get_rns", "_ensure_minimal_rns"}
 
 # Named hash primitives — sha256/sha512 ARE the primitive, and
 # truncated_hash is RNS.Identity.truncated_hash (full_hash(data)[:16]), a
@@ -137,20 +137,45 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
     called_cmds: set[str] = set()
     is_hash_primitive = func.name in HASH_PRIMITIVES
 
-    # Locals bound directly from hex_to_bytes(...) are the handler's raw byte
-    # inputs. Slicing one into a sub-range is wire-format field extraction —
-    # the parser half of the pack/unpack hand-roll. (Slicing a *computed*
-    # value, e.g. a hash result `[:16]`, is just truncation and not flagged.)
+    # Track which local names hold bytes — propagating from hex_to_bytes(...)
+    # inputs through slices and bytes-concatenation assignments. Used by two
+    # signals:
+    #   asm:fieldslice — slicing a bytes local into a wire-format sub-range.
+    #   asm:concat     — adding 2+ bytes-typed values into a wire structure
+    #                    (e.g. `signed_data = link_id + receiver_pub + sig`).
+    # Refining `+` to only fire when operands are bytes-typed is what stops
+    # numeric offset arithmetic like `keysize + name_hash_len` (which is
+    # pervasive inside honest parsers that read a known RNS layout) from
+    # being mistaken for byte concatenation.
+
+    def _is_bytes_typed(node, hex_locals):
+        if isinstance(node, ast.Name):
+            return node.id in hex_locals
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, bytes)
+        if isinstance(node, ast.Call):
+            return _dotted(node.func) == "hex_to_bytes"
+        if isinstance(node, ast.Subscript):
+            return _is_bytes_typed(node.value, hex_locals)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return all(
+                _is_bytes_typed(t, hex_locals) for t in _flatten_add(node)
+            )
+        return False
+
     hex_locals: set[str] = set()
-    for node in ast.walk(func):
-        if (
-            isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and _dotted(node.value.func) == "hex_to_bytes"
-        ):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    hex_locals.add(target.id)
+    # Iterative propagation: a name is bytes-typed if assigned from any
+    # bytes-typed expression. Fixpoint terminates in O(passes) where each
+    # pass adds at least one new name; the handler bodies are tiny.
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and _is_bytes_typed(node.value, hex_locals):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id not in hex_locals:
+                        hex_locals.add(target.id)
+                        changed = True
 
     for node in ast.walk(func):
         if isinstance(node, ast.Call):
@@ -189,7 +214,15 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
                 signals.add("asm:bitop")
             elif isinstance(node.op, ast.Add):
                 terms = _flatten_add(node)
-                if len(terms) >= 2 and not any(_is_int_const(t) for t in terms):
+                # Byte concatenation of 2+ bytes-typed operands (e.g.
+                # `signed_data = link_id + receiver_pub + sig`) builds a
+                # wire structure by hand. Numeric arithmetic like
+                # `keysize + name_hash_len` doesn't trip this — neither
+                # operand traces back to bytes (hex_to_bytes / slice / bytes
+                # literal / bytes-typed Add).
+                if len(terms) >= 2 and all(
+                    _is_bytes_typed(t, hex_locals) for t in terms
+                ):
                     signals.add("asm:concat")
 
     if any(s.startswith("live:") for s in signals):

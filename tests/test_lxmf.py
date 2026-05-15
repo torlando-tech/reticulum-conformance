@@ -15,70 +15,12 @@ __category_title__ = "LXMF"
 __category_order__ = 15
 
 
-@conformance_case(
-    commands=["lxmf_pack", "lxmf_unpack"],
-    verifies="LXMF message packing (msgpack of [timestamp, title, content, fields]) produces identical packed_payload and message_hash; unpacking wire bytes recovers destination_hash and source_hash",
-)
-def test_lxmf_pack_unpack(sut, reference):
-    dest = random_hex(16)
-    src = random_hex(16)
-    ts = 1700000000.0
-    title = "48656c6c6f"  # "Hello" in hex
-    content = "576f726c64"  # "World" in hex
-    ref = reference.execute(
-        "lxmf_pack",
-        destination_hash=dest,
-        source_hash=src,
-        timestamp=ts,
-        title=title,
-        content=content,
-    )
-    res = sut.execute(
-        "lxmf_pack",
-        destination_hash=dest,
-        source_hash=src,
-        timestamp=ts,
-        title=title,
-        content=content,
-    )
-    assert_hex_equal(res["packed_payload"], ref["packed_payload"])
-    assert_hex_equal(res["message_hash"], ref["message_hash"])
-    # Unpack: construct full LXMF wire bytes = dest(16) + src(16) + sig(64) + packed_payload
-    dummy_sig = "00" * 64  # 64 zero bytes for signature
-    lxmf_bytes = dest + src + dummy_sig + ref["packed_payload"]
-    ref_u = reference.execute("lxmf_unpack", lxmf_bytes=lxmf_bytes)
-    res_u = sut.execute("lxmf_unpack", lxmf_bytes=lxmf_bytes)
-    assert_hex_equal(res_u["destination_hash"], ref_u["destination_hash"])
-    assert_hex_equal(res_u["source_hash"], ref_u["source_hash"])
-
-
-@conformance_case(
-    commands=["lxmf_hash"],
-    verifies="LXMF message hash (SHA-256 of dest + src + packed_payload) matches",
-)
-def test_lxmf_hash(sut, reference):
-    dest = random_hex(16)
-    src = random_hex(16)
-    ts = 1700000000.0
-    title = random_hex(10)
-    content = random_hex(20)
-    ref = reference.execute(
-        "lxmf_hash",
-        destination_hash=dest,
-        source_hash=src,
-        timestamp=ts,
-        title=title,
-        content=content,
-    )
-    res = sut.execute(
-        "lxmf_hash",
-        destination_hash=dest,
-        source_hash=src,
-        timestamp=ts,
-        title=title,
-        content=content,
-    )
-    assert_hex_equal(res["message_hash"], ref["message_hash"])
+# Note: the static LXMF pack/unpack/hash tests were deleted — they
+# hand-rolled the msgpack message layout + SHA-256 hash composition. The
+# end-to-end LXMF wire format and signature semantics are exercised
+# honestly by the live delivery tests in tests/lxmf/ (test_direct.py,
+# test_opportunistic.py, test_propagation.py), which drive real
+# LXMF.LXMessage through real LXMF routers.
 
 
 @conformance_case(

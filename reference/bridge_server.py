@@ -348,31 +348,19 @@ def cmd_aes_decrypt(params):
 
 
 def cmd_token_encrypt(params):
-    """Encrypt using Token (modified Fernet)."""
+    """Encrypt plaintext into an RNS Token (Fernet-like: AES-256-CBC + HMAC).
+
+    Delegates to real RNS Token.encrypt. RNS generates the AES IV internally
+    and fresh per call, so this is non-deterministic by construction — two
+    calls with identical key+plaintext return different tokens. Tests must
+    round-trip through token_decrypt, not byte-compare. (The old IV-injection
+    branch hand-assembled iv+ciphertext+hmac to fake a deterministic token;
+    there is no honest way to inject the IV into real Token.encrypt.)
+    """
     key = hex_to_bytes(params['key'])
     plaintext = hex_to_bytes(params['plaintext'])
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
     token_obj = Token.Token(key)
-
-    if iv:
-        # For reproducibility, we need to manually construct the token
-        # This matches the encrypt() method but with fixed IV
-        mode = token_obj.mode
-        ciphertext = mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    return {
-        'token': bytes_to_hex(token_bytes)
-    }
+    return {'token': bytes_to_hex(token_obj.encrypt(plaintext))}
 
 
 def cmd_token_decrypt(params):
@@ -402,224 +390,120 @@ def cmd_token_verify_hmac(params):
 
 
 def cmd_identity_from_private_key(params):
-    """Create identity from 64-byte private key (X25519 + Ed25519)."""
+    """Derive public key + hash from a 64-byte Identity private key.
+
+    Delegates to real RNS.Identity.from_bytes — no hand-rolled key split or
+    hash composition. RNS.Identity splits the 64-byte key into its X25519(32)
+    + Ed25519(32) halves, derives both public keys, and computes
+    hash = truncated_hash(public_key) itself.
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
-
-    # Split private key: X25519 (32) + Ed25519 (32)
-    x25519_prv_bytes = private_key[:32]
-    ed25519_prv_bytes = private_key[32:]
-
-    # Derive public keys
-    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
-    x25519_pub = x25519_prv.public_key()
-    x25519_pub_bytes = x25519_pub.public_bytes()
-
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_sk = SigningKey(ed25519_prv_bytes)
-    ed25519_pub_bytes = ed25519_sk.vk_s
-
-    # Full public key
-    public_key = x25519_pub_bytes + ed25519_pub_bytes
-
-    # Identity hash = truncated_hash(public_key)
-    identity_hash = hashlib.sha256(public_key).digest()[:16]
-
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
     return {
-        'public_key': bytes_to_hex(public_key),
-        'hash': bytes_to_hex(identity_hash),
-        'hexhash': identity_hash.hex()
+        'public_key': bytes_to_hex(identity.get_public_key()),
+        'hash': bytes_to_hex(identity.hash),
+        'hexhash': identity.hexhash,
     }
 
 
 def cmd_identity_encrypt(params):
-    """Encrypt plaintext for an identity using ephemeral ECDH."""
+    """Encrypt plaintext for an Identity's public key.
+
+    Delegates to real RNS.Identity.encrypt. RNS generates the ephemeral
+    X25519 key and the AES IV internally and fresh per call — there is no
+    honest way to inject them, so this command is non-deterministic by
+    construction (two calls with identical input return different
+    ciphertext). Tests must round-trip through identity_decrypt.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
     plaintext = hex_to_bytes(params['plaintext'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Extract X25519 public key (first 32 bytes)
-    x25519_pub_bytes = public_key[:32]
-    x25519_pub = X25519.X25519PublicKey.from_public_bytes(x25519_pub_bytes)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(x25519_pub)
-
-    # Identity hash for salt
-    identity_hash = hashlib.sha256(public_key).digest()[:16]
-
-    # HKDF key derivation
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key),
-        'identity_hash': bytes_to_hex(identity_hash)
-    }
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'ciphertext': bytes_to_hex(identity.encrypt(plaintext))}
 
 
 def cmd_identity_decrypt(params):
-    """Decrypt ciphertext encrypted for an identity."""
+    """Decrypt a ciphertext token with an Identity's 64-byte private key.
+
+    Delegates to real RNS.Identity.decrypt. Returns plaintext=None if the
+    token does not authenticate (RNS.Identity.decrypt returns None).
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
     ciphertext = hex_to_bytes(params['ciphertext'])
-
-    # Split private key: X25519 (32) + Ed25519 (32)
-    x25519_prv_bytes = private_key[:32]
-    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
-
-    # Derive public key for identity hash
-    x25519_pub_bytes = x25519_prv.public_key().public_bytes()
-
-    # Get Ed25519 public key too for full identity hash
-    ed25519_prv_bytes = private_key[32:]
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_sk = SigningKey(ed25519_prv_bytes)
-    ed25519_pub_bytes = ed25519_sk.vk_s
-
-    full_public_key = x25519_pub_bytes + ed25519_pub_bytes
-    identity_hash = hashlib.sha256(full_public_key).digest()[:16]
-
-    # Extract ephemeral public key and token
-    peer_pub_bytes = ciphertext[:32]
-    token_bytes = ciphertext[32:]
-
-    peer_pub = X25519.X25519PublicKey.from_public_bytes(peer_pub_bytes)
-
-    # ECDH exchange
-    shared_key = x25519_prv.exchange(peer_pub)
-
-    # HKDF key derivation
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    token_obj = Token.Token(derived_key)
-    plaintext = token_obj.decrypt(token_bytes)
-
-    return {
-        'plaintext': bytes_to_hex(plaintext),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    plaintext = identity.decrypt(ciphertext)
+    return {'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None}
 
 
 def cmd_identity_sign(params):
-    """Sign a message with an identity's Ed25519 key."""
+    """Sign a message with an Identity's 64-byte private key.
+
+    Delegates to real RNS.Identity.sign (Ed25519, deterministic).
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
     message = hex_to_bytes(params['message'])
-
-    # Ed25519 private key is second 32 bytes
-    ed25519_prv_bytes = private_key[32:]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv_bytes)
-    signature = sk.sign(message)
-
-    return {
-        'signature': bytes_to_hex(signature)
-    }
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    return {'signature': bytes_to_hex(identity.sign(message))}
 
 
 def cmd_identity_verify(params):
-    """Verify a signature with an identity's public key."""
+    """Verify an Ed25519 signature against an Identity's public key.
+
+    Delegates to real RNS.Identity.validate.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
     message = hex_to_bytes(params['message'])
     signature = hex_to_bytes(params['signature'])
-
-    # Ed25519 public key is second 32 bytes
-    ed25519_pub_bytes = public_key[32:]
-
-    from pure25519.ed25519_oop import VerifyingKey
-    try:
-        vk = VerifyingKey(ed25519_pub_bytes)
-        vk.verify(signature, message)
-        return {'valid': True}
-    except Exception:
-        return {'valid': False}
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'valid': bool(identity.validate(signature, message))}
 
 
 def cmd_identity_hash(params):
-    """Compute identity hash from public key."""
+    """Compute the Identity hash of a 64-byte public key.
+
+    Delegates to real RNS.Identity — the hash is truncated_hash(public_key),
+    computed by RNS.Identity.update_hashes when the public key is loaded.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
-
-    # Identity hash is truncated_hash(public_key) = SHA256[0:16]
-    full_hash = hashlib.sha256(public_key).digest()
-    truncated = full_hash[:16]
-
-    return {
-        'hash': bytes_to_hex(truncated),
-        'full_hash': bytes_to_hex(full_hash)
-    }
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'hash': bytes_to_hex(identity.hash)}
 
 
 def cmd_destination_hash(params):
-    """Compute destination hash."""
+    """Compute the 16-byte destination address for an identity + app_name +
+    aspects.
+
+    Delegates to real RNS.Destination.hash, which accepts the 16-byte
+    identity hash directly. No hand-rolled name expansion or hash
+    composition — RNS.Destination.hash does the expand_name -> name_hash ->
+    truncated_hash(name_hash + identity_hash) chain itself.
+    """
+    RNS = _get_full_rns()
     identity_hash = hex_to_bytes(params['identity_hash'])
     app_name = params['app_name']
     aspects_param = params.get('aspects', '')
-
-    # Parse aspects - can be comma-separated string or already a list
     if isinstance(aspects_param, list):
         aspects = aspects_param
     elif aspects_param:
         aspects = aspects_param.split(',')
     else:
         aspects = []
-
-    # Build full name
-    name_parts = [app_name] + aspects
-    full_name = ".".join(name_parts)
-
-    # Name hash = SHA256(name.encode())[0:10]
-    name_hash = hashlib.sha256(full_name.encode('utf-8')).digest()[:10]
-
-    # Destination hash = SHA256(name_hash + identity_hash)[0:16]
-    addr_hash_material = name_hash + identity_hash
-    dest_hash = hashlib.sha256(addr_hash_material).digest()[:16]
-
-    return {
-        'name_hash': bytes_to_hex(name_hash),
-        'destination_hash': bytes_to_hex(dest_hash),
-        'full_name': full_name
-    }
+    dest_hash = RNS.Destination.hash(identity_hash, app_name, *aspects)
+    return {'destination_hash': bytes_to_hex(dest_hash)}
 
 
 def cmd_truncated_hash(params):
@@ -635,1954 +519,344 @@ def cmd_truncated_hash(params):
 
 
 def cmd_name_hash(params):
-    """Compute name hash (first 10 bytes of SHA256)."""
+    """Compute the RNS name hash of a (dotted) destination name.
+
+    Delegates to real RNS.Identity.full_hash and the real
+    RNS.Identity.NAME_HASH_LENGTH constant — the name hash is
+    full_hash(name)[:NAME_HASH_LENGTH//8], exactly as RNS.Destination.hash
+    computes it internally. Nothing about the length is hardcoded here.
+    """
+    RNS = _get_full_rns()
     name = params['name']
-    full_hash = hashlib.sha256(name.encode('utf-8')).digest()
-    name_hash = full_hash[:10]
-
-    return {
-        'hash': bytes_to_hex(name_hash)
-    }
+    name_hash = RNS.Identity.full_hash(name.encode('utf-8'))[
+        : RNS.Identity.NAME_HASH_LENGTH // 8
+    ]
+    return {'hash': bytes_to_hex(name_hash)}
 
 
-def cmd_packet_flags(params):
-    """Compute packet flags byte from components."""
-    header_type = int(params['header_type'])
-    context_flag = int(params['context_flag'])
-    transport_type = int(params['transport_type'])
-    destination_type = int(params['destination_type'])
-    packet_type = int(params['packet_type'])
+def cmd_packet_build(params):
+    """Build a real RNS.Packet on a real Destination, pack it, and report
+    the wire bytes plus the fields RNS itself parsed back out.
 
-    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+    Honest replacement for the synthetic packet_pack / packet_flags commands,
+    which hand-assembled the header and bit-packed the flags byte. RNS only
+    produces a packet's wire format through Packet.pack() against a real
+    Destination — there is no "format these arbitrary header fields" entry
+    point. dest_type selects the destination kind (which sets the
+    destination_type flag bits and decides whether the payload is encrypted:
+    PLAIN carries the payload in the clear so the wire bytes round-trip
+    exactly, SINGLE encrypts non-announce data so only the header bytes do).
 
-    return {
-        'flags': flags,
-        'flags_hex': f'{flags:02x}'
-    }
-
-
-def cmd_packet_parse_flags(params):
-    """Parse packet flags byte into components."""
-    flags = int(params['flags'])
-
-    header_type = (flags & 0b01000000) >> 6
-    context_flag = (flags & 0b00100000) >> 5
-    transport_type = (flags & 0b00010000) >> 4
-    destination_type = (flags & 0b00001100) >> 2
-    packet_type = (flags & 0b00000011)
-
-    return {
-        'header_type': header_type,
-        'context_flag': context_flag,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type
-    }
-
-
-def cmd_packet_pack(params):
-    """Pack a packet into raw bytes."""
-    import struct
-
-    header_type = int(params['header_type'])
-    context_flag = int(params['context_flag'])
-    transport_type = int(params['transport_type'])
-    destination_type = int(params['destination_type'])
-    packet_type = int(params['packet_type'])
-    hops = int(params.get('hops', 0))
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    transport_id = hex_to_bytes(params['transport_id']) if params.get('transport_id') else None
+    HEADER_2 (transport-relayed) DATA packets are not buildable here — RNS
+    only produces them inside Transport while relaying, so their wire format
+    is covered by the live multi-hop tests in
+    tests/wire/test_link_multihop.py, not synthetically.
+    """
+    RNS = _get_full_rns()
+    dest_type = params.get('dest_type', 'plain')
+    packet_type = int(params.get('packet_type', RNS.Packet.DATA))
     context = int(params.get('context', 0))
-    data = hex_to_bytes(params['data'])
+    context_flag = int(params.get('context_flag', 0))
+    transport_type = int(params.get('transport_type', RNS.Transport.BROADCAST))
+    hops = int(params.get('hops', 0))
+    data = hex_to_bytes(params.get('data', ''))
 
-    # Compute flags
-    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+    if dest_type == 'plain':
+        destination = RNS.Destination(
+            None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+            "conformance", "packet",
+        )
+    elif dest_type == 'single':
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "conformance", "packet",
+        )
+    else:
+        raise ValueError(
+            f"unsupported dest_type: {dest_type!r} (use 'plain' or 'single')"
+        )
 
-    # Build header
-    header = struct.pack("!B", flags) + struct.pack("!B", hops)
+    packet = RNS.Packet(
+        destination, data,
+        packet_type=packet_type,
+        context=context,
+        transport_type=transport_type,
+        header_type=RNS.Packet.HEADER_1,
+        context_flag=context_flag,
+        create_receipt=False,
+    )
+    packet.hops = hops
+    packet.pack()
+    raw = packet.raw
 
-    if header_type == 1:  # HEADER_2
-        if transport_id is None:
-            raise ValueError("HEADER_2 requires transport_id")
-        header += transport_id + destination_hash
-    else:  # HEADER_1
-        header += destination_hash
-
-    header += bytes([context])
-
-    raw = header + data
-
+    # Read the fields back the way any receiver does — via a real unpack.
+    parsed = RNS.Packet(None, None)
+    parsed.raw = raw
+    parsed.unpack()
     return {
         'raw': bytes_to_hex(raw),
-        'header': bytes_to_hex(header),
-        'size': len(raw)
+        'flags': raw[0],
+        'hops': parsed.hops,
+        'header_type': parsed.header_type,
+        'context_flag': parsed.context_flag,
+        'transport_type': parsed.transport_type,
+        'destination_type': parsed.destination_type,
+        'packet_type': parsed.packet_type,
+        'destination_hash': bytes_to_hex(parsed.destination_hash),
+        'context': parsed.context,
+        'data': bytes_to_hex(parsed.data),
+        'hash': bytes_to_hex(parsed.get_hash()),
     }
 
 
 def cmd_packet_unpack(params):
-    """Unpack raw packet bytes into components."""
+    """Unpack raw packet bytes into their wire-format fields.
+
+    Delegates to real RNS.Packet.unpack — exactly the parse a receiver runs.
+    Returns every field RNS populated on the packet, plus the raw flags byte
+    and the packet hash.
+    """
+    RNS = _get_full_rns()
     raw = hex_to_bytes(params['raw'])
-
-    flags = raw[0]
-    hops = raw[1]
-
-    header_type = (flags & 0b01000000) >> 6
-    context_flag = (flags & 0b00100000) >> 5
-    transport_type = (flags & 0b00010000) >> 4
-    destination_type = (flags & 0b00001100) >> 2
-    packet_type = (flags & 0b00000011)
-
-    DST_LEN = 16  # TRUNCATED_HASHLENGTH // 8
-
-    if header_type == 1:  # HEADER_2
-        transport_id = raw[2:2+DST_LEN]
-        destination_hash = raw[2+DST_LEN:2+2*DST_LEN]
-        context = raw[2+2*DST_LEN]
-        data = raw[3+2*DST_LEN:]
-    else:  # HEADER_1
-        transport_id = None
-        destination_hash = raw[2:2+DST_LEN]
-        context = raw[2+DST_LEN]
-        data = raw[3+DST_LEN:]
-
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        return {'unpacked': False}
     return {
-        'flags': flags,
-        'hops': hops,
-        'header_type': header_type,
-        'context_flag': context_flag,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type,
-        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
-        'destination_hash': bytes_to_hex(destination_hash),
-        'context': context,
-        'data': bytes_to_hex(data)
+        'unpacked': True,
+        'flags': raw[0],
+        'hops': packet.hops,
+        'header_type': packet.header_type,
+        'context_flag': packet.context_flag,
+        'transport_type': packet.transport_type,
+        'destination_type': packet.destination_type,
+        'packet_type': packet.packet_type,
+        'destination_hash': bytes_to_hex(packet.destination_hash),
+        'transport_id': (
+            bytes_to_hex(packet.transport_id)
+            if packet.transport_id is not None else None
+        ),
+        'context': packet.context,
+        'data': bytes_to_hex(packet.data),
+        'hash': bytes_to_hex(packet.get_hash()),
     }
 
 
 def cmd_packet_hash(params):
-    """Compute packet hash from raw bytes."""
+    """Compute the hash of a raw packet.
+
+    Delegates to real RNS.Packet — unpack the raw bytes, then read get_hash(),
+    which RNS itself uses to populate the dedup hashlist. The hashable part
+    deliberately excludes the hops byte and HEADER_2 transport_id so the
+    hash stays stable as the packet propagates through transports.
+    """
+    RNS = _get_full_rns()
     raw = hex_to_bytes(params['raw'])
-
-    flags = raw[0]
-    header_type = (flags & 0b01000000) >> 6
-
-    DST_LEN = 16
-
-    # Mask flags to only keep lower 4 bits
-    masked_flags = bytes([flags & 0b00001111])
-
-    if header_type == 1:  # HEADER_2
-        # Skip transport_id (16 bytes after hops)
-        hashable_part = masked_flags + raw[2+DST_LEN:]
-    else:  # HEADER_1
-        hashable_part = masked_flags + raw[2:]
-
-    full_hash = hashlib.sha256(hashable_part).digest()
-    truncated = full_hash[:16]
-
-    return {
-        'hash': bytes_to_hex(full_hash),
-        'truncated_hash': bytes_to_hex(truncated),
-        'hashable_part': bytes_to_hex(hashable_part)
-    }
-
-
-# HDLC framing constants and functions
-HDLC_FLAG = 0x7E
-HDLC_ESC = 0x7D
-HDLC_ESC_MASK = 0x20
-
-
-def cmd_hdlc_escape(params):
-    """Escape data for HDLC framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
-    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
-
-    return {
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-def cmd_hdlc_frame(params):
-    """Frame data with HDLC framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
-    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
-
-    framed = bytes([HDLC_FLAG]) + escaped + bytes([HDLC_FLAG])
-
-    return {
-        'framed': bytes_to_hex(framed),
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-# KISS framing constants and functions
-KISS_FEND = 0xC0
-KISS_FESC = 0xDB
-KISS_TFEND = 0xDC
-KISS_TFESC = 0xDD
-KISS_CMD_DATA = 0x00
-
-
-def cmd_kiss_escape(params):
-    """Escape data for KISS framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
-    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
-
-    return {
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-def cmd_kiss_frame(params):
-    """Frame data with KISS framing."""
-    data = hex_to_bytes(params['data'])
-    command = int(params.get('command', KISS_CMD_DATA))
-
-    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
-    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
-
-    framed = bytes([KISS_FEND, command]) + escaped + bytes([KISS_FEND])
-
-    return {
-        'framed': bytes_to_hex(framed),
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-# Link operations
-
-def cmd_link_id_from_packet(params):
-    """Compute link ID from link request packet data.
-
-    Link ID = truncated_hash(hashable_part of packet)
-    where hashable_part excludes transport_id and masks flags.
-    For link requests, we also exclude MTU signalling bytes if present.
-    """
-    raw = hex_to_bytes(params['raw'])
-
-    flags = raw[0]
-    header_type = (flags & 0b01000000) >> 6
-
-    DST_LEN = 16
-    ECPUBSIZE = 64  # X25519 (32) + Ed25519 (32) public keys
-
-    # Mask flags to only keep lower 4 bits
-    masked_flags = bytes([flags & 0b00001111])
-
-    if header_type == 1:  # HEADER_2
-        hashable_part = masked_flags + raw[2+DST_LEN:]
-    else:  # HEADER_1
-        hashable_part = masked_flags + raw[2:]
-
-    # For link requests, if data is longer than ECPUBSIZE,
-    # exclude the extra bytes (MTU signalling) from hash
-    # Parse to find data portion
-    if header_type == 1:
-        header_len = 2 + DST_LEN + DST_LEN + 1  # flags + hops + transport_id + dest + context
-    else:
-        header_len = 2 + DST_LEN + 1  # flags + hops + dest + context
-
-    data_start = header_len
-    data = raw[data_start:]
-
-    if len(data) > ECPUBSIZE:
-        diff = len(data) - ECPUBSIZE
-        hashable_part = hashable_part[:-diff]
-
-    full_hash = hashlib.sha256(hashable_part).digest()
-    link_id = full_hash[:16]
-
-    return {
-        'link_id': bytes_to_hex(link_id),
-        'hashable_part': bytes_to_hex(hashable_part)
-    }
-
-
-def cmd_link_derive_key(params):
-    """Derive link encryption keys using HKDF.
-
-    For AES-256-CBC mode, derives 64 bytes:
-    - First 32 bytes: encryption key
-    - Last 32 bytes: signing key
-
-    Note: Link.get_context() returns None in Python RNS, so context is None.
-    """
-    shared_key = hex_to_bytes(params['shared_key'])
-    link_id = hex_to_bytes(params['link_id'])
-    mode = params.get('mode', 'AES_256_CBC')
-
-    # Salt is the link ID (from Link.get_salt())
-    salt = link_id
-
-    # Context is None (from Link.get_context())
-    context = None
-
-    # Derived key length depends on mode
-    if mode == 'AES_256_CBC':
-        length = 64
-    else:
-        length = 32
-
-    derived = HKDF.hkdf(
-        length=length,
-        derive_from=shared_key,
-        salt=salt,
-        context=context
-    )
-
-    return {
-        'derived_key': bytes_to_hex(derived),
-        'encryption_key': bytes_to_hex(derived[:32]) if length >= 64 else bytes_to_hex(derived[:16]),
-        'signing_key': bytes_to_hex(derived[32:]) if length >= 64 else bytes_to_hex(derived[16:])
-    }
-
-
-def cmd_link_encrypt(params):
-    """Encrypt data for transmission over a link using Token encryption."""
-    derived_key = hex_to_bytes(params['derived_key'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    return {
-        'ciphertext': bytes_to_hex(token_bytes)
-    }
-
-
-def cmd_link_decrypt(params):
-    """Decrypt data received over a link."""
-    derived_key = hex_to_bytes(params['derived_key'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-
-    token_obj = Token.Token(derived_key)
-    plaintext = token_obj.decrypt(ciphertext)
-
-    return {
-        'plaintext': bytes_to_hex(plaintext)
-    }
-
-
-def cmd_link_prove(params):
-    """Generate link proof signature.
-
-    The proof signs: link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-    """
-    identity_private = hex_to_bytes(params['identity_private'])  # 64 bytes: X25519 + Ed25519
-    link_id = hex_to_bytes(params['link_id'])
-    receiver_pub = hex_to_bytes(params['receiver_pub'])  # X25519 public
-    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])  # Ed25519 public
-    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
-
-    # Build signed data
-    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-
-    # Sign with Ed25519 private key (second 32 bytes of identity)
-    ed25519_prv = identity_private[32:64]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv)
-    signature = sk.sign(signed_data)
-
-    return {
-        'signature': bytes_to_hex(signature),
-        'signed_data': bytes_to_hex(signed_data)
-    }
-
-
-def cmd_link_verify_proof(params):
-    """Verify link proof signature."""
-    identity_public = hex_to_bytes(params['identity_public'])  # 64 bytes: X25519 + Ed25519
-    link_id = hex_to_bytes(params['link_id'])
-    receiver_pub = hex_to_bytes(params['receiver_pub'])
-    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])
-    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
-    signature = hex_to_bytes(params['signature'])
-
-    # Build signed data
-    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-
-    # Verify with Ed25519 public key (second 32 bytes of identity)
-    ed25519_pub = identity_public[32:64]
-
-    from pure25519.ed25519_oop import VerifyingKey
-    try:
-        vk = VerifyingKey(ed25519_pub)
-        vk.verify(signature, signed_data)
-        return {'valid': True}
-    except Exception:
-        return {'valid': False}
-
-
-def cmd_link_signalling_bytes(params):
-    """Encode MTU and mode into signalling bytes.
-
-    Format: 3 bytes
-    - Bits 21-23: mode (3 bits)
-    - Bits 0-20: MTU (21 bits)
-    """
-    mtu = int(params['mtu'])
-    mode = int(params.get('mode', 1))  # Default: AES_256_CBC = 0x01
-
-    MTU_BYTEMASK = 0x1FFFFF  # 21 bits
-    MODE_BYTEMASK = 0xE0  # Top 3 bits of first byte
-
-    value = (mtu & MTU_BYTEMASK) + (((mode << 5) & MODE_BYTEMASK) << 16)
-
-    signalling = bytes([
-        (value >> 16) & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF
-    ])
-
-    return {
-        'signalling_bytes': bytes_to_hex(signalling),
-        'decoded_mtu': mtu & MTU_BYTEMASK,
-        'decoded_mode': mode
-    }
-
-
-def cmd_link_parse_signalling(params):
-    """Parse signalling bytes into MTU and mode."""
-    signalling = hex_to_bytes(params['signalling_bytes'])
-
-    if len(signalling) != 3:
-        raise ValueError(f"Signalling bytes must be 3 bytes, got {len(signalling)}")
-
-    MTU_BYTEMASK = 0x1FFFFF
-    MODE_BYTEMASK = 0xE0
-
-    value = (signalling[0] << 16) | (signalling[1] << 8) | signalling[2]
-    mtu = value & MTU_BYTEMASK
-    mode = (signalling[0] & MODE_BYTEMASK) >> 5
-
-    return {
-        'mtu': mtu,
-        'mode': mode
-    }
-
-
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        raise ValueError("malformed packet — RNS.Packet.unpack rejected it")
+    return {'hash': bytes_to_hex(packet.get_hash())}
 # Announce operations
 
-def cmd_random_hash(params):
-    """Generate random_hash (5 random bytes + 5 timestamp bytes).
+def cmd_announce_build(params):
+    """Build a real RNS announce packet without putting it on the wire.
 
-    Format matches Python RNS:
-    random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
+    Delegates to real RNS.Destination.announce(send=False), which returns the
+    fully-constructed announce Packet (signed by the destination's Identity,
+    with ratchet embedded if Destination.ratchets is non-empty, with
+    context_flag bookkeeping). Packs it and returns the wire bytes plus the
+    parsed announce_data fields a receiver would extract. Requires a running
+    Reticulum instance to register an IN destination — the bridge spins up a
+    minimal no-interface one lazily.
+
+    The previous synthetic announce_pack / announce_sign / announce_unpack
+    hand-rolled the field concatenation, the signed-data layout, and the
+    Ed25519 signing on top of pure25519. Their output happened to match RNS
+    so the suite stayed green, but any drift in the announce signed-data
+    layout (e.g. RNS reordering fields, changing what app_data scope is
+    signed) would be invisible because the bridge mirrored its own copy.
     """
-    import time
-    timestamp = params.get('timestamp')
-    random_bytes = hex_to_bytes(params['random_bytes']) if params.get('random_bytes') else None
-
-    # Generate random bytes if not provided
-    if random_bytes is None:
-        random_bytes = os.urandom(5)
-    elif len(random_bytes) != 5:
-        raise ValueError(f"random_bytes must be 5 bytes, got {len(random_bytes)}")
-
-    # Use provided timestamp or current time
-    if timestamp is not None:
-        timestamp = int(timestamp)
-    else:
-        timestamp = int(time.time())
-
-    # Combine: 5 random bytes + 5 timestamp bytes (big-endian)
-    random_hash = random_bytes + timestamp.to_bytes(5, "big")
-
-    return {
-        'random_hash': bytes_to_hex(random_hash),
-        'random_bytes': bytes_to_hex(random_bytes),
-        'timestamp': timestamp,
-        'timestamp_bytes': bytes_to_hex(timestamp.to_bytes(5, "big"))
-    }
-
-
-def cmd_announce_pack(params):
-    """Pack announce payload.
-
-    Without ratchet (148 bytes min):
-      public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data (var)
-
-    With ratchet (180 bytes min):
-      public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data (var)
-    """
-    public_key = hex_to_bytes(params['public_key'])
-    name_hash = hex_to_bytes(params['name_hash'])
-    random_hash = hex_to_bytes(params['random_hash'])
-    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
-    signature = hex_to_bytes(params['signature'])
-    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
-
-    # Validate sizes
-    if len(public_key) != 64:
-        raise ValueError(f"public_key must be 64 bytes, got {len(public_key)}")
-    if len(name_hash) != 10:
-        raise ValueError(f"name_hash must be 10 bytes, got {len(name_hash)}")
-    if len(random_hash) != 10:
-        raise ValueError(f"random_hash must be 10 bytes, got {len(random_hash)}")
-    if ratchet and len(ratchet) != 32:
-        raise ValueError(f"ratchet must be 32 bytes, got {len(ratchet)}")
-    if len(signature) != 64:
-        raise ValueError(f"signature must be 64 bytes, got {len(signature)}")
-
-    # Pack announce data
-    announce_data = public_key + name_hash + random_hash + ratchet + signature + app_data
-
-    return {
-        'announce_data': bytes_to_hex(announce_data),
-        'size': len(announce_data),
-        'has_ratchet': len(ratchet) > 0
-    }
-
-
-def cmd_announce_unpack(params):
-    """Unpack announce payload.
-
-    Returns all components of the announce.
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-    has_ratchet = params.get('has_ratchet', False)
-
-    # Constants
-    KEYSIZE = 64
-    NAME_HASH_LEN = 10
-    RANDOM_HASH_LEN = 10
-    RATCHET_SIZE = 32
-    SIG_LEN = 64
-
-    # Unpack based on whether ratchet is present
-    if has_ratchet:
-        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + RATCHET_SIZE + SIG_LEN:
-            raise ValueError(f"announce_data too short for ratchet announce: {len(announce_data)} bytes")
-
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
-    else:
-        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + SIG_LEN:
-            raise ValueError(f"announce_data too short for non-ratchet announce: {len(announce_data)} bytes")
-
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = b""
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
-
-    return {
-        'public_key': bytes_to_hex(public_key),
-        'name_hash': bytes_to_hex(name_hash),
-        'random_hash': bytes_to_hex(random_hash),
-        'ratchet': bytes_to_hex(ratchet) if ratchet else '',
-        'signature': bytes_to_hex(signature),
-        'app_data': bytes_to_hex(app_data) if app_data else '',
-        'has_ratchet': len(ratchet) > 0
-    }
-
-
-def cmd_announce_sign(params):
-    """Sign announce data.
-
-    Signed data format:
-      destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-    """
+    RNS = _ensure_minimal_rns()
     private_key = hex_to_bytes(params['private_key'])
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    public_key = hex_to_bytes(params['public_key'])
-    name_hash = hex_to_bytes(params['name_hash'])
-    random_hash = hex_to_bytes(params['random_hash'])
-    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
-    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
-
-    # Build signed data (matches Python RNS Destination.announce())
-    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-
-    # Sign with Ed25519 private key (second 32 bytes)
-    ed25519_prv = private_key[32:64]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv)
-    signature = sk.sign(signed_data)
-
-    return {
-        'signature': bytes_to_hex(signature),
-        'signed_data': bytes_to_hex(signed_data)
-    }
-
-
-def cmd_announce_verify(params):
-    """Verify announce signature.
-
-    Validates signature and optionally validates destination hash.
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    has_ratchet = params.get('has_ratchet', False)
-    validate_dest_hash = params.get('validate_dest_hash', True)
-
-    # Constants
-    KEYSIZE = 64
-    NAME_HASH_LEN = 10
-    RANDOM_HASH_LEN = 10
-    RATCHET_SIZE = 32
-    SIG_LEN = 64
-
-    # Unpack announce data
-    if has_ratchet:
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
+    app_name = params['app_name']
+    aspects_param = params.get('aspects', [])
+    if isinstance(aspects_param, list):
+        aspects = aspects_param
+    elif aspects_param:
+        aspects = aspects_param.split(',')
     else:
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        aspects = []
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else None
+    enable_ratchets = bool(params.get('enable_ratchets', False))
+
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    destination = RNS.Destination(
+        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
+    )
+    if enable_ratchets:
+        # RNS controls the ratchet lifecycle via Destination.enable_ratchets
+        # against a state file; on enable() + the first rotate_ratchets()
+        # inside announce() it generates a fresh ratchet and writes it. We
+        # use a fresh path (no file yet — _reload_ratchets initialises a new
+        # one) to honour that contract; the bridge does not inject a
+        # specific ratchet, tests must read what RNS produced.
+        import tempfile
+        ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
+        destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
+
+    packet = destination.announce(app_data=app_data, send=False)
+    packet.pack()
+    raw = packet.raw
+
+    # Parse what RNS just produced — the field layout RNS itself wrote.
+    keysize = RNS.Identity.KEYSIZE // 8
+    name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+    ratchet_size = RNS.Identity.RATCHETSIZE // 8
+    sig_len = RNS.Identity.SIGLENGTH // 8
+    has_ratchet = packet.context_flag == RNS.Packet.FLAG_SET
+    data = packet.data
+    pubkey = data[:keysize]
+    name_hash = data[keysize:keysize + name_hash_len]
+    # The random_hash slice is 10 bytes — Destination.announce produces it as
+    # 5 bytes of random + 5 bytes big-endian timestamp; the slice length is
+    # the part of the wire format that is not yet a named RNS constant.
+    random_hash_len = 10
+    random_hash_off = keysize + name_hash_len
+    random_hash = data[random_hash_off:random_hash_off + random_hash_len]
+    cursor = random_hash_off + random_hash_len
+    if has_ratchet:
+        ratchet = data[cursor:cursor + ratchet_size]
+        cursor += ratchet_size
+    else:
         ratchet = b""
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
-
-    # Build signed data
-    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-
-    # Verify signature
-    ed25519_pub = public_key[32:64]
-
-    from pure25519.ed25519_oop import VerifyingKey
-    try:
-        vk = VerifyingKey(ed25519_pub)
-        vk.verify(signature, signed_data)
-        signature_valid = True
-    except Exception:
-        signature_valid = False
-
-    # Optionally validate destination hash
-    dest_hash_valid = True
-    expected_dest_hash = b""
-    if validate_dest_hash:
-        # Compute identity hash from public key
-        identity_hash = hashlib.sha256(public_key).digest()[:16]
-
-        # Compute expected destination hash
-        hash_material = name_hash + identity_hash
-        expected_dest_hash = hashlib.sha256(hash_material).digest()[:16]
-
-        dest_hash_valid = (destination_hash == expected_dest_hash)
+    signature = data[cursor:cursor + sig_len]
+    cursor += sig_len
+    app_data_out = data[cursor:]
 
     return {
-        'valid': signature_valid and dest_hash_valid,
-        'signature_valid': signature_valid,
-        'dest_hash_valid': dest_hash_valid,
-        'expected_dest_hash': bytes_to_hex(expected_dest_hash) if validate_dest_hash else ''
-    }
-
-
-# Ratchet operations
-
-def cmd_ratchet_id(params):
-    """Compute ratchet ID from ratchet public key.
-
-    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-
-    # Compute full hash
-    full_hash = hashlib.sha256(ratchet_public).digest()
-
-    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
-    ratchet_id = full_hash[:10]
-
-    return {
-        'ratchet_id': bytes_to_hex(ratchet_id),
-        'full_hash': bytes_to_hex(full_hash)
-    }
-
-
-def cmd_ratchet_public_from_private(params):
-    """Derive public key from ratchet private key."""
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-
-    # Create X25519 key pair from private key
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ratchet_pub = ratchet_prv.public_key()
-    ratchet_pub_bytes = ratchet_pub.public_bytes()
-
-    return {
-        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
-    }
-
-
-def cmd_ratchet_derive_key(params):
-    """Derive encryption key using ratchet.
-
-    This performs ECDH with ephemeral key and ratchet public key,
-    then derives a key using HKDF with identity hash as salt.
-    """
-    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Create keys
-    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    return {
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_encrypt(params):
-    """Encrypt plaintext using ratchet.
-
-    Same as identity_encrypt but uses ratchet public key instead of identity public key.
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Create ratchet public key
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange with ratchet
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_decrypt(params):
-    """Decrypt ciphertext using ratchet.
-
-    Tries to decrypt using provided ratchet private keys.
-    """
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Extract ephemeral public key (first 32 bytes)
-    if len(ciphertext) <= 32:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': 'Ciphertext too short'
-        }
-
-    ephemeral_pub_bytes = ciphertext[:32]
-    token_data = ciphertext[32:]
-
-    # Create keys
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
-
-    # ECDH exchange
-    shared_key = ratchet_prv.exchange(ephemeral_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    try:
-        token_obj = Token.Token(derived_key)
-        plaintext = token_obj.decrypt(token_data)
-
-        if plaintext is None:
-            return {
-                'success': False,
-                'plaintext': None,
-                'shared_key': bytes_to_hex(shared_key),
-                'derived_key': bytes_to_hex(derived_key)
-            }
-
-        return {
-            'success': True,
-            'plaintext': bytes_to_hex(plaintext),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-    except Exception as e:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': str(e),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-
-
-def cmd_ratchet_storage_format(params):
-    """Pack ratchet storage format using msgpack.
-
-    Format: {"ratchet": ratchet_bytes, "received": timestamp}
-    """
-    import time
-
-    ratchet = hex_to_bytes(params['ratchet'])
-    received = float(params.get('received', time.time()))
-
-    # Pack using msgpack
-    ratchet_data = {
-        "ratchet": ratchet,
-        "received": received
-    }
-
-    packed = umsgpack.packb(ratchet_data)
-
-    return {
-        'packed': bytes_to_hex(packed),
-        'ratchet': bytes_to_hex(ratchet),
-        'received': received
-    }
-
-
-def cmd_ratchet_extract_from_announce(params):
-    """Extract ratchet from announce data.
-
-    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-
-    # Parse announce structure
-    # public_key: 64 bytes
-    # name_hash: 10 bytes
-    # random_hash: 10 bytes
-    # ratchet: 32 bytes (or 0 if not present)
-    # signature: 64 bytes
-
-    if len(announce_data) < 64 + 10 + 10 + 64:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Announce too short'
-        }
-
-    offset = 0
-    public_key = announce_data[offset:offset+64]
-    offset += 64
-
-    name_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    random_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    # Check if there's space for ratchet + signature
-    remaining = len(announce_data) - offset
-
-    if remaining >= 32 + 64:
-        # Ratchet is present
-        ratchet = announce_data[offset:offset+32]
-        offset += 32
-        signature = announce_data[offset:offset+64]
-        offset += 64
-
-        # Check if ratchet is all zeros (no ratchet)
-        if ratchet == b'\x00' * 32:
-            has_ratchet = False
-            ratchet = None
-        else:
-            has_ratchet = True
-    elif remaining == 64:
-        # No ratchet, just signature
-        has_ratchet = False
-        ratchet = None
-        signature = announce_data[offset:offset+64]
-        offset += 64
-    else:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Invalid announce structure'
-        }
-
-    # Any remaining data is app_data
-    app_data = announce_data[offset:] if offset < len(announce_data) else b''
-
-    result = {
-        'has_ratchet': has_ratchet,
-        'public_key': bytes_to_hex(public_key),
+        'raw': bytes_to_hex(raw),
+        'destination_hash': bytes_to_hex(destination.hash),
+        'announce_data': bytes_to_hex(data),
+        'public_key': bytes_to_hex(pubkey),
         'name_hash': bytes_to_hex(name_hash),
         'random_hash': bytes_to_hex(random_hash),
-        'signature': bytes_to_hex(signature)
-    }
-
-    if has_ratchet:
-        result['ratchet'] = bytes_to_hex(ratchet)
-        # Compute ratchet ID
-        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
-        result['ratchet_id'] = bytes_to_hex(ratchet_id)
-    else:
-        result['ratchet'] = None
-
-    if app_data:
-        result['app_data'] = bytes_to_hex(app_data)
-
-    return result
-
-# Ratchet operations
-
-def cmd_ratchet_id(params):
-    """Compute ratchet ID from ratchet public key.
-
-    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-
-    # Compute full hash
-    full_hash = hashlib.sha256(ratchet_public).digest()
-
-    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
-    ratchet_id = full_hash[:10]
-
-    return {
-        'ratchet_id': bytes_to_hex(ratchet_id),
-        'full_hash': bytes_to_hex(full_hash)
-    }
-
-
-def cmd_ratchet_public_from_private(params):
-    """Derive public key from ratchet private key."""
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-
-    # Create X25519 key pair from private key
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ratchet_pub = ratchet_prv.public_key()
-    ratchet_pub_bytes = ratchet_pub.public_bytes()
-
-    return {
-        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
-    }
-
-
-def cmd_ratchet_derive_key(params):
-    """Derive encryption key using ratchet.
-
-    This performs ECDH with ephemeral key and ratchet public key,
-    then derives a key using HKDF with identity hash as salt.
-    """
-    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Create keys
-    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    return {
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_encrypt(params):
-    """Encrypt plaintext using ratchet.
-
-    Same as identity_encrypt but uses ratchet public key instead of identity public key.
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Create ratchet public key
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange with ratchet
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_decrypt(params):
-    """Decrypt ciphertext using ratchet.
-
-    Tries to decrypt using provided ratchet private keys.
-    """
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Extract ephemeral public key (first 32 bytes)
-    if len(ciphertext) <= 32:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': 'Ciphertext too short'
-        }
-
-    ephemeral_pub_bytes = ciphertext[:32]
-    token_data = ciphertext[32:]
-
-    # Create keys
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
-
-    # ECDH exchange
-    shared_key = ratchet_prv.exchange(ephemeral_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    try:
-        token_obj = Token.Token(derived_key)
-        plaintext = token_obj.decrypt(token_data)
-
-        if plaintext is None:
-            return {
-                'success': False,
-                'plaintext': None,
-                'shared_key': bytes_to_hex(shared_key),
-                'derived_key': bytes_to_hex(derived_key)
-            }
-
-        return {
-            'success': True,
-            'plaintext': bytes_to_hex(plaintext),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-    except Exception as e:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': str(e),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-
-
-def cmd_ratchet_storage_format(params):
-    """Pack ratchet storage format using msgpack.
-
-    Format: {"ratchet": ratchet_bytes, "received": timestamp}
-    """
-    import time
-
-    ratchet = hex_to_bytes(params['ratchet'])
-    received = float(params.get('received', time.time()))
-
-    # Pack using msgpack
-    ratchet_data = {
-        "ratchet": ratchet,
-        "received": received
-    }
-
-    packed = umsgpack.packb(ratchet_data)
-
-    return {
-        'packed': bytes_to_hex(packed),
-        'ratchet': bytes_to_hex(ratchet),
-        'received': received
-    }
-
-
-def cmd_ratchet_extract_from_announce(params):
-    """Extract ratchet from announce data.
-
-    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-
-    # Parse announce structure
-    # public_key: 64 bytes
-    # name_hash: 10 bytes
-    # random_hash: 10 bytes
-    # ratchet: 32 bytes (or 0 if not present)
-    # signature: 64 bytes
-
-    if len(announce_data) < 64 + 10 + 10 + 64:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Announce too short'
-        }
-
-    offset = 0
-    public_key = announce_data[offset:offset+64]
-    offset += 64
-
-    name_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    random_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    # Check if there's space for ratchet + signature
-    remaining = len(announce_data) - offset
-
-    if remaining >= 32 + 64:
-        # Ratchet is present
-        ratchet = announce_data[offset:offset+32]
-        offset += 32
-        signature = announce_data[offset:offset+64]
-        offset += 64
-
-        # Check if ratchet is all zeros (no ratchet)
-        if ratchet == b'\x00' * 32:
-            has_ratchet = False
-            ratchet = None
-        else:
-            has_ratchet = True
-    elif remaining == 64:
-        # No ratchet, just signature
-        has_ratchet = False
-        ratchet = None
-        signature = announce_data[offset:offset+64]
-        offset += 64
-    else:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Invalid announce structure'
-        }
-
-    # Any remaining data is app_data
-    app_data = announce_data[offset:] if offset < len(announce_data) else b''
-
-    result = {
+        'ratchet': bytes_to_hex(ratchet) if ratchet else "",
+        'signature': bytes_to_hex(signature),
+        'app_data': bytes_to_hex(app_data_out),
         'has_ratchet': has_ratchet,
-        'public_key': bytes_to_hex(public_key),
-        'name_hash': bytes_to_hex(name_hash),
-        'random_hash': bytes_to_hex(random_hash),
-        'signature': bytes_to_hex(signature)
     }
 
-    if has_ratchet:
-        result['ratchet'] = bytes_to_hex(ratchet)
-        # Compute ratchet ID
-        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
-        result['ratchet_id'] = bytes_to_hex(ratchet_id)
-    else:
-        result['ratchet'] = None
 
-    if app_data:
-        result['app_data'] = bytes_to_hex(app_data)
+def cmd_announce_validate(params):
+    """Validate a real RNS announce packet.
 
-    return result
+    Delegates to real RNS.Identity.validate_announce, which checks the
+    Ed25519 signature over (destination_hash + public_key + name_hash +
+    random_hash + ratchet + app_data) and confirms the destination_hash in
+    the header matches the one derived from the public_key + name_hash. The
+    previous hand-rolled announce_verify reimplemented both checks on top of
+    pure25519 + hashlib; if validate_announce's signed-data layout ever
+    drifted (e.g. app_data scope, ratchet inclusion under context_flag) the
+    bridge wouldn't follow.
 
-
-# Ratchet file format operations (Destination-level ratchet persistence)
-
-def cmd_ratchet_file_write(params):
-    """Write a ratchet file in Python's Destination._persist_ratchets format.
-
-    params:
-        path: str - file path to write
-        ratchet_keys: list of hex strings - ratchet private keys
-        signing_private_key: hex - Ed25519 private key (64 bytes) for signing
-    returns:
-        written: bool
-        path: str
-        ratchet_count: int
+    Returns the validation verdict plus the extracted ratchet (RNS's
+    validate_announce returns only True/False, so the ratchet — when
+    present — is read off packet.data at the offsets RNS itself parses to).
     """
-    path = params['path']
-    ratchet_keys = [hex_to_bytes(k) for k in params['ratchet_keys']]
-    signing_key_bytes = hex_to_bytes(params['signing_private_key'])
-
-    # Ed25519 private key is the second 32 bytes of the 64-byte identity key
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_seed = signing_key_bytes[32:]
-    sk = SigningKey(ed25519_seed)
-
-    # Pack ratchets list (inner packing)
-    packed_ratchets = umsgpack.packb(ratchet_keys)
-
-    # Sign the packed ratchets (matches Destination._persist_ratchets → Identity.sign)
-    signature = sk.sign(packed_ratchets)
-
-    # Wrap in outer msgpack dict
-    persisted_data = {
-        "signature": signature,
-        "ratchets": packed_ratchets
-    }
-
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-
-    # Write atomically via temp file
-    temp_path = path + ".tmp"
-    with open(temp_path, "wb") as f:
-        f.write(umsgpack.packb(persisted_data))
-    if os.path.isfile(path):
-        os.unlink(path)
-    os.rename(temp_path, path)
-
-    return {
-        'written': True,
-        'path': path,
-        'ratchet_count': len(ratchet_keys)
-    }
-
-
-def cmd_ratchet_file_read(params):
-    """Read and validate a ratchet file in Python's Destination._reload_ratchets format.
-
-    params:
-        path: str - file path to read
-        verify_public_key: hex - Ed25519 public key (32 bytes) for signature verification
-    returns:
-        valid: bool
-        ratchet_keys: list of hex strings
-        ratchet_count: int
-        signature_valid: bool
-    """
-    path = params['path']
-    verify_key_bytes = hex_to_bytes(params['verify_public_key'])
-
-    from pure25519.ed25519_oop import VerifyingKey
-
-    with open(path, "rb") as f:
-        file_data = f.read()
-
-    # Unpack outer msgpack dict
-    persisted_data = umsgpack.unpackb(file_data)
-
-    if "signature" not in persisted_data or "ratchets" not in persisted_data:
-        return {
-            'valid': False,
-            'ratchet_keys': [],
-            'ratchet_count': 0,
-            'signature_valid': False,
-            'error': 'Missing signature or ratchets key in file'
-        }
-
-    signature = persisted_data["signature"]
-    packed_ratchets = persisted_data["ratchets"]
-
-    # Verify signature (VerifyingKey.verify raises on invalid)
-    vk = VerifyingKey(verify_key_bytes)
-    try:
-        vk.verify(signature, packed_ratchets)
-        signature_valid = True
-    except Exception:
-        signature_valid = False
-
-    # Unpack inner ratchets list
-    ratchet_keys = umsgpack.unpackb(packed_ratchets)
-
-    return {
-        'valid': signature_valid,
-        'ratchet_keys': [bytes_to_hex(k) for k in ratchet_keys],
-        'ratchet_count': len(ratchet_keys),
-        'signature_valid': signature_valid
-    }
-
-
-# Channel operations
-
-def cmd_envelope_pack(params):
-    """Pack a channel envelope.
-
-    Format: [msgtype:2][sequence:2][length:2][data:N]
-    All fields are big-endian.
-    """
-    import struct
-
-    msgtype = int(params['msgtype'])
-    sequence = int(params['sequence'])
-    data = hex_to_bytes(params['data'])
-    length = len(data)
-
-    # Pack header: msgtype (2), sequence (2), length (2)
-    header = struct.pack(">HHH", msgtype, sequence, length)
-    envelope = header + data
-
-    return {
-        'envelope': bytes_to_hex(envelope),
-        'msgtype': msgtype,
-        'sequence': sequence,
-        'length': length
-    }
-
-
-def cmd_envelope_unpack(params):
-    """Unpack a channel envelope.
-
-    Extracts msgtype, sequence, length, and data from envelope bytes.
-    """
-    import struct
-
-    envelope = hex_to_bytes(params['envelope'])
-
-    if len(envelope) < 6:
-        raise ValueError(f"Envelope too short: {len(envelope)} bytes")
-
-    # Unpack header
-    msgtype, sequence, length = struct.unpack(">HHH", envelope[:6])
-    data = envelope[6:]
-
-    return {
-        'msgtype': msgtype,
-        'sequence': sequence,
-        'length': length,
-        'data': bytes_to_hex(data)
-    }
-
-
-def cmd_stream_msg_pack(params):
-    """Pack a StreamDataMessage.
-
-    Python format: [header:2][data:N]
-    Header bits:
-      Bit 15: EOF flag (0x8000)
-      Bit 14: compressed flag (0x4000)
-      Bits 13-0: stream_id (0-16383)
-    """
-    import struct
-
-    stream_id = int(params['stream_id'])
-    data = hex_to_bytes(params.get('data', ''))
-    eof = bool(params.get('eof', False))
-    compressed = bool(params.get('compressed', False))
-
-    # Validate stream_id
-    if stream_id < 0 or stream_id > 0x3FFF:  # 16383
-        raise ValueError(f"stream_id must be 0-16383, got {stream_id}")
-
-    # Build header value
-    header_val = (stream_id & 0x3FFF)
-    if eof:
-        header_val |= 0x8000
-    if compressed:
-        header_val |= 0x4000
-
-    # Pack as big-endian 2-byte header
-    header = struct.pack(">H", header_val)
-    message = header + data
-
-    return {
-        'message': bytes_to_hex(message),
-        'header_val': header_val,
-        'stream_id': stream_id,
-        'eof': eof,
-        'compressed': compressed
-    }
-
-
-def cmd_stream_msg_unpack(params):
-    """Unpack a StreamDataMessage.
-
-    Extracts stream_id, flags, and data from message bytes.
-    """
-    import struct
-
-    message = hex_to_bytes(params['message'])
-
-    if len(message) < 2:
-        raise ValueError(f"Message too short: {len(message)} bytes")
-
-    # Unpack header
-    header_val = struct.unpack(">H", message[:2])[0]
-
-    # Extract fields
-    stream_id = header_val & 0x3FFF
-    eof = (header_val & 0x8000) != 0
-    compressed = (header_val & 0x4000) != 0
-    data = message[2:]
-
-    return {
-        'stream_id': stream_id,
-        'eof': eof,
-        'compressed': compressed,
-        'data': bytes_to_hex(data),
-        'header_val': header_val
-    }
-
-
-# Link request/response operations
-
-def cmd_link_rtt_pack(params):
-    """Pack RTT value for link using umsgpack.
-
-    Format: umsgpack.packb(rtt_float)
-    """
-    rtt = float(params['rtt'])
-    packed = umsgpack.packb(rtt)
-
-    return {
-        'packed': bytes_to_hex(packed)
-    }
-
-
-def cmd_link_rtt_unpack(params):
-    """Unpack RTT value from msgpack bytes."""
-    packed = hex_to_bytes(params['packed'])
-    rtt = umsgpack.unpackb(packed)
-
-    return {
-        'rtt': rtt
-    }
-
-
-def cmd_link_request_pack(params):
-    """Pack link request data.
-
-    Format: [timestamp, path_hash, data]
-    - timestamp: float (time.time())
-    - path_hash: bytes (16 bytes, truncated hash of path)
-    - data: any (request payload)
-    """
-    timestamp = float(params['timestamp'])
-    path_hash = hex_to_bytes(params['path_hash'])
-
-    # data can be None, bytes, or other types
-    if 'data' in params and params['data'] is not None:
-        if isinstance(params['data'], str):
-            # Assume hex-encoded bytes
-            data = hex_to_bytes(params['data'])
-        else:
-            data = params['data']
-    else:
-        data = None
-
-    unpacked_request = [timestamp, path_hash, data]
-    packed = umsgpack.packb(unpacked_request)
-
-    return {
-        'packed': bytes_to_hex(packed)
-    }
-
-
-def cmd_link_request_unpack(params):
-    """Unpack link request data.
-
-    Returns timestamp, path_hash, and data.
-    """
-    packed = hex_to_bytes(params['packed'])
-    unpacked = umsgpack.unpackb(packed)
-
-    timestamp = unpacked[0]
-    path_hash = unpacked[1]
-    data = unpacked[2]
-
-    return {
-        'timestamp': timestamp,
-        'path_hash': bytes_to_hex(path_hash),
-        'data': bytes_to_hex(data) if data is not None and isinstance(data, bytes) else data
-    }
-
-
-def cmd_link_response_pack(params):
-    """Pack link response data.
-
-    Format: [request_id, response_data]
-    - request_id: bytes (16 bytes, truncated hash of request packet)
-    - response_data: any (response payload)
-    """
-    request_id = hex_to_bytes(params['request_id'])
-
-    # response_data can be None, bytes, or other types
-    if 'response_data' in params and params['response_data'] is not None:
-        if isinstance(params['response_data'], str):
-            # Assume hex-encoded bytes
-            response_data = hex_to_bytes(params['response_data'])
-        else:
-            response_data = params['response_data']
-    else:
-        response_data = None
-
-    packed_response = umsgpack.packb([request_id, response_data])
-
-    return {
-        'packed': bytes_to_hex(packed_response)
-    }
-
-
-def cmd_link_response_unpack(params):
-    """Unpack link response data.
-
-    Returns request_id and response_data.
-    """
-    packed = hex_to_bytes(params['packed'])
-    unpacked = umsgpack.unpackb(packed)
-
-    request_id = unpacked[0]
-    response_data = unpacked[1]
-
-    return {
-        'request_id': bytes_to_hex(request_id),
-        'response_data': bytes_to_hex(response_data) if response_data is not None and isinstance(response_data, bytes) else response_data
-    }
-
-
-
-# Transport operations
-
-def cmd_path_entry_serialize(params):
-    """Serialize a path table entry to msgpack format.
-
-    Format: [destination_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    timestamp = float(params['timestamp'])
-    received_from = hex_to_bytes(params['received_from'])
-    hops = int(params['hops'])
-    expires = float(params['expires'])
-    random_blobs = [hex_to_bytes(blob) for blob in params['random_blobs']]
-    interface_hash = hex_to_bytes(params['interface_hash'])
-    packet_hash = hex_to_bytes(params['packet_hash'])
-
-    entry = [
-        destination_hash,
-        timestamp,
-        received_from,
-        hops,
-        expires,
-        random_blobs,
-        interface_hash,
-        packet_hash
-    ]
-
-    serialized = umsgpack.packb(entry)
-
-    return {
-        'serialized': bytes_to_hex(serialized)
-    }
-
-
-def cmd_path_entry_deserialize(params):
-    """Deserialize a path table entry from msgpack format."""
-    serialized = hex_to_bytes(params['serialized'])
-
-    entry = umsgpack.unpackb(serialized)
-
-    return {
-        'destination_hash': bytes_to_hex(entry[0]),
-        'timestamp': entry[1],
-        'received_from': bytes_to_hex(entry[2]),
-        'hops': entry[3],
-        'expires': entry[4],
-        'random_blobs': [bytes_to_hex(blob) for blob in entry[5]],
-        'interface_hash': bytes_to_hex(entry[6]),
-        'packet_hash': bytes_to_hex(entry[7])
-    }
-
-
-def cmd_path_request_pack(params):
-    """Pack path request data.
-
-    Format: [destination_hash:10-16][transport_instance:10-16?][tag:10?]
-    - If transport_enabled: destination_hash + transport_instance + tag
-    - Otherwise: destination_hash + tag
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    transport_instance = hex_to_bytes(params['transport_instance']) if params.get('transport_instance') else None
-    tag = hex_to_bytes(params['tag']) if params.get('tag') else None
-
-    if transport_instance:
-        # Transport enabled: dest + transport + tag
-        data = destination_hash + transport_instance
-        if tag:
-            data += tag
-    else:
-        # Transport disabled: dest + tag
-        data = destination_hash
-        if tag:
-            data += tag
-
-    return {
-        'data': bytes_to_hex(data),
-        'has_transport_instance': transport_instance is not None,
-        'has_tag': tag is not None
-    }
-
-
-def cmd_path_request_unpack(params):
-    """Unpack path request data.
-
-    Extracts destination_hash, and optionally transport_instance and tag.
-    """
-    data = hex_to_bytes(params['data'])
-
-    # Destination hash is first 10-16 bytes (we'll use 16 for truncated hash)
-    destination_hash = data[:16]
-    remaining = data[16:]
-
-    transport_instance = None
-    tag = None
-
-    if len(remaining) >= 16:
-        # Could be transport instance (16 bytes)
-        transport_instance = remaining[:16]
-        remaining = remaining[16:]
-
-        if len(remaining) >= 10:
-            # Remaining could be tag (10 bytes)
-            tag = remaining[:10]
-    elif len(remaining) >= 10:
-        # No transport instance, but has tag
-        tag = remaining[:10]
-
-    result = {
-        'destination_hash': bytes_to_hex(destination_hash)
-    }
-
-    if transport_instance:
-        result['transport_instance'] = bytes_to_hex(transport_instance)
-    if tag:
-        result['tag'] = bytes_to_hex(tag)
-
-    return result
-
-
-def cmd_packet_hashlist_pack(params):
-    """Pack a list of packet hashes for storage.
-
-    Uses umsgpack to serialize a list of hashes.
-    """
-    hashes = [hex_to_bytes(h) for h in params['hashes']]
-
-    serialized = umsgpack.packb(hashes)
-
-    return {
-        'serialized': bytes_to_hex(serialized),
-        'count': len(hashes)
-    }
-
-
-def cmd_packet_hashlist_unpack(params):
-    """Unpack a list of packet hashes from storage."""
-    serialized = hex_to_bytes(params['serialized'])
-
-    hashes = umsgpack.unpackb(serialized)
-
-    return {
-        'hashes': [bytes_to_hex(h) for h in hashes],
-        'count': len(hashes)
-    }
-
-
-# IFAC (Interface Access Code) operations
-IFAC_SALT = bytes.fromhex("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
-
-
-def cmd_ifac_derive_key(params):
-    """Derive IFAC key from network name/passphrase.
-
-    Uses HKDF with IFAC_SALT to derive a 64-byte key.
-    """
-    ifac_origin = hex_to_bytes(params['ifac_origin'])
-
-    # Derive 64-byte key using HKDF (matches RNS interface authentication)
-    ifac_key = HKDF.hkdf(length=64, derive_from=ifac_origin, salt=IFAC_SALT, context=None)
-
-    return {
-        'ifac_key': bytes_to_hex(ifac_key),
-        'ifac_salt': bytes_to_hex(IFAC_SALT)
-    }
-
-
-def cmd_ifac_compute(params):
-    """Compute IFAC tag for a packet.
-
-    IFAC = last N bytes of Ed25519 signature of packet data.
-    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    packet_data = hex_to_bytes(params['packet_data'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # Ed25519 signing key is the second half (bytes 32-63)
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-
-    # Sign the packet data
-    signature = sk.sign(packet_data)
-
-    # IFAC is the last ifac_size bytes of the signature
-    ifac = signature[-ifac_size:]
-
-    return {
-        'ifac': bytes_to_hex(ifac),
-        'signature': bytes_to_hex(signature)
-    }
-
-
-def cmd_ifac_verify(params):
-    """Verify IFAC tag matches expected.
-
-    Recomputes IFAC and compares.
-    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    packet_data = hex_to_bytes(params['packet_data'])
-    expected_ifac = hex_to_bytes(params['expected_ifac'])
-    ifac_size = len(expected_ifac)
-
-    # Ed25519 signing key is the second half (bytes 32-63)
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-
-    # Sign the packet data
-    signature = sk.sign(packet_data)
-
-    # IFAC is the last ifac_size bytes of the signature
-    computed_ifac = signature[-ifac_size:]
-
-    return {
-        'valid': computed_ifac == expected_ifac,
-        'computed_ifac': bytes_to_hex(computed_ifac)
-    }
-
-
-def cmd_ifac_mask_packet(params):
-    """Apply IFAC masking to a raw packet.
-
-    Performs the full IFAC transmit transform:
-    1. Compute IFAC tag (Ed25519 sign, take last ifac_size bytes)
-    2. Set IFAC flag (0x80) on header byte 0
-    3. Insert IFAC after 2-byte header
-    4. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
-    5. Apply mask: header bytes and payload masked, IFAC bytes NOT masked
-
-    Returns the masked wire-format packet.
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    raw = hex_to_bytes(params['packet_data'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # 1. Compute IFAC
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-    signature = sk.sign(raw)
-    ifac = signature[-ifac_size:]
-
-    # 2-3. Set flag and insert IFAC
-    new_header = bytes([raw[0] | 0x80, raw[1]])
-    new_raw = new_header + ifac + raw[2:]
-
-    # 4. Generate mask
-    mask = HKDF.hkdf(
-        length=len(new_raw),
-        derive_from=ifac,
-        salt=ifac_key,
-        context=None,
-    )
-
-    # 5. Apply mask
-    masked_raw = b""
-    for i, byte in enumerate(new_raw):
-        if i == 0:
-            masked_raw += bytes([byte ^ mask[i] | 0x80])
-        elif i == 1 or i > ifac_size + 1:
-            masked_raw += bytes([byte ^ mask[i]])
-        else:
-            masked_raw += bytes([byte])
-
-    return {
-        'masked_packet': bytes_to_hex(masked_raw),
-        'ifac': bytes_to_hex(ifac),
-    }
-
-
-def cmd_ifac_unmask_packet(params):
-    """Unmask and validate an IFAC-protected packet.
-
-    Performs the full IFAC receive transform:
-    1. Check IFAC flag (0x80) is set
-    2. Extract IFAC from bytes [2:2+ifac_size]
-    3. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
-    4. Unmask header bytes and payload (not IFAC itself)
-    5. Clear IFAC flag, remove IFAC bytes
-    6. Recompute expected IFAC and validate
-
-    Returns the original unmasked packet (or invalid=true).
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    masked = hex_to_bytes(params['masked_packet'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # 1. Check flag
-    if masked[0] & 0x80 != 0x80:
-        return {'valid': False, 'error': 'ifac_flag_not_set'}
-
-    if len(masked) <= 2 + ifac_size:
-        return {'valid': False, 'error': 'packet_too_short'}
-
-    # 2. Extract IFAC (not masked)
-    ifac = masked[2:2 + ifac_size]
-
-    # 3. Generate mask
-    mask = HKDF.hkdf(
-        length=len(masked),
-        derive_from=ifac,
-        salt=ifac_key,
-        context=None,
-    )
-
-    # 4. Unmask
-    unmasked = b""
-    for i, byte in enumerate(masked):
-        if i <= 1 or i > ifac_size + 1:
-            unmasked += bytes([byte ^ mask[i]])
-        else:
-            unmasked += bytes([byte])
-
-    # 5. Clear flag and remove IFAC
-    new_raw = bytes([unmasked[0] & 0x7f, unmasked[1]]) + unmasked[2 + ifac_size:]
-
-    # 6. Validate
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-    expected_ifac = sk.sign(new_raw)[-ifac_size:]
-
-    valid = ifac == expected_ifac
-
+    RNS = _ensure_minimal_rns()
+    raw = hex_to_bytes(params['raw'])
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        return {'valid': False, 'error': 'unpack_failed'}
+    if packet.packet_type != RNS.Packet.ANNOUNCE:
+        return {'valid': False, 'error': 'not_an_announce'}
+
+    valid = bool(RNS.Identity.validate_announce(packet))
     result = {
         'valid': valid,
-        'ifac': bytes_to_hex(ifac),
+        'destination_hash': bytes_to_hex(packet.destination_hash),
+        'has_ratchet': packet.context_flag == RNS.Packet.FLAG_SET,
     }
-    if valid:
-        result['packet_data'] = bytes_to_hex(new_raw)
+    if result['has_ratchet']:
+        keysize = RNS.Identity.KEYSIZE // 8
+        name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+        ratchet_size = RNS.Identity.RATCHETSIZE // 8
+        ratchet_off = keysize + name_hash_len + 10
+        result['ratchet'] = bytes_to_hex(packet.data[ratchet_off:ratchet_off + ratchet_size])
     return result
+
+
+# Ratchet operations
+
+def cmd_ratchet_id(params):
+    """Compute the 10-byte ratchet ID for a ratchet public key.
+
+    Delegates to real RNS — the ratchet ID is
+    RNS.Identity.full_hash(public)[:NAME_HASH_LENGTH//8], exactly what
+    Identity._get_ratchet_id computes internally. Nothing here hardcodes
+    the truncation length; it is read off the RNS constant.
+    """
+    RNS = _get_full_rns()
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    rid = RNS.Identity.full_hash(ratchet_public)[: RNS.Identity.NAME_HASH_LENGTH // 8]
+    return {'ratchet_id': bytes_to_hex(rid)}
+
+
+def cmd_ratchet_public_from_private(params):
+    """Derive public key from ratchet private key."""
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+
+    # Create X25519 key pair from private key
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ratchet_pub = ratchet_prv.public_key()
+    ratchet_pub_bytes = ratchet_pub.public_bytes()
+
+    return {
+        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
+    }
+
+
+def cmd_ratchet_encrypt(params):
+    """Encrypt plaintext for an Identity, using a ratchet public key.
+
+    Delegates to real RNS.Identity.encrypt(plaintext, ratchet=ratchet_public).
+    RNS performs the ECDH-with-ratchet, HKDF (salt = identity's own hash),
+    and Token encryption itself; the previous hand-rolled path took an
+    injected identity_hash as the salt and reassembled iv+ciphertext+hmac
+    by hand. Non-deterministic (fresh ephemeral key + IV per call) — tests
+    must round-trip through ratchet_decrypt.
+    """
+    RNS = _get_full_rns()
+    public_key = hex_to_bytes(params['public_key'])
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {
+        'ciphertext': bytes_to_hex(identity.encrypt(plaintext, ratchet=ratchet_public))
+    }
+
+
+def cmd_ratchet_decrypt(params):
+    """Decrypt a ratchet-encrypted ciphertext with the Identity's private key
+    and the matching ratchet private key.
+
+    Delegates to real RNS.Identity.decrypt(ciphertext, ratchets=[ratchet_private]).
+    """
+    RNS = _get_full_rns()
+    private_key = hex_to_bytes(params['private_key'])
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    plaintext = identity.decrypt(ciphertext, ratchets=[ratchet_private])
+    return {'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None}
+
 
 
 # Compression operations
@@ -2619,172 +893,6 @@ def cmd_bz2_decompress(params):
     return {
         'decompressed': bytes_to_hex(decompressed),
         'size': len(decompressed)
-    }
-
-
-# LXMF operations
-
-def cmd_lxmf_pack(params):
-    """Pack LXMF message from components.
-
-    Follows LXMessage.pack() logic but works with raw hashes instead of Destination objects.
-    Hash is computed WITHOUT stamp, then stamp can be added to payload separately.
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    source_hash = hex_to_bytes(params['source_hash'])
-    timestamp = float(params['timestamp'])
-    title = params.get('title', '')
-    content = params.get('content', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int (JSON only supports string keys)
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Encode title and content as bytes
-    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
-    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
-
-    # Build payload: [timestamp, title, content, fields]
-    payload = [timestamp, title_bytes, content_bytes, fields]
-    packed_payload = umsgpack.packb(payload)
-
-    # Compute hash: SHA256(dest_hash + source_hash + packed_payload)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    # Signed part: hashed_part + hash
-    signed_part = hashed_part + message_hash
-
-    return {
-        'packed_payload': bytes_to_hex(packed_payload),
-        'hashed_part': bytes_to_hex(hashed_part),
-        'message_hash': bytes_to_hex(message_hash),
-        'signed_part': bytes_to_hex(signed_part)
-    }
-
-
-def cmd_lxmf_unpack(params):
-    """Unpack LXMF message bytes to components.
-
-    Follows LXMessage.unpack_from_bytes() logic.
-    Extracts stamp from payload if present, recomputes hash without stamp.
-    """
-    lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
-
-    DEST_LEN = 16  # LXMessage.DESTINATION_LENGTH
-    SIG_LEN = 64   # LXMessage.SIGNATURE_LENGTH
-
-    destination_hash = lxmf_bytes[:DEST_LEN]
-    source_hash = lxmf_bytes[DEST_LEN:2*DEST_LEN]
-    signature = lxmf_bytes[2*DEST_LEN:2*DEST_LEN+SIG_LEN]
-    packed_payload = lxmf_bytes[2*DEST_LEN+SIG_LEN:]
-
-    unpacked_payload = umsgpack.unpackb(packed_payload)
-
-    # Extract stamp if present (5th element)
-    stamp = None
-    if len(unpacked_payload) > 4:
-        stamp = unpacked_payload[4]
-        unpacked_payload = unpacked_payload[:4]
-        # Repack without stamp for hash computation
-        packed_payload = umsgpack.packb(unpacked_payload)
-
-    # Compute hash (always without stamp)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    # Decode title/content
-    title_bytes = unpacked_payload[1]
-    content_bytes = unpacked_payload[2]
-    title = title_bytes.decode('utf-8') if isinstance(title_bytes, bytes) else title_bytes
-    content = content_bytes.decode('utf-8') if isinstance(content_bytes, bytes) else content_bytes
-
-    return {
-        'destination_hash': bytes_to_hex(destination_hash),
-        'source_hash': bytes_to_hex(source_hash),
-        'signature': bytes_to_hex(signature),
-        'timestamp': unpacked_payload[0],
-        'title': title,
-        'content': content,
-        'fields': unpacked_payload[3],
-        'stamp': bytes_to_hex(stamp) if stamp else None,
-        'message_hash': bytes_to_hex(message_hash)
-    }
-
-
-def serialize_field_value(value):
-    """Recursively serialize field values for JSON transport.
-
-    Binary data is hex-encoded with type annotation.
-    Lists/tuples are recursively serialized.
-    """
-    if isinstance(value, bytes):
-        return {'type': 'bytes', 'hex': value.hex()}
-    elif isinstance(value, (list, tuple)):
-        return {'type': 'list', 'items': [serialize_field_value(v) for v in value]}
-    elif isinstance(value, dict):
-        return {'type': 'dict', 'items': {str(k): serialize_field_value(v) for k, v in value.items()}}
-    elif isinstance(value, int):
-        return {'type': 'int', 'value': value}
-    elif isinstance(value, float):
-        return {'type': 'float', 'value': value}
-    elif isinstance(value, str):
-        return {'type': 'str', 'value': value}
-    else:
-        return {'type': type(value).__name__, 'value': str(value)}
-
-
-def cmd_lxmf_unpack_with_fields(params):
-    """Unpack LXMF message with deep field serialization.
-
-    Like lxmf_unpack but returns fields_hex with all nested binary data hex-encoded.
-    Replaces 'fields' with 'fields_hex' to ensure JSON serializability.
-    """
-    result = cmd_lxmf_unpack(params)
-
-    # Serialize all field values for JSON transport
-    fields = result.get('fields', {})
-    fields_hex = {}
-    if fields:
-        for key, value in fields.items():
-            fields_hex[str(key)] = serialize_field_value(value)
-
-    # Replace fields with serialized version for JSON transport
-    result['fields_hex'] = fields_hex
-    del result['fields']  # Remove raw fields to avoid JSON serialization issues
-    return result
-
-
-def cmd_lxmf_hash(params):
-    """Compute LXMF message hash from components.
-
-    Hash = SHA256(destination_hash + source_hash + packed_payload)
-    This is the message_id used for stamp generation.
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    source_hash = hex_to_bytes(params['source_hash'])
-    timestamp = float(params['timestamp'])
-    title = params.get('title', '')
-    content = params.get('content', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Encode title and content
-    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
-    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
-
-    # Build payload and hash
-    payload = [timestamp, title_bytes, content_bytes, fields]
-    packed_payload = umsgpack.packb(payload)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    return {
-        'message_hash': bytes_to_hex(message_hash)
     }
 
 
@@ -2884,6 +992,42 @@ def _get_full_rns():
     # Import real RNS fresh
     import RNS
     _rns_module = RNS
+    return RNS
+
+
+def _ensure_minimal_rns():
+    """Ensure a real RNS.Reticulum instance exists, creating a minimal,
+    no-interface, no-transport one if none does. Required for any operation
+    that registers a destination — RNS.Destination(__init__) calls
+    Transport.register_destination, which crashes without a Reticulum owner.
+
+    Reuses the live _rns_instance set by cmd_rns_start when present (RNS
+    Reticulum is a process-wide singleton, so a second `Reticulum(...)` call
+    returns the existing one regardless of the configdir passed). For the
+    static announce_* commands that need a destination but no network, a
+    minimal instance with `enable_transport = no` and no interfaces is
+    enough — and is much faster to start than the full cmd_rns_start path.
+    """
+    global _rns_instance
+    RNS = _get_full_rns()
+    if _rns_instance is None:
+        import tempfile
+        cfg = tempfile.mkdtemp(prefix='rns_minimal_')
+        cfg_file = os.path.join(cfg, "config")
+        if not os.path.isfile(cfg_file):
+            os.makedirs(cfg, exist_ok=True)
+            with open(cfg_file, "w") as f:
+                f.write(
+                    "[reticulum]\n"
+                    "enable_transport = no\n"
+                    "share_instance = no\n"
+                    "\n"
+                    "[interfaces]\n"
+                )
+        RNS.loglevel = int(
+            os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL))
+        )
+        _rns_instance = RNS.Reticulum(configdir=cfg)
     return RNS
 
 
@@ -4223,37 +2367,6 @@ def cmd_local_client_connect(params):
     return {'connected': True}
 
 
-def cmd_local_client_read_packets(params):
-    """Return HDLC-deframed packets received from the shared instance.
-
-    params:
-        timeout_ms (int, optional): max wait for at least one packet (default 5000)
-    returns:
-        packets (list of hex strings)
-        count (int)
-    """
-    import time
-
-    timeout_ms = int(params.get('timeout_ms', 5000))
-    deadline = time.time() + timeout_ms / 1000.0
-
-    # Wait until at least one packet or timeout
-    while time.time() < deadline:
-        with _local_client_lock:
-            if _local_client_packets:
-                break
-        time.sleep(0.05)
-
-    with _local_client_lock:
-        packets = list(_local_client_packets)
-        _local_client_packets.clear()
-
-    return {
-        'packets': [bytes_to_hex(p) for p in packets],
-        'count': len(packets),
-    }
-
-
 def cmd_local_client_disconnect(params):
     """Close the local client socket."""
     global _local_client_socket, _local_client_thread, _local_client_running
@@ -4272,60 +2385,6 @@ def cmd_local_client_disconnect(params):
         _local_client_thread = None
 
     return {'disconnected': True}
-
-
-def cmd_packet_parse_header(params):
-    """Parse a raw packet's header fields.
-
-    params:
-        raw (hex): raw packet bytes
-    returns:
-        header_type (int): 0=HEADER_1, 1=HEADER_2
-        transport_type (int): 0=BROADCAST, 1=TRANSPORT
-        destination_type (int): 0=SINGLE, 1=GROUP, 2=PLAIN, 3=LINK
-        packet_type (int): 0=DATA, 1=ANNOUNCE, 2=LINKREQUEST, 3=PROOF
-        context_flag (int): 0=UNSET, 1=SET
-        hops (int)
-        transport_id (hex or null)
-        destination_hash (hex)
-        context (int)
-    """
-    raw = hex_to_bytes(params['raw'])
-
-    if len(raw) < 2:
-        raise ValueError("Packet too short")
-
-    flags = raw[0]
-    hops = raw[1]
-
-    header_type     = (flags >> 6) & 0x01
-    context_flag    = (flags >> 5) & 0x01
-    transport_type  = (flags >> 4) & 0x01
-    destination_type = (flags >> 2) & 0x03
-    packet_type     = flags & 0x03
-
-    HASH_LEN = 16
-
-    if header_type == 0:  # HEADER_1
-        transport_id = None
-        destination_hash = raw[2:2 + HASH_LEN]
-        context = raw[2 + HASH_LEN] if len(raw) > 2 + HASH_LEN else 0
-    else:  # HEADER_2
-        transport_id = raw[2:2 + HASH_LEN]
-        destination_hash = raw[2 + HASH_LEN:2 + 2 * HASH_LEN]
-        context = raw[2 + 2 * HASH_LEN] if len(raw) > 2 + 2 * HASH_LEN else 0
-
-    return {
-        'header_type': header_type,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type,
-        'context_flag': context_flag,
-        'hops': hops,
-        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
-        'destination_hash': bytes_to_hex(destination_hash),
-        'context': context,
-    }
 
 
 # Command dispatcher
@@ -4356,72 +2415,21 @@ COMMANDS = {
     'destination_hash': cmd_destination_hash,
     'truncated_hash': cmd_truncated_hash,
     'name_hash': cmd_name_hash,
-    'packet_flags': cmd_packet_flags,
-    'packet_parse_flags': cmd_packet_parse_flags,
-    'packet_pack': cmd_packet_pack,
+    'packet_build': cmd_packet_build,
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
-    'hdlc_escape': cmd_hdlc_escape,
-    'hdlc_frame': cmd_hdlc_frame,
-    'kiss_escape': cmd_kiss_escape,
-    'kiss_frame': cmd_kiss_frame,
-    # Link operations
-    'link_id_from_packet': cmd_link_id_from_packet,
-    'link_derive_key': cmd_link_derive_key,
-    'link_encrypt': cmd_link_encrypt,
-    'link_decrypt': cmd_link_decrypt,
-    'link_prove': cmd_link_prove,
-    'link_verify_proof': cmd_link_verify_proof,
-    'link_signalling_bytes': cmd_link_signalling_bytes,
-    'link_parse_signalling': cmd_link_parse_signalling,
-    'link_rtt_pack': cmd_link_rtt_pack,
-    'link_rtt_unpack': cmd_link_rtt_unpack,
-    'link_request_pack': cmd_link_request_pack,
-    'link_request_unpack': cmd_link_request_unpack,
-    'link_response_pack': cmd_link_response_pack,
-    'link_response_unpack': cmd_link_response_unpack,
     # Ratchet operations
     'ratchet_id': cmd_ratchet_id,
     'ratchet_public_from_private': cmd_ratchet_public_from_private,
-    'ratchet_derive_key': cmd_ratchet_derive_key,
     'ratchet_encrypt': cmd_ratchet_encrypt,
     'ratchet_decrypt': cmd_ratchet_decrypt,
-    'ratchet_storage_format': cmd_ratchet_storage_format,
-    'ratchet_extract_from_announce': cmd_ratchet_extract_from_announce,
-    'ratchet_file_write': cmd_ratchet_file_write,
-    'ratchet_file_read': cmd_ratchet_file_read,
     # Announce operations
-    'random_hash': cmd_random_hash,
-    'announce_pack': cmd_announce_pack,
-    'announce_unpack': cmd_announce_unpack,
-    'announce_sign': cmd_announce_sign,
-    'announce_verify': cmd_announce_verify,
-    # Channel operations
-    'envelope_pack': cmd_envelope_pack,
-    'envelope_unpack': cmd_envelope_unpack,
-    'stream_msg_pack': cmd_stream_msg_pack,
-    'stream_msg_unpack': cmd_stream_msg_unpack,
-    # Transport operations
-    'path_entry_serialize': cmd_path_entry_serialize,
-    'path_entry_deserialize': cmd_path_entry_deserialize,
-    'path_request_pack': cmd_path_request_pack,
-    'path_request_unpack': cmd_path_request_unpack,
-    'packet_hashlist_pack': cmd_packet_hashlist_pack,
-    'packet_hashlist_unpack': cmd_packet_hashlist_unpack,
-    # IFAC operations
-    'ifac_derive_key': cmd_ifac_derive_key,
-    'ifac_compute': cmd_ifac_compute,
-    'ifac_verify': cmd_ifac_verify,
-    'ifac_mask_packet': cmd_ifac_mask_packet,
-    'ifac_unmask_packet': cmd_ifac_unmask_packet,
+    'announce_build': cmd_announce_build,
+    'announce_validate': cmd_announce_validate,
     # Compression operations
     'bz2_compress': cmd_bz2_compress,
     'bz2_decompress': cmd_bz2_decompress,
-    # LXMF operations
-    'lxmf_pack': cmd_lxmf_pack,
-    'lxmf_unpack': cmd_lxmf_unpack,
-    'lxmf_unpack_with_fields': cmd_lxmf_unpack_with_fields,
-    'lxmf_hash': cmd_lxmf_hash,
+    # LXMF stamp operations (real LXStamper delegation)
     'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
     'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
     'lxmf_stamp_generate': cmd_lxmf_stamp_generate,
@@ -4466,9 +2474,7 @@ COMMANDS = {
     'rns_set_proof_strategy': cmd_rns_set_proof_strategy,
     # Local client reader (raw socket for E2E announce forwarding tests)
     'local_client_connect': cmd_local_client_connect,
-    'local_client_read_packets': cmd_local_client_read_packets,
     'local_client_disconnect': cmd_local_client_disconnect,
-    'packet_parse_header': cmd_packet_parse_header,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

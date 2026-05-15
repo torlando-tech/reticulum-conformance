@@ -1,7 +1,14 @@
 """Packet conformance tests.
 
-Tests packet flag encoding/decoding, packet packing/unpacking, and
-header parsing by comparing SUT output against a reference implementation.
+Tests the RNS packet wire format by building real RNS.Packet objects on
+real Destinations and cross-unpacking the resulting raw bytes between
+implementations. There is no standalone "format these arbitrary header
+fields" RNS API — wire-format conformance is what one impl produces and
+another impl can parse, which is exactly what these tests exercise.
+
+HEADER_2 (transport-relayed) DATA packets cannot be packed standalone (RNS
+only produces them inside Transport while relaying); their wire format is
+covered by the live multi-hop tests in tests/wire/test_link_multihop.py.
 """
 
 from conftest import random_hex, assert_hex_equal
@@ -12,253 +19,154 @@ __category_title__ = "Packet"
 __category_order__ = 5
 
 
-@conformance_case(
-    commands=["packet_flags"],
-    verifies="RNS `packet_flags` byte encoding for a basic DATA packet (all bit-fields zero) is byte-identical",
-)
-def test_packet_flags(sut, reference):
-    ref = reference.execute(
-        "packet_flags",
-        header_type=0,
-        context_flag=0,
-        transport_type=0,
-        destination_type=0,
-        packet_type=0,
-    )
-    res = sut.execute(
-        "packet_flags",
-        header_type=0,
-        context_flag=0,
-        transport_type=0,
-        destination_type=0,
-        packet_type=0,
-    )
-    assert res["flags"] == ref["flags"]
+# Destination types — the flag-byte values RNS encodes for each.
+_DTYPE_SINGLE = 0
+_DTYPE_PLAIN = 2
+
+# Packet types.
+_PTYPE_DATA = 0
+_PTYPE_ANNOUNCE = 1
 
 
 @conformance_case(
-    commands=["packet_flags"],
-    verifies="RNS `packet_flags` byte encoding for an ANNOUNCE packet (`context_flag=1`, `packet_type=1` → byte `0x21`) is byte-identical",
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS packet wire-format cross-impl interop on a PLAIN destination: a packet built by either impl unpacks on the other to byte-identical hops/destination_hash/context/data, and the flags byte itself agrees — PLAIN carries the payload in the clear so the full wire bytes round-trip exactly",
 )
-def test_packet_flags_announce(sut, reference):
-    ref = reference.execute(
-        "packet_flags",
-        header_type=0,
-        context_flag=1,
-        transport_type=0,
-        destination_type=0,
-        packet_type=1,
-    )
-    res = sut.execute(
-        "packet_flags",
-        header_type=0,
-        context_flag=1,
-        transport_type=0,
-        destination_type=0,
-        packet_type=1,
-    )
-    assert res["flags"] == ref["flags"]
+def test_packet_plain_wire_format_roundtrip(sut, reference):
+    payload = random_hex(32)
+    for builder, unpacker, label in (
+        (reference, sut, "ref->sut"),
+        (sut, reference, "sut->ref"),
+    ):
+        built = builder.execute(
+            "packet_build",
+            dest_type="plain", packet_type=_PTYPE_DATA,
+            context=0, context_flag=0, hops=3, data=payload,
+        )
+        parsed = unpacker.execute("packet_unpack", raw=built["raw"])
+        assert parsed["unpacked"] is True, f"{label}: unpack rejected"
+        assert parsed["flags"] == built["flags"], f"{label}: flags mismatch"
+        assert parsed["hops"] == built["hops"] == 3, f"{label}: hops mismatch"
+        assert parsed["destination_type"] == _DTYPE_PLAIN, f"{label}: dest_type"
+        assert parsed["packet_type"] == _PTYPE_DATA, f"{label}: packet_type"
+        assert_hex_equal(parsed["destination_hash"], built["destination_hash"])
+        assert_hex_equal(parsed["data"], payload)  # PLAIN: data round-trips clear
 
 
 @conformance_case(
-    commands=["packet_parse_flags"],
-    verifies="RNS `packet_parse_flags` decodes 6 distinct flag bytes (`0x00`, `0x21`, `0x41`, `0x15`, `0x0A`, `0x7F`) covering every value of every bit-field; all decoded fields (`header_type`, `context_flag`, `transport_type`, `destination_type`, `packet_type`) match the reference",
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS packet wire-format cross-impl interop on a SINGLE destination ANNOUNCE packet: announce payloads are not encrypted, so the full wire bytes round-trip; destination_type=SINGLE and packet_type=ANNOUNCE are recovered on the other impl",
 )
-def test_packet_parse_flags(sut, reference):
-    # Enumerates every value of every bit-field in the flag byte:
-    #   0x00 = all zeros (H1, ctx=0, tx=0, dest=SINGLE, pkt=DATA)
-    #   0x21 = H1 + context_flag=1, dest=SINGLE, pkt=ANNOUNCE
-    #   0x41 = H2 + dest=SINGLE, pkt=ANNOUNCE
-    #   0x15 = H1 + transport_type=1, dest=GROUP, pkt=ANNOUNCE
-    #   0x0A = H1 + dest=PLAIN, pkt=LINKREQUEST  (closes the
-    #          PLAIN/LINKREQUEST coverage gap left by the original 5)
-    #   0x7F = H2 + ctx=1, tx=1, dest=LINK, pkt=PROOF  (all-fields-max)
-    for flags_byte in [0x00, 0x21, 0x41, 0x15, 0x0A, 0x7F]:
-        ref = reference.execute("packet_parse_flags", flags=flags_byte)
-        res = sut.execute("packet_parse_flags", flags=flags_byte)
-        assert res["header_type"] == ref["header_type"]
-        assert res["context_flag"] == ref["context_flag"]
-        assert res["transport_type"] == ref["transport_type"]
-        assert res["destination_type"] == ref["destination_type"]
-        assert res["packet_type"] == ref["packet_type"]
+def test_packet_announce_wire_format_roundtrip(sut, reference):
+    payload = random_hex(40)
+    for builder, unpacker, label in (
+        (reference, sut, "ref->sut"),
+        (sut, reference, "sut->ref"),
+    ):
+        built = builder.execute(
+            "packet_build",
+            dest_type="single", packet_type=_PTYPE_ANNOUNCE,
+            context=0, context_flag=0, hops=0, data=payload,
+        )
+        parsed = unpacker.execute("packet_unpack", raw=built["raw"])
+        assert parsed["unpacked"] is True, f"{label}: unpack rejected"
+        assert parsed["flags"] == built["flags"], f"{label}: flags mismatch"
+        assert parsed["destination_type"] == _DTYPE_SINGLE, f"{label}: dest_type"
+        assert parsed["packet_type"] == _PTYPE_ANNOUNCE, f"{label}: packet_type"
+        assert_hex_equal(parsed["destination_hash"], built["destination_hash"])
+        # Announce packets are not encrypted, so the payload survives.
+        assert_hex_equal(parsed["data"], payload)
 
 
 @conformance_case(
-    commands=["packet_parse_flags"],
-    verifies="RNS `packet_parse_flags` ignores the IFAC flag (bit 7): for every curated flag byte, decoding `byte | 0x80` yields fields byte-identical to decoding `byte` on both impls — bit 7 is the masking layer's concern, not the packet decoder's. Catches bit-7 bleed even when both impls share the bug.",
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS packet header round-trip on a SINGLE destination DATA packet: the header fields (flags, hops, destination_hash, context) parse identically across impls. Payload is encrypted-with-fresh-IV per call, so the wire bytes are non-deterministic and only the header is asserted",
 )
-def test_packet_parse_flags_ignores_ifac_bit(sut, reference):
-    """Bit 7 of the flag byte is the IFAC flag — set by the IFAC masking
-    layer when wrapping a packet for an authenticated interface. It is not
-    part of packet_parse_flags' five-field contract; decoders must mask it
-    out (or simply ignore the high nibble's top bit). This test asserts
-    three things at once for the same 6 curated bytes test_packet_parse_flags
-    uses:
-      1. cross-impl: SUT and reference produce identical fields for the
-         bit-7-set input (`base | 0x80`),
-      2. within reference: setting bit 7 does not change any of the 5
-         named fields,
-      3. within SUT: same.
-    (2) and (3) together rule out a "both impls bleed bit 7 into header_type"
-    failure mode that a pure SUT==reference check would miss.
+def test_packet_single_data_header_roundtrip(sut, reference):
+    payload = random_hex(16)
+    for builder, unpacker, label in (
+        (reference, sut, "ref->sut"),
+        (sut, reference, "sut->ref"),
+    ):
+        built = builder.execute(
+            "packet_build",
+            dest_type="single", packet_type=_PTYPE_DATA,
+            context=5, context_flag=1, hops=2, data=payload,
+        )
+        parsed = unpacker.execute("packet_unpack", raw=built["raw"])
+        assert parsed["unpacked"] is True, f"{label}: unpack rejected"
+        assert parsed["flags"] == built["flags"], f"{label}: flags mismatch"
+        assert parsed["hops"] == 2, f"{label}: hops"
+        assert parsed["context"] == 5, f"{label}: context"
+        assert parsed["context_flag"] == 1, f"{label}: context_flag"
+        assert parsed["destination_type"] == _DTYPE_SINGLE, f"{label}: dest_type"
+        assert parsed["packet_type"] == _PTYPE_DATA, f"{label}: packet_type"
+        assert_hex_equal(parsed["destination_hash"], built["destination_hash"])
+        # Data is encrypted; payload is non-deterministic. Do not compare.
+
+
+@conformance_case(
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS flag byte composition for every packet kind buildable standalone (PLAIN/SINGLE × DATA/ANNOUNCE/LINKREQUEST/PROOF, both context_flag values): the flags byte raw[0] computed by RNS.Packet.pack composes to the same value both impls produce, and parse_flags decodes back to identical five-field tuples",
+)
+def test_packet_flags_byte_by_kind(sut, reference):
+    """The RNS flag byte layout is
+        bit 6: header_type (always HEADER_1 here — HEADER_2 DATA is Transport-only)
+        bit 5: context_flag
+        bit 4: transport_type (always BROADCAST here — TRANSPORT is Transport-only)
+        bits 3-2: destination_type
+        bits 1-0: packet_type
+    For each combination of (dest_type, packet_type, context_flag) that builds
+    standalone, RNS.Packet.pack must compose those bits the same way on both
+    impls.
     """
-    fields = (
-        "header_type", "context_flag", "transport_type",
-        "destination_type", "packet_type",
-    )
-    for base_byte in [0x00, 0x21, 0x41, 0x15, 0x0A, 0x7F]:
-        ifac_set = base_byte | 0x80
-        ref_clear = reference.execute("packet_parse_flags", flags=base_byte)
-        sut_clear = sut.execute("packet_parse_flags", flags=base_byte)
-        ref_set = reference.execute("packet_parse_flags", flags=ifac_set)
-        sut_set = sut.execute("packet_parse_flags", flags=ifac_set)
-        for f in fields:
-            # (1) cross-impl at bit-7-set
-            assert sut_set[f] == ref_set[f], (
-                f"SUT/reference diverge at flags=0x{ifac_set:02x} on {f}"
-            )
-            # (2) reference: bit 7 doesn't bleed
-            assert ref_set[f] == ref_clear[f], (
-                f"reference: setting bit 7 changed {f} (base=0x{base_byte:02x})"
-            )
-            # (3) SUT: bit 7 doesn't bleed
-            assert sut_set[f] == sut_clear[f], (
-                f"SUT: setting bit 7 changed {f} (base=0x{base_byte:02x})"
-            )
+    payload = random_hex(8)
+    for dest_type, dt_bits in (("plain", _DTYPE_PLAIN), ("single", _DTYPE_SINGLE)):
+        for packet_type in (0, 1, 2, 3):  # DATA, ANNOUNCE, LINKREQUEST, PROOF
+            for context_flag in (0, 1):
+                ref = reference.execute(
+                    "packet_build",
+                    dest_type=dest_type, packet_type=packet_type,
+                    context=0, context_flag=context_flag, hops=0, data=payload,
+                )
+                res = sut.execute(
+                    "packet_build",
+                    dest_type=dest_type, packet_type=packet_type,
+                    context=0, context_flag=context_flag, hops=0, data=payload,
+                )
+                assert res["flags"] == ref["flags"], (
+                    f"flags byte diverged for dest_type={dest_type} "
+                    f"packet_type={packet_type} context_flag={context_flag}: "
+                    f"sut=0x{res['flags']:02x} ref=0x{ref['flags']:02x}"
+                )
+                # Same five-field decomposition on each impl.
+                for f in (
+                    "header_type", "context_flag", "transport_type",
+                    "destination_type", "packet_type",
+                ):
+                    assert res[f] == ref[f], (
+                        f"field {f} diverged for dest_type={dest_type} "
+                        f"packet_type={packet_type} context_flag={context_flag}"
+                    )
+                assert res["destination_type"] == dt_bits
+                assert res["packet_type"] == packet_type
+                assert res["context_flag"] == context_flag
 
 
 @conformance_case(
-    commands=["packet_parse_flags"],
-    verifies="RNS `packet_parse_flags` exhaustive sweep: for every flag byte value `0x00`–`0x7F` (all 128 combinations of the 5 named fields, IFAC bit clear), SUT and reference decode byte-identically. Pairs with the curated `test_packet_parse_flags` (which documents WHICH byte covers what) — together they catch every per-byte miswiring SUT could possibly have.",
+    commands=["packet_build", "packet_hash"],
+    verifies="RNS packet hash (the transport-dedup key, computed over the hashable part with hops byte and HEADER_2 transport_id masked out) is byte-identical when both impls hash the same raw packet — the same call site impls hit for hashlist insertion",
 )
-def test_packet_parse_flags_exhaustive(sut, reference):
-    """All 128 valid (IFAC-clear) flag byte values. Combined with
-    test_packet_parse_flags (representative subset, every-value-of-every-
-    field, documented) and test_packet_parse_flags_ignores_ifac_bit (bit 7
-    behavior), this gives complete enumeration: any byte the SUT will ever
-    see on the wire decodes the same as reference.
-    """
-    fields = (
-        "header_type", "context_flag", "transport_type",
-        "destination_type", "packet_type",
+def test_packet_hash_matches_across_impls(sut, reference):
+    ref_built = reference.execute(
+        "packet_build",
+        dest_type="plain", packet_type=_PTYPE_DATA,
+        context=0, context_flag=0, hops=7, data=random_hex(24),
     )
-    for byte in range(0x80):
-        ref = reference.execute("packet_parse_flags", flags=byte)
-        res = sut.execute("packet_parse_flags", flags=byte)
-        for f in fields:
-            assert res[f] == ref[f], (
-                f"diverge at flags=0x{byte:02x} on field {f}: "
-                f"SUT={res[f]!r} reference={ref[f]!r}"
-            )
-
-
-@conformance_case(
-    commands=["packet_pack", "packet_unpack"],
-    verifies="RNS packet pack/unpack round-trip (HEADER_1 layout — no `transport_id`): packing is byte-identical and unpacking recovers `hops`, `destination_hash`, and data",
-)
-def test_packet_pack_unpack_header1(sut, reference):
-    dest = random_hex(16)
-    data = random_hex(32)
-    ref = reference.execute(
-        "packet_pack",
-        header_type=0,
-        context_flag=0,
-        transport_type=0,
-        destination_type=0,
-        packet_type=0,
-        hops=3,
-        destination_hash=dest,
-        context=0,
-        data=data,
-    )
-    res = sut.execute(
-        "packet_pack",
-        header_type=0,
-        context_flag=0,
-        transport_type=0,
-        destination_type=0,
-        packet_type=0,
-        hops=3,
-        destination_hash=dest,
-        context=0,
-        data=data,
-    )
-    assert_hex_equal(res["raw"], ref["raw"])
-    # Unpack
-    ref_u = reference.execute("packet_unpack", raw=ref["raw"])
-    res_u = sut.execute("packet_unpack", raw=ref["raw"])
-    assert res_u["hops"] == ref_u["hops"]
-    assert_hex_equal(res_u["destination_hash"], ref_u["destination_hash"])
-    assert_hex_equal(res_u["data"], ref_u["data"])
-
-
-@conformance_case(
-    commands=["packet_pack", "packet_unpack"],
-    verifies="RNS packet pack/unpack round-trip for HEADER_2 layout (includes `transport_id` for multi-hop routing): packing is byte-identical and unpacking recovers `hops`, `transport_id`, `destination_hash`, and data",
-)
-def test_packet_pack_unpack_header2(sut, reference):
-    dest = random_hex(16)
-    transport_id = random_hex(16)
-    data = random_hex(32)
-    ref = reference.execute(
-        "packet_pack",
-        header_type=1,
-        context_flag=0,
-        transport_type=1,
-        destination_type=0,
-        packet_type=0,
-        hops=2,
-        destination_hash=dest,
-        transport_id=transport_id,
-        context=0,
-        data=data,
-    )
-    res = sut.execute(
-        "packet_pack",
-        header_type=1,
-        context_flag=0,
-        transport_type=1,
-        destination_type=0,
-        packet_type=0,
-        hops=2,
-        destination_hash=dest,
-        transport_id=transport_id,
-        context=0,
-        data=data,
-    )
-    assert_hex_equal(res["raw"], ref["raw"])
-    # Unpack — HEADER_2 specifically should round-trip transport_id too,
-    # which HEADER_1 (test_packet_pack_unpack_header1) doesn't have.
-    ref_u = reference.execute("packet_unpack", raw=ref["raw"])
-    res_u = sut.execute("packet_unpack", raw=ref["raw"])
-    assert res_u["hops"] == ref_u["hops"]
-    assert_hex_equal(res_u["transport_id"], ref_u["transport_id"])
-    assert_hex_equal(res_u["destination_hash"], ref_u["destination_hash"])
-    assert_hex_equal(res_u["data"], ref_u["data"])
-
-
-@conformance_case(
-    commands=["packet_pack", "packet_parse_header"],
-    verifies="RNS `packet_parse_header` extracts `header_type`, `hops`, `destination_hash`, and context byte-identically from a packed packet",
-)
-def test_packet_parse_header(sut, reference):
-    dest = random_hex(16)
-    data = random_hex(32)
-    ref_pkt = reference.execute(
-        "packet_pack",
-        header_type=0,
-        context_flag=1,
-        transport_type=0,
-        destination_type=2,
-        packet_type=1,
-        hops=5,
-        destination_hash=dest,
-        context=11,
-        data=data,
-    )
-    ref = reference.execute("packet_parse_header", raw=ref_pkt["raw"])
-    res = sut.execute("packet_parse_header", raw=ref_pkt["raw"])
-    assert res["header_type"] == ref["header_type"]
-    assert res["hops"] == ref["hops"]
-    assert_hex_equal(res["destination_hash"], ref["destination_hash"])
-    assert res["context"] == ref["context"]
+    ref_h = reference.execute("packet_hash", raw=ref_built["raw"])
+    res_h = sut.execute("packet_hash", raw=ref_built["raw"])
+    assert_hex_equal(res_h["hash"], ref_h["hash"])
+    # The hash RNS computed at pack-time (via Packet.update_hash inside pack)
+    # must match the hash a receiver gets from unpack — the field name
+    # "hash" on the built result is exactly that.
+    assert_hex_equal(ref_built["hash"], ref_h["hash"])

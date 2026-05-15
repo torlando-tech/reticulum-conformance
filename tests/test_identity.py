@@ -74,19 +74,16 @@ def test_identity_encrypt_decrypt(sut, reference):
     priv = random_hex(64)
     plaintext = random_hex(48)
     ref_id = reference.execute("identity_from_private_key", private_key=priv)
-    identity_hash = ref_id["hash"]
     # Encrypt with reference, decrypt with SUT
     ref_enc = reference.execute(
         "identity_encrypt",
         public_key=ref_id["public_key"],
         plaintext=plaintext,
-        identity_hash=identity_hash,
     )
     res_dec = sut.execute(
         "identity_decrypt",
         private_key=priv,
         ciphertext=ref_enc["ciphertext"],
-        identity_hash=identity_hash,
     )
     assert_hex_equal(res_dec["plaintext"], plaintext)
     # Encrypt with SUT, decrypt with reference
@@ -94,12 +91,38 @@ def test_identity_encrypt_decrypt(sut, reference):
         "identity_encrypt",
         public_key=ref_id["public_key"],
         plaintext=plaintext,
-        identity_hash=identity_hash,
     )
     ref_dec = reference.execute(
         "identity_decrypt",
         private_key=priv,
         ciphertext=res_enc["ciphertext"],
-        identity_hash=identity_hash,
     )
     assert_hex_equal(ref_dec["plaintext"], plaintext)
+
+
+@conformance_case(
+    commands=["identity_from_private_key", "identity_encrypt", "identity_decrypt"],
+    verifies="Invariant: two encryptions of byte-identical plaintext for the same Identity produce different ciphertext (RNS draws a fresh ephemeral X25519 key + AES IV per call), and both still decrypt back to the original",
+)
+def test_identity_encrypt_is_fresh_per_call(sut, reference):
+    priv = random_hex(64)
+    plaintext = random_hex(48)
+    ident = sut.execute("identity_from_private_key", private_key=priv)
+
+    first = sut.execute(
+        "identity_encrypt", public_key=ident["public_key"], plaintext=plaintext
+    )
+    second = sut.execute(
+        "identity_encrypt", public_key=ident["public_key"], plaintext=plaintext
+    )
+    assert first["ciphertext"] != second["ciphertext"], (
+        "two encryptions of identical plaintext produced identical ciphertext "
+        "— the ephemeral key / IV is not fresh per call, which leaks plaintext "
+        "equality to an observer"
+    )
+    # Both must still decrypt back — freshness must not break correctness.
+    for enc in (first, second):
+        dec = sut.execute(
+            "identity_decrypt", private_key=priv, ciphertext=enc["ciphertext"]
+        )
+        assert_hex_equal(dec["plaintext"], plaintext)

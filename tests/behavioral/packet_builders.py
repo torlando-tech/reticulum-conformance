@@ -2,15 +2,15 @@
 Helpers for constructing valid RNS packets from first principles in tests.
 
 Tests inject raw bytes onto MockInterfaces. Those bytes need to parse and
-validate as real RNS packets (correct flags, valid signature, etc). Rather
-than spin up a full RNS instance in the test process, we use the bridge's
-crypto + pack primitives to build them: `identity_sign`, `announce_pack`,
-`packet_pack`, `random_hash`.
-
-This keeps test-side construction purely a byte-level exercise with no state.
+validate as real RNS packets (correct flags, valid signature, etc). The
+helper round-trips through the bridge's honest `announce_build` command,
+which constructs a real RNS.Destination.announce(send=False) inside the
+bridge process — RNS itself produces the wire bytes, signature, and
+random_hash. The behavioral test then patches the `hops` byte in place to
+the value it wants to inject (announce_build always emits hops=0; transport
+behavior tests need to simulate an announce arriving with N hops already).
 """
 
-import hashlib
 import struct
 from typing import Optional
 
@@ -79,84 +79,49 @@ def build_announce_from_destination(
     identity_private_key: bytes,
     app_name: str,
     aspects: list,
-    random_prefix: bytes,
-    emission_ts: int,
+    random_prefix: bytes = b"",   # unused: real Destination.announce generates its own random_hash
+    emission_ts: int = 0,         # unused: real Destination.announce stamps current time
     wire_hops: int = 0,
     context: int = CONTEXT_NONE,
     ratchet: Optional[bytes] = None,
     app_data: bytes = b"",
 ) -> tuple:
-    """Build a signed announce packet by round-tripping through the bridge.
+    """Build a signed announce packet via the bridge's honest announce_build.
+
+    announce_build calls real RNS.Destination.announce(send=False) inside the
+    bridge process — RNS produces the full wire bytes (flags, header,
+    signature, random_hash, ratchet field). We then patch the hops byte
+    in-place so transport-behavior tests can inject an announce that looks
+    like it has already crossed N hops.
 
     Returns (raw_bytes, destination_hash, identity_public_key).
 
-    Bridge commands used:
-      identity_from_private_key -> public_key, identity_hash
-      name_hash                 -> 10-byte name_hash from app_name + aspects
-      destination_hash          -> 16-byte destination_hash
-      identity_sign             -> 64-byte signature
-      announce_pack             -> packed announce_data
-      packet_pack               -> final raw packet bytes
+    The `random_prefix`, `emission_ts`, and `context` parameters are
+    retained for caller compatibility but ignored — RNS owns those.
     """
-    id_info = bridge.execute(
-        "identity_from_private_key",
+    extra = {}
+    if emission_ts:
+        # Pin wall-clock time so callers can build "fresh" and "stale"
+        # announces in the same test run; announce_build monkey-patches
+        # time.time for one call so RNS itself stamps emission_ts into the
+        # random_hash and path-response timestamp.
+        extra["emission_ts"] = int(emission_ts)
+    info = bridge.execute(
+        "announce_build",
         private_key=identity_private_key.hex(),
-    )
-    public_key = bytes.fromhex(id_info["public_key"])
-    identity_hash = bytes.fromhex(id_info["hash"])
-
-    # name_hash = sha256("app_name.aspect1.aspect2…")[:10]
-    # (matches cmd_destination_hash in bridge_server.py)
-    full_name = ".".join([app_name] + list(aspects))
-    name_hash = hashlib.sha256(full_name.encode("utf-8")).digest()[:NAME_HASH_BYTES]
-
-    dest_info = bridge.execute(
-        "destination_hash",
-        identity_hash=identity_hash.hex(),
         app_name=app_name,
-        aspects=list(aspects),  # JSON array — Python accepts list OR string,
-                                # Kotlin bridge only accepts array.
+        aspects=list(aspects),
+        app_data=app_data.hex() if app_data else "",
+        enable_ratchets=ratchet is not None,
+        **extra,
     )
-    destination_hash = bytes.fromhex(dest_info["destination_hash"])
-
-    random_hash = build_random_hash(random_prefix, emission_ts)
-
-    # Signed data: destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-    ratchet_bytes = ratchet if ratchet else b""
-    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet_bytes + app_data
-
-    sig_info = bridge.execute(
-        "identity_sign",
-        private_key=identity_private_key.hex(),
-        message=signed_data.hex(),
-    )
-    signature = bytes.fromhex(sig_info["signature"])
-
-    # Pack announce data via the bridge to match exactly what the bridge expects
-    ann_info = bridge.execute(
-        "announce_pack",
-        public_key=public_key.hex(),
-        name_hash=name_hash.hex(),
-        random_hash=random_hash.hex(),
-        ratchet=ratchet.hex() if ratchet else "",
-        signature=signature.hex(),
-        app_data=app_data.hex(),
-    )
-    announce_data = bytes.fromhex(ann_info["announce_data"])
-
-    # Build raw HEADER_1 packet: [flags][hops][dest_hash][context][data]
-    context_flag = CONTEXT_FLAG_SET if ratchet else CONTEXT_FLAG_UNSET
-    flags = compose_flags(
-        header_type=HEADER_1,
-        context_flag=context_flag,
-        transport_type=TRANSPORT_BROADCAST,
-        destination_type=DESTINATION_TYPE_SINGLE,
-        packet_type=PACKET_TYPE_ANNOUNCE,
-    )
-
-    raw = bytes([flags, wire_hops & 0xFF]) + destination_hash + bytes([context]) + announce_data
-
-    return raw, destination_hash, public_key
+    raw = bytearray(bytes.fromhex(info["raw"]))
+    # announce_build sets hops=0 (real Destination.announce starts at 0); patch
+    # to the value this test wants to simulate.
+    raw[1] = wire_hops & 0xFF
+    destination_hash = bytes.fromhex(info["destination_hash"])
+    public_key = bytes.fromhex(info["public_key"])
+    return bytes(raw), destination_hash, public_key
 
 
 HEADER_1_MIN_SIZE = 2 + TRUNCATED_HASH_BYTES + 1  # flags + hops + dest_hash + ctx = 19

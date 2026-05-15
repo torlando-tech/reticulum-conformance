@@ -689,13 +689,27 @@ def cmd_announce_build(params):
         aspects = []
     app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else None
     enable_ratchets = bool(params.get('enable_ratchets', False))
+    emission_ts = params.get('emission_ts')  # optional: int seconds-since-epoch
 
     identity = RNS.Identity.from_bytes(private_key)
     if identity is None:
         raise ValueError("RNS.Identity.from_bytes rejected the private key")
-    destination = RNS.Destination(
-        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
-    )
+    # Reuse an existing registered destination if the same identity+name has
+    # already been announced through this bridge — RNS raises KeyError
+    # ("Attempt to register an already registered destination") on a second
+    # construction, but real workflows re-announce the same destination
+    # repeatedly. announce_build is called once per test, so the lifetime
+    # match between tests in the same bridge process is identity+name.
+    expected_hash = RNS.Destination.hash(identity, app_name, *aspects)
+    destination = None
+    for existing in RNS.Transport.destinations:
+        if existing.hash == expected_hash:
+            destination = existing
+            break
+    if destination is None:
+        destination = RNS.Destination(
+            identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
+        )
     if enable_ratchets:
         # RNS controls the ratchet lifecycle via Destination.enable_ratchets
         # against a state file; on enable() + the first rotate_ratchets()
@@ -707,7 +721,23 @@ def cmd_announce_build(params):
         ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
         destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
 
-    packet = destination.announce(app_data=app_data, send=False)
+    # An optional `emission_ts` lets a caller pin the announce's wall-clock
+    # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
+    # random_hash and stamps `now = time.time()` on the path response. The
+    # behavioral path-replacement tests rely on this to compare fresh and
+    # stale announces. Rather than synthesise the embed by hand we patch
+    # `time.time` for the duration of one announce() call, so RNS still does
+    # all the real work — it just sees the wall-clock value we pin.
+    import time as _time
+    if emission_ts is not None:
+        _orig_time = _time.time
+        _time.time = lambda: float(emission_ts)
+        try:
+            packet = destination.announce(app_data=app_data, send=False)
+        finally:
+            _time.time = _orig_time
+    else:
+        packet = destination.announce(app_data=app_data, send=False)
     packet.pack()
     raw = packet.raw
 

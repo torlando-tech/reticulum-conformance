@@ -318,6 +318,83 @@ class _WirePeer:
         )
         return bool(resp.get("found"))
 
+    def register_request_handler(
+        self, destination_hash: bytes, path: str, response: bytes,
+    ) -> None:
+        """Register a fixed-response request handler on a listening
+        destination — the bridge plugs in a generator that returns the
+        given bytes when a request for `path` arrives.
+        """
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_register_request_handler",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            path=path,
+            response=response.hex(),
+        )
+
+    def link_request(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """Issue link.request over an established outbound link and
+        wait for the response. Returns {status, response, response_time_s}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_request",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            path=path,
+            data=data.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def get_request_log(self, destination_hash: bytes, path: str) -> list:
+        """Drain the handler-invocation log for (destination, path).
+
+        Returns the list of recorded invocations; each entry holds the
+        request data + link_id + remote_identity_hash + requested_at the
+        handler observed. Used by tests to verify the handler fired with
+        the expected request data.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_get_request_log",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            path=path,
+        )
+        return list(resp.get("entries", []))
+
+    def identity_recall(
+        self, destination_hash: bytes, timeout_ms: int = 5000,
+    ) -> dict | None:
+        """Look up the Identity associated with a destination hash.
+
+        Returns a dict {public_key, hash} when this peer has received
+        an announce for the destination, or None when unknown. Optional
+        timeout polls Transport state — without it, the call returns
+        immediately based on the current known_destinations table.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_identity_recall",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        if not resp.get("found"):
+            return None
+        return {
+            "public_key": bytes.fromhex(resp["public_key"]),
+            "hash": bytes.fromhex(resp["hash"]),
+        }
+
     def listen(self, app_name: str, aspects: list) -> bytes:
         """Register an IN destination that accepts incoming Links."""
         assert self.handle, "start_* must be called first"

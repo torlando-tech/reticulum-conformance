@@ -611,6 +611,50 @@ def cmd_wire_poll_path(params):
     return {"found": False, "hops": None}
 
 
+def cmd_wire_identity_recall(params):
+    """Recall an Identity by destination hash from this instance's
+    received-announces table.
+
+    Delegates to real RNS.Identity.recall — the same static method apps
+    (Columba's NomadNet browser, Sideband's conversation lookup, LXMF's
+    LXMessage source/destination resolution) call after observing an
+    announce. Returns the recalled identity's public_key (and hash) when
+    found, or {found: False} when the destination hash is unknown to this
+    instance (no announce received).
+
+    Optionally polls Transport.has_path first, so the test can express
+    "wait until the announce has been received, then recall." Without the
+    poll the caller would have to sleep on raw timing.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    target_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 0))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    identity = None
+    while True:
+        identity = RNS.Identity.recall(target_hash)
+        if identity is not None:
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.05)
+
+    if identity is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "public_key": identity.get_public_key().hex(),
+        "hash": identity.hash.hex(),
+    }
+
+
 def cmd_wire_listen(params):
     """Register an IN SINGLE destination that accepts incoming Links.
 
@@ -963,6 +1007,155 @@ def cmd_wire_resource_poll(params):
         out = [p.hex() for p in listener["resource_buffer"]]
         listener["resource_buffer"].clear()
     return {"resources": out}
+
+
+def _find_destination_by_hash(inst, dest_hash):
+    """Linear scan inst["destinations"] for a destination matching hash.
+
+    The destinations list holds (identity, destination) tuples (see
+    cmd_wire_listen). Tests rarely register more than a handful of
+    destinations per peer, so a scan is fine.
+    """
+    for _identity, destination in inst.get("destinations", []):
+        if destination.hash == dest_hash:
+            return destination
+    return None
+
+
+# Per-(handle, dest_hash, path) request handler state. The fixed response
+# bytes the generator returns, plus a log of invocations so tests can
+# verify the handler ran with the expected request data.
+_request_handler_responses = {}
+_request_handler_log = {}
+
+
+def cmd_wire_register_request_handler(params):
+    """Register a Destination request handler that returns fixed bytes.
+
+    Delegates to real RNS.Destination.register_request_handler. The handler
+    receives a real RNS request invocation (path, data, request_id,
+    link_id, remote_identity, requested_at) from the real Link request
+    machinery — we just plug in a generator that returns the test-supplied
+    response and records the invocation for later assertion.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    path = params["path"]
+    response = bytes.fromhex(params["response"]) if params.get("response") else b""
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on "
+            f"handle {handle}; call wire_listen first."
+        )
+
+    key = (handle, dest_hash, path)
+    _request_handler_responses[key] = response
+    _request_handler_log.setdefault(key, [])
+
+    def _generator(req_path, data, request_id, link_id, remote_identity, requested_at):
+        _request_handler_log[key].append({
+            "data": data if isinstance(data, (bytes, bytearray)) else b"",
+            "request_id": request_id,
+            "link_id": link_id,
+            "remote_identity_hash": getattr(remote_identity, "hash", None),
+            "requested_at": requested_at,
+        })
+        return _request_handler_responses[key]
+
+    destination.register_request_handler(
+        path, response_generator=_generator, allow=RNS.Destination.ALLOW_ALL,
+    )
+    return {"registered": True}
+
+
+def cmd_wire_link_request(params):
+    """Issue a request over an established outbound Link, wait for the
+    response, return it.
+
+    Delegates to real RNS.Link.request. Polls RequestReceipt.get_status()
+    until READY (response back), FAILED, or timeout. Returns the response
+    bytes on success.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    path = params["path"]
+    data = bytes.fromhex(params["data"]) if params.get("data") else None
+    timeout_ms = int(params.get("timeout_ms", 10000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    timeout_s = timeout_ms / 1000.0
+    receipt = link.request(path, data=data, timeout=timeout_s)
+    # +0.5s slack so the receipt's own internal timeout fires first if
+    # the network really stalled — that gives us the FAILED status
+    # rather than our own poll-loop timeout returning ambiguous results.
+    deadline = time.time() + timeout_s + 0.5
+    while time.time() < deadline:
+        status = receipt.get_status()
+        if status == RNS.RequestReceipt.READY:
+            response = receipt.get_response()
+            return {
+                "status": "ready",
+                "response": (
+                    response.hex() if isinstance(response, (bytes, bytearray)) else None
+                ),
+                "response_time_s": receipt.get_response_time(),
+            }
+        if status == RNS.RequestReceipt.FAILED:
+            return {"status": "failed", "response": None}
+        time.sleep(0.05)
+    return {"status": "timeout", "response": None}
+
+
+def cmd_wire_get_request_log(params):
+    """Drain the request-handler invocation log for a (destination, path).
+
+    Returns one entry per request that arrived at the handler — used by
+    tests to assert "the handler fired with the expected data."
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    path = params["path"]
+    key = (handle, dest_hash, path)
+    entries = _request_handler_log.get(key, [])
+    return {
+        "count": len(entries),
+        "entries": [
+            {
+                "data": (e["data"].hex() if isinstance(e["data"], (bytes, bytearray)) else ""),
+                "request_id": (
+                    e["request_id"].hex()
+                    if isinstance(e["request_id"], (bytes, bytearray)) else None
+                ),
+                "link_id": (
+                    e["link_id"].hex()
+                    if isinstance(e["link_id"], (bytes, bytearray)) else None
+                ),
+                "remote_identity_hash": (
+                    e["remote_identity_hash"].hex()
+                    if isinstance(e["remote_identity_hash"], (bytes, bytearray)) else None
+                ),
+                "requested_at": e["requested_at"],
+            }
+            for e in entries
+        ],
+    }
 
 
 def cmd_wire_link_poll(params):
@@ -1339,6 +1532,10 @@ WIRE_COMMANDS = {
     "wire_read_announce_table_timestamp": cmd_wire_read_announce_table_timestamp,
     "wire_tx_bytes": cmd_wire_tx_bytes,
     "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
+    "wire_identity_recall": cmd_wire_identity_recall,
+    "wire_register_request_handler": cmd_wire_register_request_handler,
+    "wire_link_request": cmd_wire_link_request,
+    "wire_get_request_log": cmd_wire_get_request_log,
     "wire_listen": cmd_wire_listen,
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,

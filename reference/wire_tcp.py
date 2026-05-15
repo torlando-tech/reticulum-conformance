@@ -1037,12 +1037,20 @@ def cmd_wire_register_request_handler(params):
     link_id, remote_identity, requested_at) from the real Link request
     machinery — we just plug in a generator that returns the test-supplied
     response and records the invocation for later assertion.
+
+    Optional auth policy: pass `allow` as "all" (default) or "list" plus
+    `allowed_identity_hashes` (list of hex strings). RNS rejects requests
+    from un-listed identities before the generator runs — the invocation
+    log will not record those, which is exactly what the ALLOW_LIST
+    negative-control test asserts.
     """
     RNS = _get_rns()
     handle = params["handle"]
     dest_hash = bytes.fromhex(params["destination_hash"])
     path = params["path"]
     response = bytes.fromhex(params["response"]) if params.get("response") else b""
+    allow_param = params.get("allow", "all")
+    allowed_list_hex = params.get("allowed_identity_hashes", []) or []
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -1055,6 +1063,15 @@ def cmd_wire_register_request_handler(params):
             f"No registered destination with hash {dest_hash.hex()} on "
             f"handle {handle}; call wire_listen first."
         )
+
+    if allow_param == "all":
+        allow = RNS.Destination.ALLOW_ALL
+        allowed_list = None
+    elif allow_param == "list":
+        allow = RNS.Destination.ALLOW_LIST
+        allowed_list = [bytes.fromhex(h) for h in allowed_list_hex]
+    else:
+        raise ValueError(f"unsupported allow: {allow_param!r} (use 'all' or 'list')")
 
     key = (handle, dest_hash, path)
     _request_handler_responses[key] = response
@@ -1071,9 +1088,37 @@ def cmd_wire_register_request_handler(params):
         return _request_handler_responses[key]
 
     destination.register_request_handler(
-        path, response_generator=_generator, allow=RNS.Destination.ALLOW_ALL,
+        path, response_generator=_generator, allow=allow, allowed_list=allowed_list,
     )
     return {"registered": True}
+
+
+def cmd_wire_link_identify(params):
+    """Identify the link initiator to the remote peer via real
+    RNS.Link.identify. Required for ALLOW_LIST request handlers — the
+    handler's remote_identity argument is None unless the requester
+    identifies first. This is the path LXMF's lxmd uses for
+    propagation-node sync (identity-gated request handlers).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    private_key = bytes.fromhex(params["private_key"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    link.identify(identity)
+    return {"identified": True, "identity_hash": identity.hash.hex()}
 
 
 def cmd_wire_link_request(params):
@@ -1534,6 +1579,7 @@ WIRE_COMMANDS = {
     "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
     "wire_identity_recall": cmd_wire_identity_recall,
     "wire_register_request_handler": cmd_wire_register_request_handler,
+    "wire_link_identify": cmd_wire_link_identify,
     "wire_link_request": cmd_wire_link_request,
     "wire_get_request_log": cmd_wire_get_request_log,
     "wire_listen": cmd_wire_listen,

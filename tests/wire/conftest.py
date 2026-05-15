@@ -319,20 +319,50 @@ class _WirePeer:
         return bool(resp.get("found"))
 
     def register_request_handler(
-        self, destination_hash: bytes, path: str, response: bytes,
+        self,
+        destination_hash: bytes,
+        path: str,
+        response: bytes,
+        allow: str = "all",
+        allowed_identity_hashes: list | None = None,
     ) -> None:
         """Register a fixed-response request handler on a listening
         destination — the bridge plugs in a generator that returns the
         given bytes when a request for `path` arrives.
+
+        `allow="list"` plus `allowed_identity_hashes=[<16-byte hash>, ...]`
+        gates the handler on the requester's identified Identity, mirroring
+        the LXMF lxmd SYNC_REQUEST_PATH authentication model.
         """
         assert self.handle, "start_* must be called first"
-        self.bridge.execute(
-            "wire_register_request_handler",
+        params = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "path": path,
+            "response": response.hex(),
+            "allow": allow,
+        }
+        if allowed_identity_hashes:
+            params["allowed_identity_hashes"] = [
+                h.hex() if isinstance(h, (bytes, bytearray)) else str(h)
+                for h in allowed_identity_hashes
+            ]
+        self.bridge.execute("wire_register_request_handler", **params)
+
+    def link_identify(self, link_id: bytes, private_key: bytes) -> bytes:
+        """Identify the link initiator to the remote peer.
+
+        Returns the identity_hash (16 bytes) that the remote sees on the
+        request handler's `remote_identity` argument.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_link_identify",
             handle=self.handle,
-            destination_hash=destination_hash.hex(),
-            path=path,
-            response=response.hex(),
+            link_id=link_id.hex(),
+            private_key=private_key.hex(),
         )
+        return bytes.fromhex(resp["identity_hash"])
 
     def link_request(
         self,

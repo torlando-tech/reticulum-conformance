@@ -459,6 +459,49 @@ def cmd_identity_hash(params):
     return {'hash': bytes_to_hex(identity.hash)}
 
 
+def cmd_identity_to_file(params):
+    """Persist an Identity (from 64-byte private key) to a temp file on
+    disk via real RNS.Identity.to_file, and return the path.
+
+    Delegates straight to RNS.Identity.from_bytes(...).to_file(...) —
+    no hand-rolled file format. The path is in a per-bridge tempdir so
+    repeated calls don't collide. Tests pair this with identity_from_file
+    to round-trip the on-disk identity format Sideband + other apps use.
+    """
+    import tempfile
+    RNS = _get_full_rns()
+    private_key = hex_to_bytes(params['private_key'])
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    path = tempfile.NamedTemporaryFile(
+        prefix='conformance_identity_', suffix='.bin', delete=False
+    ).name
+    if not identity.to_file(path):
+        raise IOError(f"RNS.Identity.to_file returned False for path {path}")
+    return {'path': path}
+
+
+def cmd_identity_from_file(params):
+    """Load an Identity from a file on disk via real RNS.Identity.from_file.
+
+    Returns the recovered identity's public_key + hash + hexhash on
+    success, or {found: False} when from_file returns None (corrupt /
+    invalid file).
+    """
+    RNS = _get_full_rns()
+    path = params['path']
+    identity = RNS.Identity.from_file(path)
+    if identity is None:
+        return {'found': False}
+    return {
+        'found': True,
+        'public_key': bytes_to_hex(identity.get_public_key()),
+        'hash': bytes_to_hex(identity.hash),
+        'hexhash': identity.hexhash,
+    }
+
+
 def cmd_destination_hash(params):
     """Compute the 16-byte destination address for an identity + app_name +
     aspects.
@@ -1873,6 +1916,8 @@ COMMANDS = {
     'identity_sign': cmd_identity_sign,
     'identity_verify': cmd_identity_verify,
     'identity_hash': cmd_identity_hash,
+    'identity_to_file': cmd_identity_to_file,
+    'identity_from_file': cmd_identity_from_file,
     'destination_hash': cmd_destination_hash,
     'truncated_hash': cmd_truncated_hash,
     'name_hash': cmd_name_hash,

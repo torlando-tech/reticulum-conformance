@@ -493,21 +493,21 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <h2>Categories</h2>
 <ol>
 <li><a href="#cat-1">1. Cryptographic Primitives<span class="count">15</span></a></li>
-<li><a href="#cat-2">2. Identity<span class="count">5</span></a></li>
+<li><a href="#cat-2">2. Identity<span class="count">8</span></a></li>
 <li><a href="#cat-3">3. Token Encryption<span class="count">4</span></a></li>
 <li><a href="#cat-4">4. Destination<span class="count">2</span></a></li>
 <li><a href="#cat-5">5. Packet<span class="count">5</span></a></li>
 <li><a href="#cat-6">6. Announce<span class="count">5</span></a></li>
 <li><a href="#cat-7">7. Ratchet<span class="count">4</span></a></li>
 <li><a href="#cat-8">8. Compression<span class="count">3</span></a></li>
-<li><a href="#cat-9">9. Wire Interop<span class="count">28</span></a></li>
+<li><a href="#cat-9">9. Wire Interop<span class="count">31</span></a></li>
 <li><a href="#cat-10">10. Transport Behavior<span class="count">3</span></a></li>
 </ol>
 </aside>
 <main>
 <header class="page">
 <h1>Conformance Test Cases</h1>
-<div class="stats">74 tests across 10 categories · click any row to view the test source, its fixtures, and the rest of the module · generated from <code>@conformance_case</code> decorators</div>
+<div class="stats">80 tests across 10 categories · click any row to view the test source, its fixtures, and the rest of the module · generated from <code>@conformance_case</code> decorators</div>
 </header>
 <div class="filter-bar">
 <input id="filter" type="search" autocomplete="off" placeholder="Filter tests by name, command, or description" aria-label="Filter tests">
@@ -1080,7 +1080,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 </div>
 </div>
 </details>
-<details class="category" id="cat-2" open><summary>2. Identity<span class="count">5 tests</span></summary>
+<details class="category" id="cat-2" open><summary>2. Identity<span class="count">8 tests</span></summary>
 <div class="file-section">
 <div class="file-label">File: <code>tests/test_identity.py</code> · 5 tests</div>
 <div class="tests-list">
@@ -1302,6 +1302,179 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">signing/verification, and encrypt/decrypt by comparing SUT output</span>
 <span class="sd">against a reference implementation.</span>
 <span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span><span class="p">,</span> <span class="n">assert_hex_equal</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Identity&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">2</span>
+</code></pre></details></div></details>
+</div>
+</div>
+<div class="file-section">
+<div class="file-label">File: <code>tests/test_identity_persistence.py</code> · 3 tests</div>
+<div class="tests-list">
+<div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
+<details class="test-detail" id="t-2-6" data-search="test_identity_to_file_from_file_round_trip identity_from_private_key identity_to_file identity_from_file rns.identity round-trips through the on-disk file format (raw 64-byte private key) via to_file -&gt; from_file with byte-identical public_key + hash on the reloaded identity. catches an impl whose to_file / from_file disagree on byte layout (sideband&#x27;s identity-on-disk format)."><summary><span class="col num">2.6</span><span class="col name"><code>test_identity_to_file_from_file_round_trip</code></span><span class="col cmds"><span class="cmd-chip">identity_from_private_key</span><span class="cmd-chip">identity_to_file</span><span class="cmd-chip">identity_from_file</span></span><span class="col ver">RNS.Identity round-trips through the on-disk file format (raw 64-byte private key) via to_file -&gt; from_file with byte-identical public_key + hash on the reloaded Identity. Catches an impl whose to_file / from_file disagree on byte layout (Sideband&#x27;s identity-on-disk format).</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/test_identity_persistence.py</code></span><a href="#t-2-6">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_identity_to_file_from_file_round_trip</span><span class="p">(</span><span class="n">sut</span><span class="p">,</span> <span class="n">reference</span><span class="p">):</span>
+    <span class="n">priv</span> <span class="o">=</span> <span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span>
+    <span class="n">expected</span> <span class="o">=</span> <span class="n">reference</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_from_private_key&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">priv</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">impl</span><span class="p">,</span> <span class="n">label</span> <span class="ow">in</span> <span class="p">((</span><span class="n">reference</span><span class="p">,</span> <span class="s2">&quot;reference&quot;</span><span class="p">),</span> <span class="p">(</span><span class="n">sut</span><span class="p">,</span> <span class="s2">&quot;sut&quot;</span><span class="p">)):</span>
+        <span class="n">written</span> <span class="o">=</span> <span class="n">impl</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_to_file&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">priv</span><span class="p">)</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="n">written</span><span class="p">[</span><span class="s2">&quot;path&quot;</span><span class="p">]</span>
+        <span class="n">loaded</span> <span class="o">=</span> <span class="n">impl</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_from_file&quot;</span><span class="p">,</span> <span class="n">path</span><span class="o">=</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">loaded</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">.identity_from_file(</span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">) reported not-found despite &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;to_file having just written the identity there&quot;</span>
+        <span class="p">)</span>
+        <span class="n">assert_hex_equal</span><span class="p">(</span><span class="n">loaded</span><span class="p">[</span><span class="s2">&quot;public_key&quot;</span><span class="p">],</span> <span class="n">expected</span><span class="p">[</span><span class="s2">&quot;public_key&quot;</span><span class="p">])</span>
+        <span class="n">assert_hex_equal</span><span class="p">(</span><span class="n">loaded</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">],</span> <span class="n">expected</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">])</span>
+        <span class="k">assert</span> <span class="n">loaded</span><span class="p">[</span><span class="s2">&quot;hexhash&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="n">expected</span><span class="p">[</span><span class="s2">&quot;hexhash&quot;</span><span class="p">]</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>sut</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">sut</span><span class="p">(</span><span class="n">sut_impl</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Alias for sut_impl to use in tests.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">sut_impl</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>reference</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span><span class="p">(</span><span class="n">scope</span><span class="o">=</span><span class="s2">&quot;session&quot;</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">reference</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Reference implementation bridge (Python RNS).&quot;&quot;&quot;</span>
+    <span class="n">cmd</span> <span class="o">=</span> <span class="n">resolve_command</span><span class="p">(</span><span class="s2">&quot;reference&quot;</span><span class="p">)</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;PYTHON_RNS_PATH&quot;</span><span class="p">:</span> <span class="n">resolve_rns_path</span><span class="p">(),</span>
+    <span class="p">}</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">)</span>
+    <span class="k">yield</span> <span class="n">client</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/test_identity_persistence.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Identity persistence conformance.</span>
+
+<span class="sd">Apps store their RNS Identity on disk so it survives restarts: Sideband&#39;s</span>
+<span class="sd">``core.py`` calls ``Identity.from_file`` to load the persisted identity on</span>
+<span class="sd">startup. The on-disk format is the 64-byte raw private key (X25519 + Ed25519</span>
+<span class="sd">halves); ``RNS.Identity.to_file`` writes it, ``RNS.Identity.from_file``</span>
+<span class="sd">reads it. Any mismatch in format would break every Sideband install.</span>
+
+<span class="sd">Honest test: build a real Identity from a known private key, write it via</span>
+<span class="sd">to_file, read it back via from_file, assert the recovered identity has the</span>
+<span class="sd">same public_key + hash. Cross-impl proof of agreement on the on-disk byte</span>
+<span class="sd">format.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span><span class="p">,</span> <span class="n">assert_hex_equal</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Identity&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">2</span>
+</code></pre></details></div></details>
+<details class="test-detail" id="t-2-7" data-search="test_identity_file_format_cross_impl identity_to_file identity_from_file cross-impl on-disk format: an identity written by either impl can be loaded by the other with byte-identical public_key + hash. the 64-byte raw private key on disk is the interop contract between python lxmf / sideband and any cross-impl reload path."><summary><span class="col num">2.7</span><span class="col name"><code>test_identity_file_format_cross_impl</code></span><span class="col cmds"><span class="cmd-chip">identity_to_file</span><span class="cmd-chip">identity_from_file</span></span><span class="col ver">Cross-impl on-disk format: an identity written by either impl can be loaded by the other with byte-identical public_key + hash. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path.</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/test_identity_persistence.py</code></span><a href="#t-2-7">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_identity_file_format_cross_impl</span><span class="p">(</span><span class="n">sut</span><span class="p">,</span> <span class="n">reference</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Reference writes -&gt; SUT reads, and SUT writes -&gt; reference reads.&quot;&quot;&quot;</span>
+    <span class="n">priv</span> <span class="o">=</span> <span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span>
+
+    <span class="n">written_by_ref</span> <span class="o">=</span> <span class="n">reference</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_to_file&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">priv</span><span class="p">)</span>
+    <span class="n">loaded_by_sut</span> <span class="o">=</span> <span class="n">sut</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_from_file&quot;</span><span class="p">,</span> <span class="n">path</span><span class="o">=</span><span class="n">written_by_ref</span><span class="p">[</span><span class="s2">&quot;path&quot;</span><span class="p">])</span>
+    <span class="k">assert</span> <span class="n">loaded_by_sut</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;SUT could not load a file written by reference at &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">written_by_ref</span><span class="p">[</span><span class="s1">&#39;path&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+
+    <span class="n">written_by_sut</span> <span class="o">=</span> <span class="n">sut</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_to_file&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">priv</span><span class="p">)</span>
+    <span class="n">loaded_by_ref</span> <span class="o">=</span> <span class="n">reference</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_from_file&quot;</span><span class="p">,</span> <span class="n">path</span><span class="o">=</span><span class="n">written_by_sut</span><span class="p">[</span><span class="s2">&quot;path&quot;</span><span class="p">])</span>
+    <span class="k">assert</span> <span class="n">loaded_by_ref</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;reference could not load a file written by SUT at &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">written_by_sut</span><span class="p">[</span><span class="s1">&#39;path&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># Both reload paths must surface the same public key + hash (they were</span>
+    <span class="c1"># derived from the same 64-byte private key, so deterministic).</span>
+    <span class="n">assert_hex_equal</span><span class="p">(</span><span class="n">loaded_by_sut</span><span class="p">[</span><span class="s2">&quot;public_key&quot;</span><span class="p">],</span> <span class="n">loaded_by_ref</span><span class="p">[</span><span class="s2">&quot;public_key&quot;</span><span class="p">])</span>
+    <span class="n">assert_hex_equal</span><span class="p">(</span><span class="n">loaded_by_sut</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">],</span> <span class="n">loaded_by_ref</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">])</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>sut</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">sut</span><span class="p">(</span><span class="n">sut_impl</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Alias for sut_impl to use in tests.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">sut_impl</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>reference</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span><span class="p">(</span><span class="n">scope</span><span class="o">=</span><span class="s2">&quot;session&quot;</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">reference</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Reference implementation bridge (Python RNS).&quot;&quot;&quot;</span>
+    <span class="n">cmd</span> <span class="o">=</span> <span class="n">resolve_command</span><span class="p">(</span><span class="s2">&quot;reference&quot;</span><span class="p">)</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;PYTHON_RNS_PATH&quot;</span><span class="p">:</span> <span class="n">resolve_rns_path</span><span class="p">(),</span>
+    <span class="p">}</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">)</span>
+    <span class="k">yield</span> <span class="n">client</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/test_identity_persistence.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Identity persistence conformance.</span>
+
+<span class="sd">Apps store their RNS Identity on disk so it survives restarts: Sideband&#39;s</span>
+<span class="sd">``core.py`` calls ``Identity.from_file`` to load the persisted identity on</span>
+<span class="sd">startup. The on-disk format is the 64-byte raw private key (X25519 + Ed25519</span>
+<span class="sd">halves); ``RNS.Identity.to_file`` writes it, ``RNS.Identity.from_file``</span>
+<span class="sd">reads it. Any mismatch in format would break every Sideband install.</span>
+
+<span class="sd">Honest test: build a real Identity from a known private key, write it via</span>
+<span class="sd">to_file, read it back via from_file, assert the recovered identity has the</span>
+<span class="sd">same public_key + hash. Cross-impl proof of agreement on the on-disk byte</span>
+<span class="sd">format.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span><span class="p">,</span> <span class="n">assert_hex_equal</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Identity&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">2</span>
+</code></pre></details></div></details>
+<details class="test-detail" id="t-2-8" data-search="test_identity_from_file_missing_path identity_from_file negative control: identity_from_file on a non-existent path returns found=false (or on python&#x27;s rns, raises which the bridge surfaces as an error). catches an impl that silently fabricates an identity for a missing file — a vector for accidentally generating fresh keys on every boot."><summary><span class="col num">2.8</span><span class="col name"><code>test_identity_from_file_missing_path</code></span><span class="col cmds"><span class="cmd-chip">identity_from_file</span></span><span class="col ver">Negative control: identity_from_file on a non-existent path returns found=False (or on Python&#x27;s RNS, raises which the bridge surfaces as an error). Catches an impl that silently fabricates an Identity for a missing file — a vector for accidentally generating fresh keys on every boot.</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/test_identity_persistence.py</code></span><a href="#t-2-8">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_identity_from_file_missing_path</span><span class="p">(</span><span class="n">sut</span><span class="p">,</span> <span class="n">reference</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A path that does not exist must NOT yield a valid Identity.&quot;&quot;&quot;</span>
+    <span class="c1"># /tmp/&lt;random&gt;.nonexistent is virtually guaranteed not to exist.</span>
+    <span class="n">bogus_path</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;/tmp/conformance_nonexistent_</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span><span class="si">}</span><span class="s2">.bin&quot;</span>
+    <span class="k">for</span> <span class="n">impl</span><span class="p">,</span> <span class="n">label</span> <span class="ow">in</span> <span class="p">((</span><span class="n">reference</span><span class="p">,</span> <span class="s2">&quot;reference&quot;</span><span class="p">),</span> <span class="p">(</span><span class="n">sut</span><span class="p">,</span> <span class="s2">&quot;sut&quot;</span><span class="p">)):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">res</span> <span class="o">=</span> <span class="n">impl</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;identity_from_file&quot;</span><span class="p">,</span> <span class="n">path</span><span class="o">=</span><span class="n">bogus_path</span><span class="p">)</span>
+            <span class="c1"># Some impls return found=False; some surface an error via the</span>
+            <span class="c1"># bridge — both are acceptable, what&#39;s NOT acceptable is</span>
+            <span class="c1"># silently returning a fabricated Identity.</span>
+            <span class="k">assert</span> <span class="n">res</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;found&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">,</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">.identity_from_file(</span><span class="si">{</span><span class="n">bogus_path</span><span class="si">!r}</span><span class="s2">) returned a &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;non-None identity for a missing file: </span><span class="si">{</span><span class="n">res</span><span class="si">!r}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+            <span class="c1"># Surfaced as an error — also acceptable (the bridge raised</span>
+            <span class="c1"># because RNS itself raised). The wrong behavior is silent</span>
+            <span class="c1"># success, not loud failure.</span>
+            <span class="k">pass</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>sut</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">sut</span><span class="p">(</span><span class="n">sut_impl</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Alias for sut_impl to use in tests.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">sut_impl</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>reference</code><code>conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span><span class="p">(</span><span class="n">scope</span><span class="o">=</span><span class="s2">&quot;session&quot;</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">reference</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Reference implementation bridge (Python RNS).&quot;&quot;&quot;</span>
+    <span class="n">cmd</span> <span class="o">=</span> <span class="n">resolve_command</span><span class="p">(</span><span class="s2">&quot;reference&quot;</span><span class="p">)</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;PYTHON_RNS_PATH&quot;</span><span class="p">:</span> <span class="n">resolve_rns_path</span><span class="p">(),</span>
+    <span class="p">}</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">)</span>
+    <span class="k">yield</span> <span class="n">client</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/test_identity_persistence.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Identity persistence conformance.</span>
+
+<span class="sd">Apps store their RNS Identity on disk so it survives restarts: Sideband&#39;s</span>
+<span class="sd">``core.py`` calls ``Identity.from_file`` to load the persisted identity on</span>
+<span class="sd">startup. The on-disk format is the 64-byte raw private key (X25519 + Ed25519</span>
+<span class="sd">halves); ``RNS.Identity.to_file`` writes it, ``RNS.Identity.from_file``</span>
+<span class="sd">reads it. Any mismatch in format would break every Sideband install.</span>
+
+<span class="sd">Honest test: build a real Identity from a known private key, write it via</span>
+<span class="sd">to_file, read it back via from_file, assert the recovered identity has the</span>
+<span class="sd">same public_key + hash. Cross-impl proof of agreement on the on-disk byte</span>
+<span class="sd">format.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span><span class="p">,</span> <span class="n">assert_hex_equal</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
@@ -2610,7 +2783,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 </div>
 </div>
 </details>
-<details class="category" id="cat-9" open><summary>9. Wire Interop<span class="count">28 tests</span></summary>
+<details class="category" id="cat-9" open><summary>9. Wire Interop<span class="count">31 tests</span></summary>
 <div class="file-section">
 <div class="file-label">File: <code>tests/wire/test_announce_burst_throttle.py</code> · 1 test</div>
 <div class="tests-list">
@@ -3827,10 +4000,418 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 </div>
 </div>
 <div class="file-section">
+<div class="file-label">File: <code>tests/wire/test_link_identify.py</code> · 3 tests</div>
+<div class="tests-list">
+<div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
+<details class="test-detail" id="t-9-10" data-search="test_identified_request_surfaces_remote_identity start_tcp_server start_tcp_client listen link_open register_request_handler link_identify link_request get_request_log allow_all request handler observes a non-none remote_identity when the requester called link.identify first — the field handlers gate auth on. an impl that drops remote_identity through the request pipeline breaks every allow_list handler (lxmf lxmd propagation sync etc.)"><summary><span class="col num">9.10</span><span class="col name"><code>test_identified_request_surfaces_remote_identity</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">register_request_handler</span><span class="cmd-chip">link_identify</span><span class="cmd-chip">link_request</span><span class="cmd-chip">get_request_log</span></span><span class="col ver">ALLOW_ALL request handler observes a non-None remote_identity when the requester called Link.identify first — the field handlers gate auth on. An impl that drops remote_identity through the request pipeline breaks every ALLOW_LIST handler (LXMF lxmd propagation sync etc.)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_identify.py</code></span><a href="#t-9-10">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_identified_request_surfaces_remote_identity</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+    <span class="n">server</span><span class="p">,</span> <span class="n">client</span> <span class="o">=</span> <span class="n">wire_peers</span>
+    <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span> <span class="o">=</span> <span class="n">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">)</span>
+    <span class="n">response_payload</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">32</span><span class="p">)</span>
+    <span class="n">server</span><span class="o">.</span><span class="n">register_request_handler</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">response_payload</span><span class="p">,</span> <span class="n">allow</span><span class="o">=</span><span class="s2">&quot;all&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Identify the link initiator BEFORE requesting. The handler&#39;s</span>
+    <span class="c1"># remote_identity is None for an un-identified requester.</span>
+    <span class="n">client_priv</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">))</span>
+    <span class="n">client_identity_hash</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_identify</span><span class="p">(</span><span class="n">link_id</span><span class="p">,</span> <span class="n">client_priv</span><span class="p">)</span>
+
+    <span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_request</span><span class="p">(</span>
+        <span class="n">link_id</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_REQUEST_TIMEOUT_MS</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">result</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;ready&quot;</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;identified link.request did not complete READY: status=&quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">result</span><span class="p">[</span><span class="s1">&#39;status&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, response=</span><span class="si">{</span><span class="n">result</span><span class="p">[</span><span class="s1">&#39;response&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="n">entries</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">get_request_log</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;expected exactly 1 handler invocation, got </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="n">observed_hash</span> <span class="o">=</span> <span class="n">entries</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;remote_identity_hash&quot;</span><span class="p">]</span>
+    <span class="k">assert</span> <span class="n">observed_hash</span> <span class="o">==</span> <span class="n">client_identity_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;handler observed remote_identity_hash=</span><span class="si">{</span><span class="n">observed_hash</span><span class="si">!r}</span><span class="s2">, &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;expected </span><span class="si">{</span><span class="n">client_identity_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span><span class="si">!r}</span><span class="s2"> (the requester&#39;s &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;identified identity). An impl that loses remote_identity &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;on identified requests breaks ALLOW_LIST auth.&quot;</span>
+    <span class="p">)</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>wire_peers</code><code>tests/wire/conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">wire_peers</span><span class="p">(</span><span class="n">wire_pair</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Two freshly-spawned bridge subprocesses, one server-role, one client-role.</span>
+
+<span class="sd">    Yields (server, client) as `_WirePeer` objects. Caller is responsible for</span>
+<span class="sd">    calling `server.start_tcp_server(...)` and `client.start_tcp_client(...)`</span>
+<span class="sd">    with the port the server returns. Both bridges are torn down in the</span>
+<span class="sd">    fixture finalizer regardless of whether the test raised.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">server_impl</span><span class="p">,</span> <span class="n">client_impl</span> <span class="o">=</span> <span class="n">wire_pair</span>
+    <span class="n">server_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">server_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">server_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">client_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">client_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">client_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">server</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;server(</span><span class="si">{</span><span class="n">server_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">client_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;client(</span><span class="si">{</span><span class="n">client_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">server</span><span class="p">,</span> <span class="n">client</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># Stop both peers before tearing down the pipe — mirrors the</span>
+        <span class="c1"># behavioral fixture pattern so an in-process teardown hook on</span>
+        <span class="c1"># the bridge side (e.g. Reticulum.stop) gets a chance to run</span>
+        <span class="c1"># cleanly before its stdin closes.</span>
+        <span class="k">for</span> <span class="n">peer</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">peer</span><span class="o">.</span><span class="n">stop</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+        <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">client_bridge</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/wire/test_link_identify.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Link.identify + ALLOW_LIST request handler conformance.</span>
+
+<span class="sd">RNS Link request handlers support an authentication policy:</span>
+<span class="sd">``Destination.ALLOW_ALL`` (any requester, default) or</span>
+<span class="sd">``Destination.ALLOW_LIST`` (only identities in a fixed allow-list). The</span>
+<span class="sd">requester opts into being identified by calling ``Link.identify(identity)``</span>
+<span class="sd">after the link is up — the remote then sees the requester&#39;s Identity on</span>
+<span class="sd">the handler&#39;s ``remote_identity`` argument.</span>
+
+<span class="sd">This is the path LXMF&#39;s lxmd uses for propagation-node sync:</span>
+<span class="sd">SYNC_REQUEST_PATH and UNPEER_REQUEST_PATH register ALLOW_LIST handlers</span>
+<span class="sd">(only peered propagation nodes are allowed), and the sync code calls</span>
+<span class="sd">``link.identify(local_identity)`` before requesting. An impl that drops</span>
+<span class="sd">``remote_identity`` from the handler signature, or that fails ALLOW_LIST</span>
+<span class="sd">enforcement, silently breaks propagation auth.</span>
+
+<span class="sd">Three tests:</span>
+
+<span class="sd">  1. identified ALLOW_ALL — the handler observes a non-None</span>
+<span class="sd">     remote_identity matching the requester&#39;s identity_hash.</span>
+<span class="sd">  2. ALLOW_LIST positive — requester&#39;s identity_hash is on the list;</span>
+<span class="sd">     the handler runs and the response comes back.</span>
+<span class="sd">  3. ALLOW_LIST negative — requester not on the list; RNS rejects the</span>
+<span class="sd">     request before the handler runs (request fails / times out), AND</span>
+<span class="sd">     the invocation log shows zero entries.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Wire Interop&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">18</span>
+
+
+<span class="n">_APP</span> <span class="o">=</span> <span class="s2">&quot;conformance&quot;</span>
+<span class="n">_ASPECTS</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;link-identify&quot;</span><span class="p">]</span>
+<span class="n">_PATH</span> <span class="o">=</span> <span class="s2">&quot;/echo&quot;</span>
+<span class="n">_LINK_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+<span class="n">_PATH_POLL_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">10000</span>
+<span class="n">_REQUEST_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wire the pair together and open a link from client to server&#39;s</span>
+<span class="sd">    listening destination. Returns (server_dest, link_id).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">start_tcp_client</span><span class="p">(</span>
+        <span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">target_host</span><span class="o">=</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="n">target_port</span><span class="o">=</span><span class="n">port</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">server_dest</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">client</span><span class="o">.</span><span class="n">poll_path</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_PATH_POLL_TIMEOUT_MS</span><span class="p">),</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">client</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2"> never learned a path to </span><span class="si">{</span><span class="n">server</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">&#39;s &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;destination — link-identify tests need the link first.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">link_id</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_open</span><span class="p">(</span>
+        <span class="n">server_dest</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">,</span>
+        <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_LINK_TIMEOUT_MS</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span>
+</code></pre></details></div></details>
+<details class="test-detail" id="t-9-11" data-search="test_allow_list_admits_listed_identity start_tcp_server start_tcp_client listen link_open register_request_handler link_identify link_request get_request_log allow_list request handler positive control: when the identified requester&#x27;s identity_hash is in the destination&#x27;s allowed_list, rns runs the handler and routes the response back"><summary><span class="col num">9.11</span><span class="col name"><code>test_allow_list_admits_listed_identity</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">register_request_handler</span><span class="cmd-chip">link_identify</span><span class="cmd-chip">link_request</span><span class="cmd-chip">get_request_log</span></span><span class="col ver">ALLOW_LIST request handler positive control: when the identified requester&#x27;s identity_hash is in the destination&#x27;s allowed_list, RNS runs the handler and routes the response back</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_identify.py</code></span><a href="#t-9-11">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_allow_list_admits_listed_identity</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+    <span class="n">server</span><span class="p">,</span> <span class="n">client</span> <span class="o">=</span> <span class="n">wire_peers</span>
+    <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span> <span class="o">=</span> <span class="n">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">)</span>
+    <span class="n">response_payload</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">32</span><span class="p">)</span>
+
+    <span class="c1"># Pre-compute the client&#39;s identity hash; only that identity is</span>
+    <span class="c1"># allowed through the handler.</span>
+    <span class="n">client_priv</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">))</span>
+    <span class="n">client_id_info</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+        <span class="s2">&quot;identity_from_private_key&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">client_priv</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+    <span class="p">)</span>
+    <span class="n">allowed_hash</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">client_id_info</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">])</span>
+
+    <span class="n">server</span><span class="o">.</span><span class="n">register_request_handler</span><span class="p">(</span>
+        <span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">response_payload</span><span class="p">,</span>
+        <span class="n">allow</span><span class="o">=</span><span class="s2">&quot;list&quot;</span><span class="p">,</span> <span class="n">allowed_identity_hashes</span><span class="o">=</span><span class="p">[</span><span class="n">allowed_hash</span><span class="p">],</span>
+    <span class="p">)</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">link_identify</span><span class="p">(</span><span class="n">link_id</span><span class="p">,</span> <span class="n">client_priv</span><span class="p">)</span>
+
+    <span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_request</span><span class="p">(</span>
+        <span class="n">link_id</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_REQUEST_TIMEOUT_MS</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">result</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;ready&quot;</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;ALLOW_LIST request from listed identity did not complete READY: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;status=</span><span class="si">{</span><span class="n">result</span><span class="p">[</span><span class="s1">&#39;status&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="n">entries</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">get_request_log</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;expected handler to run once for listed identity, got &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span><span class="si">}</span><span class="s2"> invocations&quot;</span>
+    <span class="p">)</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>wire_peers</code><code>tests/wire/conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">wire_peers</span><span class="p">(</span><span class="n">wire_pair</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Two freshly-spawned bridge subprocesses, one server-role, one client-role.</span>
+
+<span class="sd">    Yields (server, client) as `_WirePeer` objects. Caller is responsible for</span>
+<span class="sd">    calling `server.start_tcp_server(...)` and `client.start_tcp_client(...)`</span>
+<span class="sd">    with the port the server returns. Both bridges are torn down in the</span>
+<span class="sd">    fixture finalizer regardless of whether the test raised.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">server_impl</span><span class="p">,</span> <span class="n">client_impl</span> <span class="o">=</span> <span class="n">wire_pair</span>
+    <span class="n">server_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">server_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">server_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">client_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">client_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">client_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">server</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;server(</span><span class="si">{</span><span class="n">server_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">client_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;client(</span><span class="si">{</span><span class="n">client_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">server</span><span class="p">,</span> <span class="n">client</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># Stop both peers before tearing down the pipe — mirrors the</span>
+        <span class="c1"># behavioral fixture pattern so an in-process teardown hook on</span>
+        <span class="c1"># the bridge side (e.g. Reticulum.stop) gets a chance to run</span>
+        <span class="c1"># cleanly before its stdin closes.</span>
+        <span class="k">for</span> <span class="n">peer</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">peer</span><span class="o">.</span><span class="n">stop</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+        <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">client_bridge</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/wire/test_link_identify.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Link.identify + ALLOW_LIST request handler conformance.</span>
+
+<span class="sd">RNS Link request handlers support an authentication policy:</span>
+<span class="sd">``Destination.ALLOW_ALL`` (any requester, default) or</span>
+<span class="sd">``Destination.ALLOW_LIST`` (only identities in a fixed allow-list). The</span>
+<span class="sd">requester opts into being identified by calling ``Link.identify(identity)``</span>
+<span class="sd">after the link is up — the remote then sees the requester&#39;s Identity on</span>
+<span class="sd">the handler&#39;s ``remote_identity`` argument.</span>
+
+<span class="sd">This is the path LXMF&#39;s lxmd uses for propagation-node sync:</span>
+<span class="sd">SYNC_REQUEST_PATH and UNPEER_REQUEST_PATH register ALLOW_LIST handlers</span>
+<span class="sd">(only peered propagation nodes are allowed), and the sync code calls</span>
+<span class="sd">``link.identify(local_identity)`` before requesting. An impl that drops</span>
+<span class="sd">``remote_identity`` from the handler signature, or that fails ALLOW_LIST</span>
+<span class="sd">enforcement, silently breaks propagation auth.</span>
+
+<span class="sd">Three tests:</span>
+
+<span class="sd">  1. identified ALLOW_ALL — the handler observes a non-None</span>
+<span class="sd">     remote_identity matching the requester&#39;s identity_hash.</span>
+<span class="sd">  2. ALLOW_LIST positive — requester&#39;s identity_hash is on the list;</span>
+<span class="sd">     the handler runs and the response comes back.</span>
+<span class="sd">  3. ALLOW_LIST negative — requester not on the list; RNS rejects the</span>
+<span class="sd">     request before the handler runs (request fails / times out), AND</span>
+<span class="sd">     the invocation log shows zero entries.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Wire Interop&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">18</span>
+
+
+<span class="n">_APP</span> <span class="o">=</span> <span class="s2">&quot;conformance&quot;</span>
+<span class="n">_ASPECTS</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;link-identify&quot;</span><span class="p">]</span>
+<span class="n">_PATH</span> <span class="o">=</span> <span class="s2">&quot;/echo&quot;</span>
+<span class="n">_LINK_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+<span class="n">_PATH_POLL_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">10000</span>
+<span class="n">_REQUEST_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wire the pair together and open a link from client to server&#39;s</span>
+<span class="sd">    listening destination. Returns (server_dest, link_id).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">start_tcp_client</span><span class="p">(</span>
+        <span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">target_host</span><span class="o">=</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="n">target_port</span><span class="o">=</span><span class="n">port</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">server_dest</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">client</span><span class="o">.</span><span class="n">poll_path</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_PATH_POLL_TIMEOUT_MS</span><span class="p">),</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">client</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2"> never learned a path to </span><span class="si">{</span><span class="n">server</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">&#39;s &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;destination — link-identify tests need the link first.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">link_id</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_open</span><span class="p">(</span>
+        <span class="n">server_dest</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">,</span>
+        <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_LINK_TIMEOUT_MS</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span>
+</code></pre></details></div></details>
+<details class="test-detail" id="t-9-12" data-search="test_allow_list_rejects_unlisted_identity start_tcp_server start_tcp_client listen link_open register_request_handler link_identify link_request get_request_log allow_list request handler negative control: when the identified requester&#x27;s identity_hash is not in the destination&#x27;s allowed_list, rns rejects the request before the handler runs (request fails or times out) and the handler&#x27;s invocation log stays empty. an impl that runs the handler regardless of allow_list silently bypasses propagation-node auth."><summary><span class="col num">9.12</span><span class="col name"><code>test_allow_list_rejects_unlisted_identity</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">register_request_handler</span><span class="cmd-chip">link_identify</span><span class="cmd-chip">link_request</span><span class="cmd-chip">get_request_log</span></span><span class="col ver">ALLOW_LIST request handler negative control: when the identified requester&#x27;s identity_hash is NOT in the destination&#x27;s allowed_list, RNS rejects the request before the handler runs (request fails or times out) AND the handler&#x27;s invocation log stays empty. An impl that runs the handler regardless of allow_list silently bypasses propagation-node auth.</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_identify.py</code></span><a href="#t-9-12">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_allow_list_rejects_unlisted_identity</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+    <span class="n">server</span><span class="p">,</span> <span class="n">client</span> <span class="o">=</span> <span class="n">wire_peers</span>
+    <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span> <span class="o">=</span> <span class="n">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">)</span>
+
+    <span class="c1"># Allowed list contains a *different* identity than the client&#39;s.</span>
+    <span class="n">different_priv</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">))</span>
+    <span class="n">different_id</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+        <span class="s2">&quot;identity_from_private_key&quot;</span><span class="p">,</span> <span class="n">private_key</span><span class="o">=</span><span class="n">different_priv</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+    <span class="p">)</span>
+    <span class="n">allowed_hash</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">different_id</span><span class="p">[</span><span class="s2">&quot;hash&quot;</span><span class="p">])</span>
+
+    <span class="n">server</span><span class="o">.</span><span class="n">register_request_handler</span><span class="p">(</span>
+        <span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">32</span><span class="p">),</span>
+        <span class="n">allow</span><span class="o">=</span><span class="s2">&quot;list&quot;</span><span class="p">,</span> <span class="n">allowed_identity_hashes</span><span class="o">=</span><span class="p">[</span><span class="n">allowed_hash</span><span class="p">],</span>
+    <span class="p">)</span>
+
+    <span class="c1"># Client identifies as its OWN identity — not the one on the list.</span>
+    <span class="n">client_priv</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">random_hex</span><span class="p">(</span><span class="mi">64</span><span class="p">))</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">link_identify</span><span class="p">(</span><span class="n">link_id</span><span class="p">,</span> <span class="n">client_priv</span><span class="p">)</span>
+
+    <span class="n">result</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_request</span><span class="p">(</span>
+        <span class="n">link_id</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="mi">5000</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="c1"># RNS rejects the request before the handler runs — the receipt</span>
+    <span class="c1"># either times out or fails. The CRITICAL assertion is that the</span>
+    <span class="c1"># handler&#39;s invocation log is EMPTY: ALLOW_LIST enforcement</span>
+    <span class="c1"># happens in real RNS before any user code runs.</span>
+    <span class="k">assert</span> <span class="n">result</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">]</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;failed&quot;</span><span class="p">,</span> <span class="s2">&quot;timeout&quot;</span><span class="p">),</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;ALLOW_LIST request from un-listed identity completed READY — &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;the destination accepted a request from an unauthorised &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;requester. status=</span><span class="si">{</span><span class="n">result</span><span class="p">[</span><span class="s1">&#39;status&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">, response=&quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">result</span><span class="p">[</span><span class="s1">&#39;response&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="n">entries</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">get_request_log</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">_PATH</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;handler ran for an un-listed identity (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">entries</span><span class="p">)</span><span class="si">}</span><span class="s2"> &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;invocations) — RNS did not enforce ALLOW_LIST before &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;dispatching to the user generator. entries=</span><span class="si">{</span><span class="n">entries</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>wire_peers</code><code>tests/wire/conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">wire_peers</span><span class="p">(</span><span class="n">wire_pair</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Two freshly-spawned bridge subprocesses, one server-role, one client-role.</span>
+
+<span class="sd">    Yields (server, client) as `_WirePeer` objects. Caller is responsible for</span>
+<span class="sd">    calling `server.start_tcp_server(...)` and `client.start_tcp_client(...)`</span>
+<span class="sd">    with the port the server returns. Both bridges are torn down in the</span>
+<span class="sd">    fixture finalizer regardless of whether the test raised.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">server_impl</span><span class="p">,</span> <span class="n">client_impl</span> <span class="o">=</span> <span class="n">wire_pair</span>
+    <span class="n">server_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">server_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">server_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">client_bridge</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span>
+        <span class="n">resolve_command</span><span class="p">(</span><span class="n">client_impl</span><span class="p">),</span> <span class="n">env</span><span class="o">=</span><span class="n">_env_for</span><span class="p">(</span><span class="n">client_impl</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">server</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;server(</span><span class="si">{</span><span class="n">server_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">_WirePeer</span><span class="p">(</span><span class="n">client_bridge</span><span class="p">,</span> <span class="n">role_label</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;client(</span><span class="si">{</span><span class="n">client_impl</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">server</span><span class="p">,</span> <span class="n">client</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># Stop both peers before tearing down the pipe — mirrors the</span>
+        <span class="c1"># behavioral fixture pattern so an in-process teardown hook on</span>
+        <span class="c1"># the bridge side (e.g. Reticulum.stop) gets a chance to run</span>
+        <span class="c1"># cleanly before its stdin closes.</span>
+        <span class="k">for</span> <span class="n">peer</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">peer</span><span class="o">.</span><span class="n">stop</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+        <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="p">(</span><span class="n">server_bridge</span><span class="p">,</span> <span class="n">client_bridge</span><span class="p">):</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">b</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                <span class="k">pass</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/wire/test_link_identify.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;Link.identify + ALLOW_LIST request handler conformance.</span>
+
+<span class="sd">RNS Link request handlers support an authentication policy:</span>
+<span class="sd">``Destination.ALLOW_ALL`` (any requester, default) or</span>
+<span class="sd">``Destination.ALLOW_LIST`` (only identities in a fixed allow-list). The</span>
+<span class="sd">requester opts into being identified by calling ``Link.identify(identity)``</span>
+<span class="sd">after the link is up — the remote then sees the requester&#39;s Identity on</span>
+<span class="sd">the handler&#39;s ``remote_identity`` argument.</span>
+
+<span class="sd">This is the path LXMF&#39;s lxmd uses for propagation-node sync:</span>
+<span class="sd">SYNC_REQUEST_PATH and UNPEER_REQUEST_PATH register ALLOW_LIST handlers</span>
+<span class="sd">(only peered propagation nodes are allowed), and the sync code calls</span>
+<span class="sd">``link.identify(local_identity)`` before requesting. An impl that drops</span>
+<span class="sd">``remote_identity`` from the handler signature, or that fails ALLOW_LIST</span>
+<span class="sd">enforcement, silently breaks propagation auth.</span>
+
+<span class="sd">Three tests:</span>
+
+<span class="sd">  1. identified ALLOW_ALL — the handler observes a non-None</span>
+<span class="sd">     remote_identity matching the requester&#39;s identity_hash.</span>
+<span class="sd">  2. ALLOW_LIST positive — requester&#39;s identity_hash is on the list;</span>
+<span class="sd">     the handler runs and the response comes back.</span>
+<span class="sd">  3. ALLOW_LIST negative — requester not on the list; RNS rejects the</span>
+<span class="sd">     request before the handler runs (request fails / times out), AND</span>
+<span class="sd">     the invocation log shows zero entries.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">conftest</span><span class="w"> </span><span class="kn">import</span> <span class="n">random_hex</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Wire Interop&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">18</span>
+
+
+<span class="n">_APP</span> <span class="o">=</span> <span class="s2">&quot;conformance&quot;</span>
+<span class="n">_ASPECTS</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;link-identify&quot;</span><span class="p">]</span>
+<span class="n">_PATH</span> <span class="o">=</span> <span class="s2">&quot;/echo&quot;</span>
+<span class="n">_LINK_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+<span class="n">_PATH_POLL_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">10000</span>
+<span class="n">_REQUEST_TIMEOUT_MS</span> <span class="o">=</span> <span class="mi">15000</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_bring_up_link</span><span class="p">(</span><span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wire the pair together and open a link from client to server&#39;s</span>
+<span class="sd">    listening destination. Returns (server_dest, link_id).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="n">client</span><span class="o">.</span><span class="n">start_tcp_client</span><span class="p">(</span>
+        <span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">target_host</span><span class="o">=</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="n">target_port</span><span class="o">=</span><span class="n">port</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">server_dest</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">client</span><span class="o">.</span><span class="n">poll_path</span><span class="p">(</span><span class="n">server_dest</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_PATH_POLL_TIMEOUT_MS</span><span class="p">),</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">client</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2"> never learned a path to </span><span class="si">{</span><span class="n">server</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">&#39;s &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;destination — link-identify tests need the link first.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">link_id</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_open</span><span class="p">(</span>
+        <span class="n">server_dest</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">,</span>
+        <span class="n">timeout_ms</span><span class="o">=</span><span class="n">_LINK_TIMEOUT_MS</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">server_dest</span><span class="p">,</span> <span class="n">link_id</span>
+</code></pre></details></div></details>
+</div>
+</div>
+<div class="file-section">
 <div class="file-label">File: <code>tests/wire/test_link_multihop.py</code> · 3 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-10" data-search="test_link_establishes_multihop start_tcp_server start_tcp_client listen announce link_open a 2-hop link (sender → tcp transport → receiver) establishes with a 16-byte link_id within the establishment timeout"><summary><span class="col num">9.10</span><span class="col name"><code>test_link_establishes_multihop</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">announce</span><span class="cmd-chip">link_open</span></span><span class="col ver">A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-10">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_establishes_multihop</span><span class="p">(</span><span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-13" data-search="test_link_establishes_multihop start_tcp_server start_tcp_client listen announce link_open a 2-hop link (sender → tcp transport → receiver) establishes with a 16-byte link_id within the establishment timeout"><summary><span class="col num">9.13</span><span class="col name"><code>test_link_establishes_multihop</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">announce</span><span class="cmd-chip">link_open</span></span><span class="col ver">A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-13">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_establishes_multihop</span><span class="p">(</span><span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Baseline: a 2-hop Link must establish successfully across a transport.</span>
 
 <span class="sd">    This is a lighter-weight check than data delivery. If this FAILS,</span>
@@ -4011,7 +4592,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
     <span class="k">return</span> <span class="n">sender</span><span class="p">,</span> <span class="n">transport</span><span class="p">,</span> <span class="n">receiver</span><span class="p">,</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-11" data-search="test_link_data_reaches_receiver_multihop link_open link_send link_poll bytes sent over an established multi-hop link arrive at the receiver intact — catches header_2 transport_id mis-wrapping at the sender"><summary><span class="col num">9.11</span><span class="col name"><code>test_link_data_reaches_receiver_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">link_send</span><span class="cmd-chip">link_poll</span></span><span class="col ver">Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-11">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_data_reaches_receiver_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-14" data-search="test_link_data_reaches_receiver_multihop link_open link_send link_poll bytes sent over an established multi-hop link arrive at the receiver intact — catches header_2 transport_id mis-wrapping at the sender"><summary><span class="col num">9.14</span><span class="col name"><code>test_link_data_reaches_receiver_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">link_send</span><span class="cmd-chip">link_poll</span></span><span class="col ver">Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-14">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_data_reaches_receiver_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The real test: once the link is established, sent bytes must</span>
 <span class="sd">    arrive at the receiver.</span>
 
@@ -4216,7 +4797,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
     <span class="k">return</span> <span class="n">sender</span><span class="p">,</span> <span class="n">transport</span><span class="p">,</span> <span class="n">receiver</span><span class="p">,</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-12" data-search="test_link_data_roundtrip_multiple_packets link_open link_send link_poll five back-to-back link data packets (16-48 bytes each) all arrive at the receiver as a multiset — catches &#x27;only first packet routes&#x27; regressions"><summary><span class="col num">9.12</span><span class="col name"><code>test_link_data_roundtrip_multiple_packets</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">link_send</span><span class="cmd-chip">link_poll</span></span><span class="col ver">Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches &#x27;only first packet routes&#x27; regressions</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-12">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_data_roundtrip_multiple_packets</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-15" data-search="test_link_data_roundtrip_multiple_packets link_open link_send link_poll five back-to-back link data packets (16-48 bytes each) all arrive at the receiver as a multiset — catches &#x27;only first packet routes&#x27; regressions"><summary><span class="col num">9.15</span><span class="col name"><code>test_link_data_roundtrip_multiple_packets</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">link_send</span><span class="cmd-chip">link_poll</span></span><span class="col ver">Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches &#x27;only first packet routes&#x27; regressions</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_multihop.py</code></span><a href="#t-9-15">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_data_roundtrip_multiple_packets</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Extension: multiple consecutive sends must all arrive. This</span>
 <span class="sd">    catches regressions where only the first post-establishment packet</span>
 <span class="sd">    gets routed correctly (e.g. if a fix only updated the first TX but</span>
@@ -4418,7 +4999,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <div class="file-label">File: <code>tests/wire/test_link_request.py</code> · 1 test</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-13" data-search="test_link_request_round_trip start_tcp_server start_tcp_client listen link_open register_request_handler link_request get_request_log rns link request/response rpc: a destination.register_request_handler-registered generator fires when the linked client calls link.request(path, data); the handler&#x27;s return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester&#x27;s identity"><summary><span class="col num">9.13</span><span class="col name"><code>test_link_request_round_trip</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">register_request_handler</span><span class="cmd-chip">link_request</span><span class="cmd-chip">get_request_log</span></span><span class="col ver">RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler&#x27;s return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester&#x27;s Identity</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_request.py</code></span><a href="#t-9-13">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_request_round_trip</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-16" data-search="test_link_request_round_trip start_tcp_server start_tcp_client listen link_open register_request_handler link_request get_request_log rns link request/response rpc: a destination.register_request_handler-registered generator fires when the linked client calls link.request(path, data); the handler&#x27;s return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester&#x27;s identity"><summary><span class="col num">9.16</span><span class="col name"><code>test_link_request_round_trip</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">register_request_handler</span><span class="cmd-chip">link_request</span><span class="cmd-chip">get_request_log</span></span><span class="col ver">RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler&#x27;s return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester&#x27;s Identity</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_request.py</code></span><a href="#t-9-16">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_request_round_trip</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
     <span class="n">server</span><span class="p">,</span> <span class="n">client</span> <span class="o">=</span> <span class="n">wire_peers</span>
     <span class="n">port</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
     <span class="n">client</span><span class="o">.</span><span class="n">start_tcp_client</span><span class="p">(</span>
@@ -4559,7 +5140,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <div class="file-label">File: <code>tests/wire/test_link_via_shared_master.py</code> · 1 test</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-14" data-search="test_link_establishes_via_shared_master start_tcp_server start_tcp_client start_local_client listen announce poll_path link_open a link from a shared-instance local client to a tcp-attached destination establishes successfully via the master — catches the h1→h2 synthesis link_id-desynchronization bug"><summary><span class="col num">9.14</span><span class="col name"><code>test_link_establishes_via_shared_master</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">start_local_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">announce</span><span class="cmd-chip">poll_path</span><span class="cmd-chip">link_open</span></span><span class="col ver">A Link from a shared-instance local client to a TCP-attached destination establishes successfully via the master — catches the H1→H2 synthesis link_id-desynchronization bug</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_via_shared_master.py</code></span><a href="#t-9-14">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_establishes_via_shared_master</span><span class="p">(</span><span class="n">wire_shared_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-17" data-search="test_link_establishes_via_shared_master start_tcp_server start_tcp_client start_local_client listen announce poll_path link_open a link from a shared-instance local client to a tcp-attached destination establishes successfully via the master — catches the h1→h2 synthesis link_id-desynchronization bug"><summary><span class="col num">9.17</span><span class="col name"><code>test_link_establishes_via_shared_master</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">start_local_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">announce</span><span class="cmd-chip">poll_path</span><span class="cmd-chip">link_open</span></span><span class="col ver">A Link from a shared-instance local client to a TCP-attached destination establishes successfully via the master — catches the H1→H2 synthesis link_id-desynchronization bug</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_link_via_shared_master.py</code></span><a href="#t-9-17">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_link_establishes_via_shared_master</span><span class="p">(</span><span class="n">wire_shared_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A.link_open(D_on_C) must succeed within a reasonable timeout.</span>
 
 <span class="sd">    If the master miscomputes link_id when forwarding the LINKREQUEST</span>
@@ -4797,7 +5378,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <div class="file-label">File: <code>tests/wire/test_path_discovery.py</code> · 5 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-15" data-search="test_path_response_reuses_cached_announce start_tcp_server start_tcp_client announce request_path poll_path read_path_random_hash when b answers a path request for a destination it cached, the re-emitted announce&#x27;s random_hash bytes are byte-identical to the cached announce&#x27;s (no regeneration on re-emit)"><summary><span class="col num">9.15</span><span class="col name"><code>test_path_response_reuses_cached_announce</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">poll_path</span><span class="cmd-chip">read_path_random_hash</span></span><span class="col ver">When B answers a path request for a destination it cached, the re-emitted announce&#x27;s random_hash bytes are byte-identical to the cached announce&#x27;s (no regeneration on re-emit)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-15">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_path_response_reuses_cached_announce</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-18" data-search="test_path_response_reuses_cached_announce start_tcp_server start_tcp_client announce request_path poll_path read_path_random_hash when b answers a path request for a destination it cached, the re-emitted announce&#x27;s random_hash bytes are byte-identical to the cached announce&#x27;s (no regeneration on re-emit)"><summary><span class="col num">9.18</span><span class="col name"><code>test_path_response_reuses_cached_announce</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">poll_path</span><span class="cmd-chip">read_path_random_hash</span></span><span class="col ver">When B answers a path request for a destination it cached, the re-emitted announce&#x27;s random_hash bytes are byte-identical to the cached announce&#x27;s (no regeneration on re-emit)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-18">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_path_response_reuses_cached_announce</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;When B (transport) answers a PR for a destination it has cached,</span>
 <span class="sd">    the re-emitted announce MUST be the cached announce — identifiable</span>
 <span class="sd">    by the 10-byte random_hash segment being byte-identical on B&#39;s side</span>
@@ -5128,7 +5709,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="c1"># being read from different sources on the two sides.</span>
 <span class="n">_EXPIRY_JITTER_MS</span> <span class="o">=</span> <span class="mi">1000</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-16" data-search="test_discover_paths_for_mode_gating start_tcp_server start_tcp_client request_path has_discovery_path_request b forwards path requests for unknown destinations only when its receiving interface&#x27;s mode is in discover_paths_for={access_point, gateway, roaming}, gated correctly for every parametrized mode"><summary><span class="col num">9.16</span><span class="col name"><code>test_discover_paths_for_mode_gating</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">request_path</span><span class="cmd-chip">has_discovery_path_request</span></span><span class="col ver">B forwards path requests for unknown destinations only when its receiving interface&#x27;s mode is in DISCOVER_PATHS_FOR={access_point, gateway, roaming}, gated correctly for every parametrized mode</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-16">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_discover_paths_for_mode_gating</span><span class="p">(</span><span class="n">wire_3peer</span><span class="p">,</span> <span class="n">transport_mode</span><span class="p">):</span>
+<details class="test-detail" id="t-9-19" data-search="test_discover_paths_for_mode_gating start_tcp_server start_tcp_client request_path has_discovery_path_request b forwards path requests for unknown destinations only when its receiving interface&#x27;s mode is in discover_paths_for={access_point, gateway, roaming}, gated correctly for every parametrized mode"><summary><span class="col num">9.19</span><span class="col name"><code>test_discover_paths_for_mode_gating</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">request_path</span><span class="cmd-chip">has_discovery_path_request</span></span><span class="col ver">B forwards path requests for unknown destinations only when its receiving interface&#x27;s mode is in DISCOVER_PATHS_FOR={access_point, gateway, roaming}, gated correctly for every parametrized mode</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-19">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_discover_paths_for_mode_gating</span><span class="p">(</span><span class="n">wire_3peer</span><span class="p">,</span> <span class="n">transport_mode</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;When C sends a PR for an UNKNOWN destination to B, B must only</span>
 <span class="sd">    forward the request to its other interfaces if B&#39;s receiving</span>
 <span class="sd">    interface mode is in DISCOVER_PATHS_FOR = {ACCESS_POINT, GATEWAY,</span>
@@ -5404,7 +5985,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="c1"># being read from different sources on the two sides.</span>
 <span class="n">_EXPIRY_JITTER_MS</span> <span class="o">=</span> <span class="mi">1000</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-17" data-search="test_roaming_no_answer_when_next_hop_on_same_interface start_tcp_server start_tcp_client announce request_path tx_bytes read_path_entry under roaming mode, b refuses to answer a path request when the cached path&#x27;s next-hop is the same interface that received the pr (loop-prevention rule fires)"><summary><span class="col num">9.17</span><span class="col name"><code>test_roaming_no_answer_when_next_hop_on_same_interface</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">tx_bytes</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Under ROAMING mode, B refuses to answer a path request when the cached path&#x27;s next-hop is the same interface that received the PR (loop-prevention rule fires)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-17">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_roaming_no_answer_when_next_hop_on_same_interface</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-20" data-search="test_roaming_no_answer_when_next_hop_on_same_interface start_tcp_server start_tcp_client announce request_path tx_bytes read_path_entry under roaming mode, b refuses to answer a path request when the cached path&#x27;s next-hop is the same interface that received the pr (loop-prevention rule fires)"><summary><span class="col num">9.20</span><span class="col name"><code>test_roaming_no_answer_when_next_hop_on_same_interface</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">tx_bytes</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Under ROAMING mode, B refuses to answer a path request when the cached path&#x27;s next-hop is the same interface that received the PR (loop-prevention rule fires)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-20">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_roaming_no_answer_when_next_hop_on_same_interface</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;ROAMING loop prevention: when a PR arrives on an interface that</span>
 <span class="sd">    is itself the `received_from` of the cached path, B must refuse to</span>
 <span class="sd">    answer.</span>
@@ -5693,7 +6274,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="c1"># being read from different sources on the two sides.</span>
 <span class="n">_EXPIRY_JITTER_MS</span> <span class="o">=</span> <span class="mi">1000</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-18" data-search="test_roaming_loop_prevention_positive_companion start_tcp_server start_tcp_client announce request_path tx_bytes read_path_entry under full mode (companion to the roaming test) b does answer the pr — proves the roaming test isn&#x27;t vacuously passing because b never answers"><summary><span class="col num">9.18</span><span class="col name"><code>test_roaming_loop_prevention_positive_companion</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">tx_bytes</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn&#x27;t vacuously passing because B never answers</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-18">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_roaming_loop_prevention_positive_companion</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-21" data-search="test_roaming_loop_prevention_positive_companion start_tcp_server start_tcp_client announce request_path tx_bytes read_path_entry under full mode (companion to the roaming test) b does answer the pr — proves the roaming test isn&#x27;t vacuously passing because b never answers"><summary><span class="col num">9.21</span><span class="col name"><code>test_roaming_loop_prevention_positive_companion</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">request_path</span><span class="cmd-chip">tx_bytes</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn&#x27;t vacuously passing because B never answers</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-21">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_roaming_loop_prevention_positive_companion</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Companion to the negative test above. Same 2-peer topology, but</span>
 <span class="sd">    under FULL mode the loop-prevention rule does NOT apply, so B must</span>
 <span class="sd">    emit an answer packet. Without this companion, the negative test</span>
@@ -5953,7 +6534,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="c1"># being read from different sources on the two sides.</span>
 <span class="n">_EXPIRY_JITTER_MS</span> <span class="o">=</span> <span class="mi">1000</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-19" data-search="test_mode_specific_path_expiry_assignment start_tcp_server start_tcp_client announce read_path_entry stored path-entry expiry equals timestamp + the per-mode constant (pathfinder_e for full, ap_path_time for access_point, roaming_path_time for roaming) within jitter"><summary><span class="col num">9.19</span><span class="col name"><code>test_mode_specific_path_expiry_assignment</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-19">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_mode_specific_path_expiry_assignment</span><span class="p">(</span>
+<details class="test-detail" id="t-9-22" data-search="test_mode_specific_path_expiry_assignment start_tcp_server start_tcp_client announce read_path_entry stored path-entry expiry equals timestamp + the per-mode constant (pathfinder_e for full, ap_path_time for access_point, roaming_path_time for roaming) within jitter"><summary><span class="col num">9.22</span><span class="col name"><code>test_mode_specific_path_expiry_assignment</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">announce</span><span class="cmd-chip">read_path_entry</span></span><span class="col ver">Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_path_discovery.py</code></span><a href="#t-9-22">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_mode_specific_path_expiry_assignment</span><span class="p">(</span>
     <span class="n">wire_peers</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">expected_delta_ms</span><span class="p">,</span> <span class="n">label</span>
 <span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Path table entries store an `expires` field whose value is</span>
@@ -6249,7 +6830,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <div class="file-label">File: <code>tests/wire/test_resource_invariants.py</code> · 5 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-20" data-search="test_resource_identity_is_fresh_per_construction start_tcp_server start_tcp_client listen link_open resource_create invariant: two resources built from byte-identical payloads get different identities — rns draws a fresh random_hash per construction (resource.py:193), so the hash never leaks that two payloads were equal"><summary><span class="col num">9.20</span><span class="col name"><code>test_resource_identity_is_fresh_per_construction</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: two Resources built from byte-identical payloads get different identities — RNS draws a fresh random_hash per construction (Resource.py:193), so the hash never leaks that two payloads were equal</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-20">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_identity_is_fresh_per_construction</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-23" data-search="test_resource_identity_is_fresh_per_construction start_tcp_server start_tcp_client listen link_open resource_create invariant: two resources built from byte-identical payloads get different identities — rns draws a fresh random_hash per construction (resource.py:193), so the hash never leaks that two payloads were equal"><summary><span class="col num">9.23</span><span class="col name"><code>test_resource_identity_is_fresh_per_construction</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: two Resources built from byte-identical payloads get different identities — RNS draws a fresh random_hash per construction (Resource.py:193), so the hash never leaks that two payloads were equal</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-23">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_identity_is_fresh_per_construction</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Construct two Resources from the *same* payload bytes on the same</span>
 <span class="sd">    Link; their random_hash — and therefore their hash — must differ.</span>
 
@@ -6414,7 +6995,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">client</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-21" data-search="test_resource_encrypted_output_is_fresh_per_construction start_tcp_server start_tcp_client listen link_open resource_create invariant: two resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (resource.py:158/165) plus per-construction link encryption keeps every chunk&#x27;s ciphertext unique"><summary><span class="col num">9.21</span><span class="col name"><code>test_resource_encrypted_output_is_fresh_per_construction</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: two Resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (Resource.py:158/165) plus per-construction Link encryption keeps every chunk&#x27;s ciphertext unique</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-21">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_encrypted_output_is_fresh_per_construction</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-24" data-search="test_resource_encrypted_output_is_fresh_per_construction start_tcp_server start_tcp_client listen link_open resource_create invariant: two resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (resource.py:158/165) plus per-construction link encryption keeps every chunk&#x27;s ciphertext unique"><summary><span class="col num">9.24</span><span class="col name"><code>test_resource_encrypted_output_is_fresh_per_construction</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: two Resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (Resource.py:158/165) plus per-construction Link encryption keeps every chunk&#x27;s ciphertext unique</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-24">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_encrypted_output_is_fresh_per_construction</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Construct two Resources from the *same* payload bytes; no encrypted</span>
 <span class="sd">    part of one may be byte-identical to any part of the other.</span>
 
@@ -6584,7 +7165,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">client</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-22" data-search="test_resource_truncated_hash_is_consistent_with_full_hash start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs"><summary><span class="col num">9.22</span><span class="col name"><code>test_resource_truncated_hash_is_consistent_with_full_hash</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-22">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_truncated_hash_is_consistent_with_full_hash</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-25" data-search="test_resource_truncated_hash_is_consistent_with_full_hash start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs"><summary><span class="col num">9.25</span><span class="col name"><code>test_resource_truncated_hash_is_consistent_with_full_hash</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-25">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_truncated_hash_is_consistent_with_full_hash</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A Resource&#39;s truncated_hash must equal the first 16 bytes of its</span>
 <span class="sd">    full hash, and the two must have the spec lengths (32 and 16 bytes).</span>
 
@@ -6754,7 +7335,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">client</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-23" data-search="test_resource_expected_proof_is_full_length start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s expected_proof is a full-length 32-byte sha-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had"><summary><span class="col num">9.23</span><span class="col name"><code>test_resource_expected_proof_is_full_length</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s expected_proof is a full-length 32-byte SHA-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-23">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_expected_proof_is_full_length</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-26" data-search="test_resource_expected_proof_is_full_length start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s expected_proof is a full-length 32-byte sha-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had"><summary><span class="col num">9.26</span><span class="col name"><code>test_resource_expected_proof_is_full_length</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s expected_proof is a full-length 32-byte SHA-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-26">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_expected_proof_is_full_length</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A Resource&#39;s expected_proof must be a full-length 32-byte hash.</span>
 
 <span class="sd">    RNS computes expected_proof as full_hash(data + hash) (Resource.py:196)</span>
@@ -6914,7 +7495,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">client</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-24" data-search="test_resource_hashmap_has_one_entry_per_part start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x maphash_len — for a multi-part resource, catching a mis-sized or mis-counted hashmap"><summary><span class="col num">9.24</span><span class="col name"><code>test_resource_hashmap_has_one_entry_per_part</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x MAPHASH_LEN — for a multi-part resource, catching a mis-sized or mis-counted hashmap</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-24">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_hashmap_has_one_entry_per_part</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
+<details class="test-detail" id="t-9-27" data-search="test_resource_hashmap_has_one_entry_per_part start_tcp_server start_tcp_client listen link_open resource_create invariant: a resource&#x27;s hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x maphash_len — for a multi-part resource, catching a mis-sized or mis-counted hashmap"><summary><span class="col num">9.27</span><span class="col name"><code>test_resource_hashmap_has_one_entry_per_part</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">start_tcp_client</span><span class="cmd-chip">listen</span><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_create</span></span><span class="col ver">Invariant: a Resource&#x27;s hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x MAPHASH_LEN — for a multi-part resource, catching a mis-sized or mis-counted hashmap</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_invariants.py</code></span><a href="#t-9-27">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_resource_hashmap_has_one_entry_per_part</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;For a multi-part Resource, the hashmap must be exactly one</span>
 <span class="sd">    MAPHASH_LEN-byte map hash per part.</span>
 
@@ -7087,7 +7668,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <div class="file-label">File: <code>tests/wire/test_resource_multihop.py</code> · 4 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-9-25" data-search="test_small_resource_multihop link_open resource_send resource_poll a sub-mdu 256-byte resource transfer over a multi-hop link round-trips exactly through resource_adv → req → data → proof"><summary><span class="col num">9.25</span><span class="col name"><code>test_small_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A sub-MDU 256-byte Resource transfer over a multi-hop Link round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-25">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_small_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-28" data-search="test_small_resource_multihop link_open resource_send resource_poll a sub-mdu 256-byte resource transfer over a multi-hop link round-trips exactly through resource_adv → req → data → proof"><summary><span class="col num">9.28</span><span class="col name"><code>test_small_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A sub-MDU 256-byte Resource transfer over a multi-hop Link round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-28">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_small_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A sub-MDU resource: exercises the Resource API without chunking.</span>
 
 <span class="sd">    Even a small Resource goes through RESOURCE_ADV → RESOURCE_REQ →</span>
@@ -7247,7 +7828,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">sender</span><span class="p">,</span> <span class="n">receiver</span><span class="p">,</span> <span class="n">dest_hash</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-26" data-search="test_chunked_resource_multihop link_open resource_send resource_poll a 16 kib resource (multi-packet chunking, mirroring columba image-send size) round-trips intact over a multi-hop link"><summary><span class="col num">9.26</span><span class="col name"><code>test_chunked_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a multi-hop Link</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-26">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_chunked_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-29" data-search="test_chunked_resource_multihop link_open resource_send resource_poll a 16 kib resource (multi-packet chunking, mirroring columba image-send size) round-trips intact over a multi-hop link"><summary><span class="col num">9.29</span><span class="col name"><code>test_chunked_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a multi-hop Link</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-29">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_chunked_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A larger resource that definitely requires chunking across</span>
 <span class="sd">    multiple link DATA packets. ~16 KB mirrors the size Columba was</span>
 <span class="sd">    sending when the image bug surfaced (2 × 8175-byte chunks).</span>
@@ -7409,7 +7990,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">sender</span><span class="p">,</span> <span class="n">receiver</span><span class="p">,</span> <span class="n">dest_hash</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-27" data-search="test_chunked_resource_with_ifac_multihop link_open resource_send resource_poll a 16 kib resource round-trips intact over an ifac-protected multi-hop link — exercises per-packet ifac masking on resource chunks (columba production config)"><summary><span class="col num">9.27</span><span class="col name"><code>test_chunked_resource_with_ifac_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 16 KiB Resource round-trips intact over an IFAC-protected multi-hop Link — exercises per-packet IFAC masking on Resource chunks (Columba production config)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-27">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_chunked_resource_with_ifac_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-30" data-search="test_chunked_resource_with_ifac_multihop link_open resource_send resource_poll a 16 kib resource round-trips intact over an ifac-protected multi-hop link — exercises per-packet ifac masking on resource chunks (columba production config)"><summary><span class="col num">9.30</span><span class="col name"><code>test_chunked_resource_with_ifac_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 16 KiB Resource round-trips intact over an IFAC-protected multi-hop Link — exercises per-packet IFAC masking on Resource chunks (Columba production config)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-30">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_chunked_resource_with_ifac_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Same as test_chunked_resource_multihop but with IFAC enabled on</span>
 <span class="sd">    every peer. Every on-wire packet gets a 16-byte IFAC tag and XOR</span>
 <span class="sd">    mask. Mirrors Columba&#39;s production config where the interface</span>
@@ -7575,7 +8156,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
     <span class="k">return</span> <span class="n">sender</span><span class="p">,</span> <span class="n">receiver</span><span class="p">,</span> <span class="n">dest_hash</span><span class="p">,</span> <span class="n">link_id</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-9-28" data-search="test_large_resource_multihop link_open resource_send resource_poll a 256 kib resource (~32 chunks) round-trips intact, stress-testing back-to-back link data transmission and reassembly"><summary><span class="col num">9.28</span><span class="col name"><code>test_large_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 256 KiB Resource (~32 chunks) round-trips intact, stress-testing back-to-back link DATA transmission and reassembly</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-28">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_large_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
+<details class="test-detail" id="t-9-31" data-search="test_large_resource_multihop link_open resource_send resource_poll a 256 kib resource (~32 chunks) round-trips intact, stress-testing back-to-back link data transmission and reassembly"><summary><span class="col num">9.31</span><span class="col name"><code>test_large_resource_multihop</code></span><span class="col cmds"><span class="cmd-chip">link_open</span><span class="cmd-chip">resource_send</span><span class="cmd-chip">resource_poll</span></span><span class="col ver">A 256 KiB Resource (~32 chunks) round-trips intact, stress-testing back-to-back link DATA transmission and reassembly</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_resource_multihop.py</code></span><a href="#t-9-31">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_large_resource_multihop</span><span class="p">(</span><span class="n">wire_trio</span><span class="p">,</span> <span class="n">wire_3peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A resource large enough to guarantee many link DATA packets even</span>
 <span class="sd">    at the TCP interface&#39;s large MTU. 256 KB split into chunks of</span>
 <span class="sd">    ~8 KB MDU ≈ 32 packets, stress-tests back-to-back link DATA</span>

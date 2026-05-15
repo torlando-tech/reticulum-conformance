@@ -22,9 +22,9 @@
 | 1.14 | `test_ed25519_sign_verify` | `ed25519_generate`, `ed25519_sign`, `ed25519_verify` | Ed25519 sign+verify: signing is deterministic per RFC 8032 (same input → byte-identical signature) and both impls verify each other's signatures |
 | 1.15 | `test_ed25519_verify_bad_sig` | `ed25519_generate`, `ed25519_verify` | Negative control: both impls reject a random (forged) Ed25519 signature |
 
-## 2. Identity (5 tests)
+## 2. Identity (8 tests)
 
-**File:** `tests/test_identity.py`
+### `tests/test_identity.py` (5 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
@@ -33,6 +33,14 @@
 | 2.3 | `test_identity_sign_verify` | `identity_sign`, `identity_from_private_key`, `identity_verify` | RNS Identity sign+verify: signatures are byte-identical and both impls verify each other's signatures |
 | 2.4 | `test_identity_encrypt_decrypt` | `identity_from_private_key`, `identity_encrypt`, `identity_decrypt` | RNS Identity encrypt/decrypt cross-impl round-trip in both directions — exercises the X25519+HKDF+AES composition used for unicast encryption |
 | 2.5 | `test_identity_encrypt_is_fresh_per_call` | `identity_from_private_key`, `identity_encrypt`, `identity_decrypt` | Invariant: two encryptions of byte-identical plaintext for the same Identity produce different ciphertext (RNS draws a fresh ephemeral X25519 key + AES IV per call), and both still decrypt back to the original |
+
+### `tests/test_identity_persistence.py` (3 tests)
+
+| # | Test | Commands Used | What It Verifies |
+|---|------|--------------|-----------------|
+| 2.6 | `test_identity_to_file_from_file_round_trip` | `identity_from_private_key`, `identity_to_file`, `identity_from_file` | RNS.Identity round-trips through the on-disk file format (raw 64-byte private key) via to_file -> from_file with byte-identical public_key + hash on the reloaded Identity. Catches an impl whose to_file / from_file disagree on byte layout (Sideband's identity-on-disk format). |
+| 2.7 | `test_identity_file_format_cross_impl` | `identity_to_file`, `identity_from_file` | Cross-impl on-disk format: an identity written by either impl can be loaded by the other with byte-identical public_key + hash. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path. |
+| 2.8 | `test_identity_from_file_missing_path` | `identity_from_file` | Negative control: identity_from_file on a non-existent path returns found=False (or on Python's RNS, raises which the bridge surfaces as an error). Catches an impl that silently fabricates an Identity for a missing file — a vector for accidentally generating fresh keys on every boot. |
 
 ## 3. Token Encryption (4 tests)
 
@@ -99,7 +107,7 @@
 | 8.2 | `test_bz2_decompress` | `bz2_compress`, `bz2_decompress` | SUT decompression of reference-compressed bytes recovers the original input |
 | 8.3 | `test_bz2_cross_decompress` | `bz2_compress`, `bz2_decompress` | Cross-impl: SUT-compressed bytes decompressed by reference recovers the original input |
 
-## 9. Wire Interop (28 tests)
+## 9. Wire Interop (31 tests)
 
 ### `tests/wire/test_announce_burst_throttle.py` (1 test)
 
@@ -135,54 +143,62 @@
 | 9.8 | `test_announce_bidirectional` | `start_tcp_server`, `start_tcp_client`, `announce`, `poll_path` | Reverse-direction IFAC: server-initiated announce reaches the TCP client (exercises TCPServerInterface child-interface IFAC inheritance) |
 | 9.9 | `test_mismatched_ifac_blocks_announce` | `start_tcp_server`, `start_tcp_client`, `announce`, `poll_path` | Negative control: when network_names match but passphrases differ, IFAC verification rejects the announce and no path is learned |
 
+### `tests/wire/test_link_identify.py` (3 tests)
+
+| # | Test | Commands Used | What It Verifies |
+|---|------|--------------|-----------------|
+| 9.10 | `test_identified_request_surfaces_remote_identity` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `register_request_handler`, `link_identify`, `link_request`, `get_request_log` | ALLOW_ALL request handler observes a non-None remote_identity when the requester called Link.identify first — the field handlers gate auth on. An impl that drops remote_identity through the request pipeline breaks every ALLOW_LIST handler (LXMF lxmd propagation sync etc.) |
+| 9.11 | `test_allow_list_admits_listed_identity` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `register_request_handler`, `link_identify`, `link_request`, `get_request_log` | ALLOW_LIST request handler positive control: when the identified requester's identity_hash is in the destination's allowed_list, RNS runs the handler and routes the response back |
+| 9.12 | `test_allow_list_rejects_unlisted_identity` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `register_request_handler`, `link_identify`, `link_request`, `get_request_log` | ALLOW_LIST request handler negative control: when the identified requester's identity_hash is NOT in the destination's allowed_list, RNS rejects the request before the handler runs (request fails or times out) AND the handler's invocation log stays empty. An impl that runs the handler regardless of allow_list silently bypasses propagation-node auth. |
+
 ### `tests/wire/test_link_multihop.py` (3 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.10 | `test_link_establishes_multihop` | `start_tcp_server`, `start_tcp_client`, `listen`, `announce`, `link_open` | A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout |
-| 9.11 | `test_link_data_reaches_receiver_multihop` | `link_open`, `link_send`, `link_poll` | Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender |
-| 9.12 | `test_link_data_roundtrip_multiple_packets` | `link_open`, `link_send`, `link_poll` | Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches 'only first packet routes' regressions |
+| 9.13 | `test_link_establishes_multihop` | `start_tcp_server`, `start_tcp_client`, `listen`, `announce`, `link_open` | A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout |
+| 9.14 | `test_link_data_reaches_receiver_multihop` | `link_open`, `link_send`, `link_poll` | Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender |
+| 9.15 | `test_link_data_roundtrip_multiple_packets` | `link_open`, `link_send`, `link_poll` | Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches 'only first packet routes' regressions |
 
 ### `tests/wire/test_link_request.py` (1 test)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.13 | `test_link_request_round_trip` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `register_request_handler`, `link_request`, `get_request_log` | RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester's Identity |
+| 9.16 | `test_link_request_round_trip` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `register_request_handler`, `link_request`, `get_request_log` | RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester's Identity |
 
 ### `tests/wire/test_link_via_shared_master.py` (1 test)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.14 | `test_link_establishes_via_shared_master` | `start_tcp_server`, `start_tcp_client`, `start_local_client`, `listen`, `announce`, `poll_path`, `link_open` | A Link from a shared-instance local client to a TCP-attached destination establishes successfully via the master — catches the H1→H2 synthesis link_id-desynchronization bug |
+| 9.17 | `test_link_establishes_via_shared_master` | `start_tcp_server`, `start_tcp_client`, `start_local_client`, `listen`, `announce`, `poll_path`, `link_open` | A Link from a shared-instance local client to a TCP-attached destination establishes successfully via the master — catches the H1→H2 synthesis link_id-desynchronization bug |
 
 ### `tests/wire/test_path_discovery.py` (5 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.15 | `test_path_response_reuses_cached_announce` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `poll_path`, `read_path_random_hash` | When B answers a path request for a destination it cached, the re-emitted announce's random_hash bytes are byte-identical to the cached announce's (no regeneration on re-emit) |
-| 9.16 | `test_discover_paths_for_mode_gating` | `start_tcp_server`, `start_tcp_client`, `request_path`, `has_discovery_path_request` | B forwards path requests for unknown destinations only when its receiving interface's mode is in DISCOVER_PATHS_FOR={access_point, gateway, roaming}, gated correctly for every parametrized mode |
-| 9.17 | `test_roaming_no_answer_when_next_hop_on_same_interface` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `tx_bytes`, `read_path_entry` | Under ROAMING mode, B refuses to answer a path request when the cached path's next-hop is the same interface that received the PR (loop-prevention rule fires) |
-| 9.18 | `test_roaming_loop_prevention_positive_companion` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `tx_bytes`, `read_path_entry` | Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn't vacuously passing because B never answers |
-| 9.19 | `test_mode_specific_path_expiry_assignment` | `start_tcp_server`, `start_tcp_client`, `announce`, `read_path_entry` | Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter |
+| 9.18 | `test_path_response_reuses_cached_announce` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `poll_path`, `read_path_random_hash` | When B answers a path request for a destination it cached, the re-emitted announce's random_hash bytes are byte-identical to the cached announce's (no regeneration on re-emit) |
+| 9.19 | `test_discover_paths_for_mode_gating` | `start_tcp_server`, `start_tcp_client`, `request_path`, `has_discovery_path_request` | B forwards path requests for unknown destinations only when its receiving interface's mode is in DISCOVER_PATHS_FOR={access_point, gateway, roaming}, gated correctly for every parametrized mode |
+| 9.20 | `test_roaming_no_answer_when_next_hop_on_same_interface` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `tx_bytes`, `read_path_entry` | Under ROAMING mode, B refuses to answer a path request when the cached path's next-hop is the same interface that received the PR (loop-prevention rule fires) |
+| 9.21 | `test_roaming_loop_prevention_positive_companion` | `start_tcp_server`, `start_tcp_client`, `announce`, `request_path`, `tx_bytes`, `read_path_entry` | Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn't vacuously passing because B never answers |
+| 9.22 | `test_mode_specific_path_expiry_assignment` | `start_tcp_server`, `start_tcp_client`, `announce`, `read_path_entry` | Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter |
 
 ### `tests/wire/test_resource_invariants.py` (5 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.20 | `test_resource_identity_is_fresh_per_construction` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: two Resources built from byte-identical payloads get different identities — RNS draws a fresh random_hash per construction (Resource.py:193), so the hash never leaks that two payloads were equal |
-| 9.21 | `test_resource_encrypted_output_is_fresh_per_construction` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: two Resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (Resource.py:158/165) plus per-construction Link encryption keeps every chunk's ciphertext unique |
-| 9.22 | `test_resource_truncated_hash_is_consistent_with_full_hash` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs |
-| 9.23 | `test_resource_expected_proof_is_full_length` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's expected_proof is a full-length 32-byte SHA-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had |
-| 9.24 | `test_resource_hashmap_has_one_entry_per_part` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x MAPHASH_LEN — for a multi-part resource, catching a mis-sized or mis-counted hashmap |
+| 9.23 | `test_resource_identity_is_fresh_per_construction` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: two Resources built from byte-identical payloads get different identities — RNS draws a fresh random_hash per construction (Resource.py:193), so the hash never leaks that two payloads were equal |
+| 9.24 | `test_resource_encrypted_output_is_fresh_per_construction` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: two Resources built from byte-identical payloads produce entirely different encrypted parts — a fresh random prefix on the data stream (Resource.py:158/165) plus per-construction Link encryption keeps every chunk's ciphertext unique |
+| 9.25 | `test_resource_truncated_hash_is_consistent_with_full_hash` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's truncated_hash is its own full hash truncated to 16 bytes — not an independently derived value — catching an implementation that computes the two from different inputs |
+| 9.26 | `test_resource_expected_proof_is_full_length` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's expected_proof is a full-length 32-byte SHA-256 hash — directly catching the proof being truncated, which is the exact drift the deleted hand-rolled resource_proof command had |
+| 9.27 | `test_resource_hashmap_has_one_entry_per_part` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `resource_create` | Invariant: a Resource's hashmap carries exactly one 4-byte map hash per part — len(hashmap) == num_parts x MAPHASH_LEN — for a multi-part resource, catching a mis-sized or mis-counted hashmap |
 
 ### `tests/wire/test_resource_multihop.py` (4 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 9.25 | `test_small_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A sub-MDU 256-byte Resource transfer over a multi-hop Link round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF |
-| 9.26 | `test_chunked_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a multi-hop Link |
-| 9.27 | `test_chunked_resource_with_ifac_multihop` | `link_open`, `resource_send`, `resource_poll` | A 16 KiB Resource round-trips intact over an IFAC-protected multi-hop Link — exercises per-packet IFAC masking on Resource chunks (Columba production config) |
-| 9.28 | `test_large_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A 256 KiB Resource (~32 chunks) round-trips intact, stress-testing back-to-back link DATA transmission and reassembly |
+| 9.28 | `test_small_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A sub-MDU 256-byte Resource transfer over a multi-hop Link round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF |
+| 9.29 | `test_chunked_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a multi-hop Link |
+| 9.30 | `test_chunked_resource_with_ifac_multihop` | `link_open`, `resource_send`, `resource_poll` | A 16 KiB Resource round-trips intact over an IFAC-protected multi-hop Link — exercises per-packet IFAC masking on Resource chunks (Columba production config) |
+| 9.31 | `test_large_resource_multihop` | `link_open`, `resource_send`, `resource_poll` | A 256 KiB Resource (~32 chunks) round-trips intact, stress-testing back-to-back link DATA transmission and reassembly |
 
 ## 10. Transport Behavior (3 tests)
 

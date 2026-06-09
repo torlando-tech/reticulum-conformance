@@ -63,8 +63,10 @@ _FIXED_MTU = 500
 _MODE_AES256_CBC = 1
 
 # RNS.Link status ints (PENDING/HANDSHAKE/ACTIVE/STALE/CLOSED).
+_STATUS_PENDING = 0
 _STATUS_ACTIVE = 2
 _STATUS_STALE = 3
+_STATUS_CLOSED = 4
 
 
 # --- Proof-strategy DATA behaviour (Link.py:999-1008) ----------------------
@@ -360,3 +362,134 @@ def test_stale_link_recovers_to_active_on_inbound(wire_link_setup):
         f"the recovered non-initiator link must still answer the 0xFF keepalive "
         f"with 0xFE: {recovery!r}"
     )
+
+
+# --- LINKCLOSE link_id forgery teardown rejection (Link.py:710-722) ---------
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "send_forged_link_close", "link_status",
+    ],
+    verifies="LINKCLOSE teardown is gated on the embedded link_id (Link.teardown_packet, Link.py:710-722): injecting a LINKCLOSE whose decrypted payload is a WRONG 16-byte link id over an ACTIVE link does NOT tear it down — torn_down is False, status_before and status_after are both ACTIVE(2), and an independent link_status read still reports ACTIVE. The positive control is a genuine LINKCLOSE carrying the link's REAL link_id, which DOES tear the same link down (torn_down True, status_after CLOSED(4), link_status CLOSED) — so the survival above is a real id check, not a dead teardown path.",
+)
+def test_forged_link_close_with_wrong_link_id_is_ignored(wire_link_setup):
+    server, client, dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # A forged link id distinct from the real one (16-byte collision is
+    # astronomically improbable, but assert it so the negative is meaningful).
+    forged_id = secrets.token_bytes(len(link_id))
+    while forged_id == link_id:
+        forged_id = secrets.token_bytes(len(link_id))
+
+    # Negative: a LINKCLOSE carrying the WRONG link_id must be ignored — the
+    # established link stays ACTIVE (teardown_packet only acts when the decrypted
+    # payload equals the link's own link_id, Link.py:711-714).
+    forged = client.send_forged_link_close(link_id, forged_id)
+    assert forged["real_link_id"] == link_id.hex() and forged["forged_id"] == forged_id.hex(), (
+        f"forged-close did not target the right link / id: {forged!r}"
+    )
+    assert forged["status_before"] == _STATUS_ACTIVE, (
+        f"the link must be ACTIVE before the forged close so the rejection is "
+        f"meaningful, got status_before={forged['status_before']!r}: {forged!r}"
+    )
+    assert forged["torn_down"] is False, (
+        f"a LINKCLOSE carrying a link_id that does not match the link's own id "
+        f"must NOT tear the link down (Link.py:711-714), got {forged!r}"
+    )
+    assert forged["status_after"] == _STATUS_ACTIVE and forged["status_name_after"] == "ACTIVE", (
+        f"after a forged (wrong-id) LINKCLOSE the link must remain ACTIVE, got "
+        f"status_after={forged['status_after']!r}: {forged!r}"
+    )
+    # Independent confirmation via a second, separate read path: the live link
+    # snapshot must still report ACTIVE (the forged close left it untouched).
+    snap = client.link_status(link_id)
+    assert snap["status_name"] == "ACTIVE", (
+        f"an independent link_status read must confirm the link survived the "
+        f"forged close, got {snap!r}"
+    )
+
+    # Positive control: a genuine LINKCLOSE carrying the link's REAL link_id
+    # DOES tear the same link down — proving the survival above is a real id
+    # check on a live teardown path, not a no-op detector.
+    genuine = client.send_forged_link_close(link_id, link_id)
+    assert genuine["status_before"] == _STATUS_ACTIVE, (
+        f"the link must still have been ACTIVE going into the genuine close "
+        f"(the forged close did not secretly damage it), got {genuine!r}"
+    )
+    assert genuine["torn_down"] is True, (
+        f"a LINKCLOSE carrying the correct link_id MUST tear the link down "
+        f"(Link.py:711-714), got {genuine!r}"
+    )
+    assert genuine["status_after"] == _STATUS_CLOSED and genuine["status_name_after"] == "CLOSED", (
+        f"after a genuine LINKCLOSE the link must be CLOSED, got "
+        f"status_after={genuine['status_after']!r}: {genuine!r}"
+    )
+    closed = client.link_status(link_id)
+    assert closed["status_name"] == "CLOSED", (
+        f"an independent link_status read must confirm the genuine close tore "
+        f"the link down, got {closed!r}"
+    )
+
+
+# --- Link.identify on a PENDING link is a no-op (Link.py:459-475/:468) -------
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "link_identify", "listener_link_status",
+        "link_identify_pending",
+    ],
+    verifies="Link.identify is guarded by an ACTIVE-only check (Link.py:459-475/:468): calling identify on a PENDING (pre-ACTIVE) initiator link is a silent no-op — it does not raise (crashed False), emits no LINKIDENTIFY packet (identify_packet_sent False), leaves the link PENDING(0), and the link is an initiator. The positive control is Link.identify on the established ACTIVE link, which DOES propagate — the receiver-side inbound link reports remote_identified True with remote_identity_hash byte-equal to the identity presented — so the PENDING no-op is a real status gate, not a broken identify path.",
+)
+def test_link_identify_on_pending_link_is_noop(wire_link_setup):
+    server, client, dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Positive control: identify on the established ACTIVE link propagates to the
+    # receiver-side link (the same Link.identify, taken with status==ACTIVE).
+    active_identity = client.link_identify(link_id, secrets.token_bytes(64))
+    observed = None
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        snap = server.listener_link_status(dest_hash, timeout_ms=0)
+        if snap.get("remote_identified"):
+            observed = snap
+            break
+        time.sleep(0.1)
+    assert observed is not None, (
+        "positive control failed: Link.identify on the ACTIVE link never "
+        "propagated to the receiver — cannot conclude the PENDING case is a gate"
+    )
+    assert observed["remote_identity_hash"] == active_identity.hex(), (
+        f"the receiver must surface the identity the ACTIVE-link initiator "
+        f"presented, expected {active_identity.hex()!r}, got {observed!r}"
+    )
+
+    # Negative: the harness builds a fresh initiator link forced to PENDING and
+    # calls identify on it. The ACTIVE-only guard (Link.py:468) must make this a
+    # silent no-op: no exception, no LINKIDENTIFY packet, link still PENDING.
+    pending = client.bridge.execute(
+        "wire_link_identify_pending",
+        handle=client.handle,
+        destination_hash=dest_hash.hex(),
+        app_name=_APP,
+        aspects=list(_ASPECTS),
+        private_key=secrets.token_bytes(64).hex(),
+    )
+    assert pending["initiator"] is True, (
+        f"the probed link must be an initiator link (identify only ever acts on "
+        f"initiator links), got {pending!r}"
+    )
+    assert pending["crashed"] is False, (
+        f"Link.identify on a PENDING link must not raise — it is guarded by the "
+        f"ACTIVE-only check (Link.py:468), got {pending!r}"
+    )
+    assert pending["identify_packet_sent"] is False, (
+        f"Link.identify on a PENDING link must emit NO LINKIDENTIFY packet "
+        f"(the guard returns before send, Link.py:468), got {pending!r}"
+    )
+    assert pending["status"] == _STATUS_PENDING and pending["status_name"] == "PENDING", (
+        f"the link must remain PENDING after the no-op identify, got "
+        f"status={pending['status']!r}: {pending!r}"
+    )
+

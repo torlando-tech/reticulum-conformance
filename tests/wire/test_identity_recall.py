@@ -31,6 +31,9 @@ __category_order__ = 18
 _APP = "conformance"
 _ASPECTS = ["identity-recall"]
 _POLL_TIMEOUT_MS = 10000
+# The display-name/payload byte string an app rides on the announce so peers can
+# label it (Sideband display name, NomadNet node name, LXMF stamp/ticket blob).
+_APP_DATA = b"display-name-xyz"
 
 
 @conformance_case(
@@ -133,4 +136,149 @@ def test_identity_recall_unknown_returns_none(wire_peers):
         f"returned a non-None result for a never-announced destination "
         f"hash: {recalled!r}. A recall impl that fabricates Identities "
         f"for unknown hashes silently corrupts outbound encryption."
+    )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "announce", "poll_path",
+        "identity_recall",
+    ],
+    verifies="recall app_data round-trip (Identity.py:161-174/:138/:149): after peer B receives an announce that carried app_data, RNS.Identity.recall(destination_hash).app_data (== RNS.Identity.recall_app_data(destination_hash)) is byte-identical to the exact bytes the announcer passed to Destination.announce(app_data=...); the negative control recall_app_data(unknown_hash) returns None — the announce-borne label/payload every app reads off a peer (Sideband display name, NomadNet node name, LXMF stamp/ticket app_data)",
+)
+def test_recall_app_data_round_trip(wire_peers):
+    """A announces a destination carrying app_data; B receives the announce,
+    recalls A's identity, and gets back the SAME app_data bytes. A recall that
+    drops/garbles app_data would mislabel the peer in every consuming app.
+    """
+    server, client = wire_peers
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="", passphrase="",
+        target_host="127.0.0.1", target_port=port,
+    )
+
+    # Announce a fresh SINGLE destination carrying app_data. wire_announce
+    # passes app_data straight to Destination.announce(app_data=...), so what
+    # the receiver stores in known_destinations[...][3] must be byte-identical.
+    server_dest = server.announce(
+        app_name=_APP, aspects=_ASPECTS, app_data=_APP_DATA,
+    )
+
+    # Wait for the announce to land — the app_data is stored in the same
+    # known_destinations write that creates the path entry, so once the path
+    # is learned the recalled app_data is available.
+    assert client.poll_path(server_dest, timeout_ms=_POLL_TIMEOUT_MS), (
+        f"{client.role_label} never learned a path to {server.role_label}'s "
+        f"announced destination — recall_app_data is untestable without the "
+        f"announce reception."
+    )
+
+    recalled = client.identity_recall(server_dest, timeout_ms=_POLL_TIMEOUT_MS)
+    assert recalled is not None, (
+        f"{client.role_label}.Identity.recall({server_dest.hex()}) returned "
+        f"None despite the path being learned — the announce was received but "
+        f"the receiver's known_destinations table is missing the announcer."
+    )
+    # The discriminating assertion: byte-identity of the recalled app_data to
+    # the announced bytes. An impl that drops app_data surfaces None here; one
+    # that garbles it surfaces wrong bytes.
+    assert recalled["app_data"] == _APP_DATA, (
+        f"recalled app_data for {server_dest.hex()} is not byte-identical to "
+        f"the announced app_data. recalled={recalled['app_data']!r} "
+        f"announced={_APP_DATA!r}. recall_app_data lost/garbled the announce "
+        f"payload — every app reading this peer's label would be wrong."
+    )
+
+    # Negative control: recall_app_data(unknown_hash) -> None. A never-announced
+    # hash must surface no identity (and therefore no app_data), not a stub.
+    unknown_hash = secrets.token_bytes(16)
+    assert client.identity_recall(unknown_hash, timeout_ms=0) is None, (
+        f"{client.role_label}.Identity.recall_app_data({unknown_hash.hex()}) "
+        f"surfaced app_data for a never-announced destination hash — an impl "
+        f"that fabricates app_data for unknown hashes mislabels unknown peers."
+    )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "identity_recall",
+    ],
+    verifies="recall from_identity_hash variant (Identity.py:129-141): RNS.Identity.recall(identity_hash, from_identity_hash=True) resolves a received announce by the announcer's IDENTITY hash (matched against truncated_hash(public_key)) rather than its destination hash, and returns the SAME Identity (byte-identical public_key and identity hash) as the default destination-hash recall; the control recall(destination_hash, from_identity_hash=True) returns None, proving the lookup actually keys on identity hash and not destination hash",
+)
+def test_recall_from_identity_hash(wire_peers):
+    """B recalls A's identity by A's IDENTITY hash (from_identity_hash=True)
+    and gets the same identity as the destination-hash recall. An impl that
+    ignores the flag treats the identity hash as a destination hash, finds
+    nothing, and returns None.
+    """
+    server, client = wire_peers
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="", passphrase="",
+        target_host="127.0.0.1", target_port=port,
+    )
+
+    server_dest = server.listen(app_name=_APP, aspects=_ASPECTS)
+    announced = server.listening_identity(server_dest)
+    assert announced["public_key"] is not None, (
+        f"wire_listen did not surface the listening identity's public_key for "
+        f"{server_dest.hex()}; byte-identity recall is unassertable."
+    )
+    identity_hash = announced["identity_hash"]
+    # The destination hash and identity hash are distinct 16-byte values; the
+    # whole point of from_identity_hash is to key on the latter.
+    assert identity_hash != server_dest, (
+        f"identity hash {identity_hash.hex()} == destination hash "
+        f"{server_dest.hex()}; the from_identity_hash control below would be "
+        f"meaningless."
+    )
+
+    assert client.poll_path(server_dest, timeout_ms=_POLL_TIMEOUT_MS), (
+        f"{client.role_label} never learned a path to {server.role_label}'s "
+        f"destination — recall is untestable without the announce reception."
+    )
+
+    # Baseline: the default destination-hash recall confirms the announce was
+    # received and gives the identity to compare against.
+    by_dest = client.identity_recall(server_dest, timeout_ms=_POLL_TIMEOUT_MS)
+    assert by_dest is not None and by_dest["public_key"] == announced["public_key"], (
+        f"destination-hash recall of {server_dest.hex()} did not return the "
+        f"announced identity — from_identity_hash cannot be compared."
+    )
+
+    # The variant under test: recall by IDENTITY hash. has_path keys on
+    # destination hashes, so the bridge skips the path poll for this mode; the
+    # known_destinations entry already exists (proven by by_dest above), so a
+    # zero timeout is sufficient.
+    by_id = client.identity_recall(
+        identity_hash, timeout_ms=0, from_identity_hash=True,
+    )
+    assert by_id is not None, (
+        f"{client.role_label}.Identity.recall({identity_hash.hex()}, "
+        f"from_identity_hash=True) returned None — an impl that ignores "
+        f"from_identity_hash treats the identity hash as a destination hash "
+        f"(which is unknown) and fails to resolve the announcer by identity."
+    )
+    assert by_id["public_key"] == announced["public_key"], (
+        f"from_identity_hash recall bound to the WRONG public key: "
+        f"got {by_id['public_key'].hex()}, expected "
+        f"{announced['public_key'].hex()}."
+    )
+    assert by_id["hash"] == identity_hash, (
+        f"from_identity_hash recall returned identity hash {by_id['hash'].hex()} "
+        f"!= the queried identity hash {identity_hash.hex()}."
+    )
+
+    # Control proving the lookup truly keys on identity hash: passing the
+    # DESTINATION hash with from_identity_hash=True must NOT resolve (no stored
+    # public key truncates to the destination hash).
+    cross = client.identity_recall(
+        server_dest, timeout_ms=0, from_identity_hash=True,
+    )
+    assert cross is None, (
+        f"recall({server_dest.hex()}, from_identity_hash=True) resolved an "
+        f"identity, but the destination hash is not any announcer's identity "
+        f"hash — from_identity_hash is not keying on the identity hash."
     )

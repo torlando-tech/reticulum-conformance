@@ -14,12 +14,15 @@ Honest test: peer A registers a fixed-response handler on a destination,
 peer B opens a link and calls link.request(path, data). Real RNS routes
 the request to A's handler, runs it, sends the response back over the
 link, fires B's response_callback. We assert:
-  - the response RNS delivered matches what A's handler returned,
+  - the response RNS delivered matches what A's handler returned, and
   - the handler was invoked exactly once with the exact request bytes B
     sent (this catches an impl that loses/duplicates request data on the
-    wire), and
-  - the handler observed B's identity (impls that drop remote_identity
-    break authentication-gated request handlers).
+    wire).
+
+The identity-gated path — where the handler observes the requester's
+Identity after Link.identify — is NOT exercised here: this test leaves the
+requester un-identified, so remote_identity is None by RNS default. That
+path is covered separately in test_link_identify.py.
 """
 
 import secrets
@@ -41,10 +44,11 @@ _REQUEST_TIMEOUT_MS = 15000
 
 @conformance_case(
     commands=[
-        "start_tcp_server", "start_tcp_client", "listen", "link_open",
-        "register_request_handler", "link_request", "get_request_log",
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "link_request",
+        "get_request_log",
     ],
-    verifies="RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester's Identity",
+    verifies="RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data the client sent",
 )
 def test_link_request_round_trip(wire_peers):
     server, client = wire_peers

@@ -34,13 +34,13 @@ _POLL_TIMEOUT_MS = 10000
 
 
 @conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "announce", "identity_recall"],
-    verifies="After receiving an announce, RNS.Identity.recall(destination_hash) returns the announcing peer's real Identity with byte-identical public_key — the lookup every app does to bind a destination hash back to its underlying identity (Columba NomadNet handler, Sideband conversation routing, LXMF LXMessage source/destination resolution)",
+    commands=["start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path", "read_path_entry", "identity_recall"],
+    verifies="After receiving an announce over a 1-hop link, RNS.Identity.recall(destination_hash) returns the announcing peer's real Identity whose public_key AND identity hash are byte-identical to the listening peer's announced identity (asserted against the identity wire_listen surfaces, not merely 64/16-byte length); the learned path is a deterministic 1 hop — the lookup every app does to bind a destination hash back to its underlying identity (Columba NomadNet handler, Sideband conversation routing, LXMF LXMessage source/destination resolution)",
 )
 def test_identity_recall_after_announce(wire_peers):
     """Peer A announces an IN destination; peer B recalls A's identity
-    from the announce-populated known_destinations table and gets A's
-    full public key back.
+    from the announce-populated known_destinations table and gets back
+    A's exact public key (byte-for-byte, N-M3) and identity hash.
     """
     server, client = wire_peers
     port = server.start_tcp_server(network_name="", passphrase="")
@@ -50,8 +50,16 @@ def test_identity_recall_after_announce(wire_peers):
     )
 
     # Server registers an IN destination and announces it. wire_listen
-    # in the bridge automatically emits the announce after registration.
+    # in the bridge automatically emits the announce after registration,
+    # and surfaces the listening identity (hash + raw public_key) so the
+    # recall below can be asserted byte-identical, not merely length-shaped.
     server_dest = server.listen(app_name=_APP, aspects=_ASPECTS)
+    announced = server.listening_identity(server_dest)
+    assert announced["public_key"] is not None, (
+        f"wire_listen did not surface the listening identity's public_key "
+        f"for {server_dest.hex()}; byte-identity recall (N-M3) is "
+        f"unassertable. Update the bridge's wire_listen to return public_key."
+    )
 
     # Client waits for the announce to land — Transport.has_path is the
     # observable proof. identity_recall's own timeout polls the same
@@ -62,6 +70,17 @@ def test_identity_recall_after_announce(wire_peers):
         f"announce reception."
     )
 
+    # The announce traversed exactly one interface hop (A's TCP client ->
+    # B's spawned child), so the learned path is deterministically 1 hop.
+    # Asserting it (L15) catches an impl that mis-counts hops on a direct
+    # link — which would mis-rank this path against any alternate route.
+    entry = client.read_path_entry(server_dest)
+    assert entry is not None and entry["hops"] == 1, (
+        f"{client.role_label} learned a path to {server_dest.hex()} but "
+        f"recorded hops={entry['hops'] if entry else None}; a direct "
+        f"1-hop announce must store hops==1."
+    )
+
     recalled = client.identity_recall(server_dest, timeout_ms=_POLL_TIMEOUT_MS)
     assert recalled is not None, (
         f"{client.role_label}.Identity.recall({server_dest.hex()}) "
@@ -69,13 +88,24 @@ def test_identity_recall_after_announce(wire_peers):
         f"received but the receiver's known_destinations table is "
         f"missing the Identity that signed it."
     )
-    assert len(recalled["public_key"]) == 64, (
-        f"recalled public_key is {len(recalled['public_key'])} bytes; "
-        f"RNS Identity public keys are 64 bytes (X25519 32 + Ed25519 32)"
+    # N-M3: byte-identity, not length. The recalled public_key must be the
+    # SAME 64 bytes the server announced; a wrong-but-64-byte key (e.g. a
+    # fabricated stub, or the wrong identity recalled for this hash) would
+    # pass a length-only check but fail here.
+    assert recalled["public_key"] == announced["public_key"], (
+        f"recalled public_key for {server_dest.hex()} is not byte-identical "
+        f"to the announced one. recalled={recalled['public_key'].hex()} "
+        f"announced={announced['public_key'].hex()}. Identity.recall bound "
+        f"the destination hash to the WRONG public key — outbound "
+        f"encryption to this destination would go to the wrong key."
     )
-    # The recalled identity's own hash is truncated_hash(public_key) —
-    # 16 bytes derived from the same public key the recall returned.
-    assert len(recalled["hash"]) == 16
+    # The recalled identity's own hash is truncated_hash(public_key); it must
+    # equal the hash of the identity the server announced.
+    assert recalled["hash"] == announced["identity_hash"], (
+        f"recalled identity hash {recalled['hash'].hex()} != announced "
+        f"identity hash {announced['identity_hash'].hex()} for "
+        f"{server_dest.hex()}."
+    )
 
 
 @conformance_case(

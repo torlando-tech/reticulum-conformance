@@ -7,15 +7,17 @@ path layer makes. They're deliberately 2-peer or 3-peer where the
 observable is tight enough to distinguish "rule fired" from "rule did
 not fire" without any timing slop.
 
-References (line numbers against Python Reticulum Transport.py):
-  - request_path:                    2541
-  - path_request_handler:            2646
-  - path_request:                    2696
-  - cached-announce re-emission:     2724, 2735-2781
-  - ROAMING loop-prevention drop:    2731-2732
-  - DISCOVER_PATHS_FOR gating:       2700 (Interface.py:54)
-  - per-mode expiry assignment:      1730-1735
-  - path expiry constants:           70-72 (PATHFINDER_E / AP_PATH_TIME /
+References (line numbers against installed Python RNS 1.3.1 Transport.py):
+  - request_path:                    2769
+  - path_request_handler:            2864
+  - path_request:                    2909
+  - cached-announce re-emission:     2949-3013 (announce_table set at 3000)
+  - ROAMING loop-prevention drop:    2949 (cached received_from read at 2944)
+  - DISCOVER_PATHS_FOR gating:       2916 (Interface.py:54)
+  - per-mode expiry assignment:      1874-1878 (timestamp `now` stamped once at
+                                     1832; entry stored at 2011 with the SAME
+                                     `now`, so expires - timestamp is exact)
+  - path expiry constants:           71-73 (PATHFINDER_E / AP_PATH_TIME /
                                      ROAMING_PATH_TIME)
 
 Kotlin mirrors (rns-core/src/main/kotlin/network/reticulum/transport/
@@ -68,6 +70,15 @@ _PR_ANSWER_SETTLE_SEC = 2.0
 # a local state check on the transport side, not an observation of wire
 # traffic, so a small window catches the state-set before cull.
 _LOCAL_STATE_SETTLE_SEC = 0.3
+# How long to watch B's TX after a PR (L12). This MUST exceed the worst-case
+# answer latency, otherwise the negative (suppress) test can't be told apart
+# from a merely-delayed answer. A roaming/AP answer is scheduled at
+# now + PATH_REQUEST_GRACE (0.4s) and emitted on the announce-loop tick
+# (announces_check_interval ~1s) plus a rebroadcast random window
+# (PATHFINDER_RW 0.5s) and wire RTT — a worst case near ~2.9s. 4.0s clears
+# that with headroom, so if B were going to answer at all, the bytes appear
+# inside the window.
+_PR_OBSERVE_SEC = 4.0
 
 
 def _start_three_peer_topology(
@@ -82,8 +93,9 @@ def _start_three_peer_topology(
     C = receiver (TCPClient). All three connect on loopback.
 
     `transport_mode` is applied to B's server and (via TCPServerInterface's
-    spawn-time mode propagation mirrored from Python TCPInterface.py:619)
-    to the child interfaces spawned per peer connection, so B's
+    spawn-time mode propagation, Python RNS 1.3.1 TCPInterface.py:625
+    `spawned_interface.mode = self.mode`) to the child interfaces spawned
+    per peer connection, so B's
     `receiving_interface` for packets from either A or C reports the
     configured mode.
 
@@ -127,7 +139,7 @@ _ISSUE_46_REASON = (
 
 
 @conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "poll_path", "read_path_random_hash"],
+    commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "poll_path", "read_path_entry", "read_path_random_hash"],
     verifies="When B answers a path request for a destination it cached, the re-emitted announce's random_hash bytes are byte-identical to the cached announce's (no regeneration on re-emit)",
 )
 def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
@@ -258,7 +270,8 @@ def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
     Observable: `B.has_discovery_path_request(UNKNOWN)` — a membership
     test on `Transport.discovery_path_requests`. That dict is populated
     at the exact spot in path_request() where the mode-gated forwarding
-    branch runs (Python Transport.py:2800, Kotlin
+    branch runs (Python RNS 1.3.1 Transport.py:3030, reached only via the
+    `should_search_for_unknown` gate set at 2916; Kotlin
     Transport.kt:processPathRequest case 2).
 
     Tight assertion: `assert has == expected_forwarded`. Not `>= 1`; the
@@ -304,22 +317,22 @@ def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
 
 def _tx_delta_after_pr(requester, transport_peer, dest_hash):
     """Helper: send a path request from `requester` and return how many
-    bytes `transport_peer` emits within PATH_REQUEST_GRACE + the
-    announce-loop tick interval.
+    bytes `transport_peer` emits within the full worst-case answer window.
 
     TX-byte deltas are the model-agnostic "did B send anything" signal;
     they don't depend on impl-specific held_announces restore timing or
     announce_table observability.
 
-    Timing budget: Python schedules the answer at now + PATH_REQUEST_GRACE
-    (0.4s) and the announce loop checks every ~1s
-    (Transport.announces_check_interval), so the first actual send
-    usually lands around 0.8-1.0s after the PR. 2.5s covers both sides'
-    grace + first tick + wire RTT with headroom.
+    Timing budget (L12): Python schedules the answer at now +
+    PATH_REQUEST_GRACE (0.4s) and the announce loop checks every ~1s
+    (Transport.announces_check_interval), so an actual answer usually lands
+    around 0.8-1.0s but worst-cases near ~2.9s. We wait _PR_OBSERVE_SEC
+    (4.0s) so a merely-delayed answer cannot masquerade as suppression in
+    the negative test.
     """
     tx_before = transport_peer.tx_bytes()
     requester.request_path(dest_hash)
-    time.sleep(2.5)
+    time.sleep(_PR_OBSERVE_SEC)
     return transport_peer.tx_bytes() - tx_before
 
 
@@ -332,7 +345,7 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     is itself the `received_from` of the cached path, B must refuse to
     answer.
 
-    The rule (Python Transport.py:2731-2732 / Kotlin
+    The rule (Python RNS 1.3.1 Transport.py:2949 / Kotlin
     Transport.kt:processPathRequest's roaming branch) prevents a PR and
     its response from ping-ponging on a single shared-medium ROAMING
     link. The mode bit matters: the same topology under FULL mode DOES
@@ -344,11 +357,11 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     B's attached_interface (the same spawned child) == received_from,
     mode == ROAMING → rule fires → B does NOT emit an answer packet.
 
-    Observable: B's outbound TX byte count — a delta of zero during
-    the post-PR grace window means no packet left B's wire. A separate
-    companion test asserts the positive case (FULL mode → non-zero
-    delta), catching any regression that makes this test vacuously
-    pass.
+    Observable: B's outbound TX byte count — a near-zero delta over the
+    full worst-case answer window (_PR_OBSERVE_SEC) means no packet left
+    B's wire (suppression, not delay). A separate companion test asserts
+    the positive case (FULL mode → a genuine-answer-sized delta),
+    catching any regression that makes this test vacuously pass.
     """
     server, client = wire_peers
 
@@ -390,17 +403,30 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     assert tx_delta < 20, (
         f"B ({server.role_label}) emitted {tx_delta} bytes after A's "
         f"PR for {dest_hash.hex()} under ROAMING mode (above idle-"
-        f"traffic budget). The roaming loop-prevention rule "
-        f"(Transport.py:2731 / Transport.kt:processPathRequest's "
+        f"traffic budget, observed over {_PR_OBSERVE_SEC}s which exceeds "
+        f"the worst-case answer latency — so this is suppression, not a "
+        f"delayed answer). The roaming loop-prevention rule "
+        f"(Transport.py:2949 / Transport.kt:processPathRequest's "
         f"roaming-mode branch) should have skipped the answer path "
         f"entirely — B's A-facing interface IS the `received_from` "
         f"for D1's cached path, and both are ROAMING."
     )
 
 
+# Floor for "B actually answered the PR" (L13). A FULL-mode answer is the
+# cached announce re-emitted as a HEADER_2 path response: empirically ~370
+# bytes on the reference (signature + random_hash + app_data + framing). We
+# require the delta to clear the negative test's <20-byte idle budget by a
+# wide margin so the positive control is symmetric with — and strictly
+# stronger than — the negative's "<20 = no answer" boundary. 100 sits well
+# above idle framing yet far below the real ~370 answer, so it is robust to
+# MTU / keepalive-framing differences without weakening to a bare `> 0`.
+_PR_ANSWER_FLOOR_BYTES = 100
+
+
 @conformance_case(
     commands=["start_tcp_server", "start_tcp_client", "announce", "request_path", "tx_bytes", "read_path_entry"],
-    verifies="Under FULL mode (companion to the ROAMING test) B does answer the PR — proves the ROAMING test isn't vacuously passing because B never answers",
+    verifies="Under FULL mode (companion to the ROAMING test) B answers the PR with a genuine-answer-sized burst (>=100 bytes, vs the ROAMING test's <20 idle budget) — proves the ROAMING suppression test isn't vacuously passing because B never answers",
 )
 def test_roaming_loop_prevention_positive_companion(wire_peers):
     """Companion to the negative test above. Same 2-peer topology, but
@@ -431,16 +457,20 @@ def test_roaming_loop_prevention_positive_companion(wire_peers):
 
     tx_delta = _tx_delta_after_pr(client, server, dest_hash)
 
-    # Under FULL, B must emit at least the HEADER_2-wrapped cached
-    # announce (~160 bytes for a minimal destination + signature). A
-    # non-zero delta is the positive signal; the exact byte count isn't
-    # asserted here (MTU varies, keepalive framing overhead differs
-    # across impls).
-    assert tx_delta > 0, (
-        f"B ({server.role_label}) did not emit any bytes in response "
-        f"to A's PR for {dest_hash.hex()} under FULL mode "
-        f"(tx_delta={tx_delta}). The positive path is broken, which "
-        f"means the negative test's observable is unreliable."
+    # Under FULL, B re-emits the cached announce as a HEADER_2 path
+    # response (~370 bytes on the reference). Requiring >= 100 makes this
+    # floor symmetric with — and strictly stronger than — the negative
+    # test's `< 20` idle budget, so the pair brackets the same observable:
+    # < 20 == "no answer", >= 100 == "genuine answer". A bare `> 0` floor
+    # (the prior L13 weakness) could be satisfied by a few bytes of idle
+    # framing and would not actually prove B answered.
+    assert tx_delta >= _PR_ANSWER_FLOOR_BYTES, (
+        f"B ({server.role_label}) emitted only {tx_delta} bytes in "
+        f"response to A's PR for {dest_hash.hex()} under FULL mode "
+        f"(floor={_PR_ANSWER_FLOOR_BYTES}). A genuine cached-announce "
+        f"path response is hundreds of bytes; a sub-floor delta means the "
+        f"positive path is broken, which would make the negative test's "
+        f"observable unreliable."
     )
 
 
@@ -456,12 +486,18 @@ _EXPIRY_EXPECTATIONS = [
     ("roaming", _ROAMING_PATH_TIME_MS, "ROAMING_PATH_TIME (6h)"),
 ]
 
-# Allow tiny jitter between when the bridge stamps `timestamp` and when
-# Transport stamps `expires` — these are a couple of function calls
-# apart, well below 1 second in practice. Expanding this window should
-# not be needed; if the delta drifts, investigate whether clocks are
-# being read from different sources on the two sides.
-_EXPIRY_JITTER_MS = 1000
+# L14: RNS stamps the path entry from a SINGLE `now = time.time()`
+# (Transport.py:1832); both the stored timestamp (entry[0], line 2011) and
+# `expires` (now + the per-mode constant, lines 1874-1878) derive from that
+# same `now`, so `expires - timestamp` is mathematically EXACTLY the constant
+# (in seconds). The only slack is the bridge's float-seconds -> int-ms
+# truncation (int(expires*1000) - int(timestamp*1000)); since the per-mode
+# constant is a whole number of seconds, that subtraction is exact to the
+# millisecond except for sub-ULP float error near a ms boundary. Empirically
+# the delta is exact (diff=0) for all three modes; ±2ms is a safe, justified
+# bound (vs the prior unjustified ±1000ms, which would have hidden a constant
+# applied wrongly by up to a second).
+_EXPIRY_JITTER_MS = 2
 
 
 @conformance_case(
@@ -482,7 +518,8 @@ def test_mode_specific_path_expiry_assignment(
         ROAMING      → ROAMING_PATH_TIME (6h)
         everything else → PATHFINDER_E (7d)
 
-    (Python Transport.py:1730-1735; Kotlin AnnounceFilter.pathExpiryForMode.)
+    (Python RNS 1.3.1 Transport.py:1874-1878; Kotlin
+    AnnounceFilter.pathExpiryForMode.)
 
     We don't need clock control for this: send an announce and
     immediately read the stored entry. expires - timestamp must equal
@@ -491,13 +528,14 @@ def test_mode_specific_path_expiry_assignment(
     server, client = wire_peers
 
     # Only set the mode on the server side (the receiving side). The
-    # expiry-assignment branch at Transport.py:1730 keys off
+    # expiry-assignment branch at Transport.py:1873-1878 keys off
     # `packet.receiving_interface.mode`, and that's the server-spawned
     # child that inherits the server's configured mode (Kotlin propagates
-    # via TCPServerInterface:149, Python via TCPInterface.py:619).
-    # Setting the client's mode too would, in AP mode, block A's outbound
-    # announce (Transport.py:1042) and the test would see no path entry
-    # for reasons unrelated to expiry assignment.
+    # via TCPServerInterface:149, Python via TCPInterface.py:625
+    # `spawned_interface.mode = self.mode`). Setting the client's mode too
+    # would, in AP mode, block A's outbound announce (Transport.py:1191-1195)
+    # and the test would see no path entry for reasons unrelated to expiry
+    # assignment.
     port = server.start_tcp_server(network_name="", passphrase="", mode=mode)
     client.start_tcp_client(
         network_name="",
@@ -519,12 +557,12 @@ def test_mode_specific_path_expiry_assignment(
 
     delta = entry["expires"] - entry["timestamp"]
 
-    # Tight bound: the delta should equal the expected constant exactly.
-    # Small jitter is allowed because on Python `timestamp` and `expires`
-    # are stamped by two distinct `time.time()` calls (Transport.py:1663
-    # and 1731) a few microseconds apart. On Kotlin
-    # (Transport.kt:3317) `System.currentTimeMillis()` is called once
-    # but the jitter bound keeps the cross-impl contract symmetric.
+    # Exact bound: on Python both timestamp and expires come from the SAME
+    # `now` (Transport.py:1832), so expires - timestamp is exactly the
+    # per-mode constant; the ±2ms only absorbs float-seconds -> int-ms
+    # truncation (see _EXPIRY_JITTER_MS). On Kotlin
+    # System.currentTimeMillis() is likewise read once, so the contract is
+    # symmetric.
     lower = expected_delta_ms - _EXPIRY_JITTER_MS
     upper = expected_delta_ms + _EXPIRY_JITTER_MS
     assert lower <= delta <= upper, (
@@ -532,7 +570,7 @@ def test_mode_specific_path_expiry_assignment(
         f"path entry with expires-timestamp = {delta}ms; expected "
         f"{expected_delta_ms}ms ±{_EXPIRY_JITTER_MS}ms. This indicates "
         f"either the wrong expiry constant was applied (check "
-        f"AnnounceFilter.pathExpiryForMode on Kotlin / lines 1730-1735 "
+        f"AnnounceFilter.pathExpiryForMode on Kotlin / lines 1874-1878 "
         f"on Python) or the interface mode wasn't applied correctly "
         f"to the receiving interface."
     )

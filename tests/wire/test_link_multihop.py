@@ -111,12 +111,28 @@ def _setup_three_peer_topology(wire_3peer):
         f"meaningless."
     )
 
+    # Pin that the learned path is genuinely multi-hop (L10): the announce
+    # reached the sender via the transport, so the path table must record
+    # hops >= 2 (sender -> transport -> receiver). A 1-hop path would mean
+    # the sender somehow reached the receiver directly, which would make the
+    # whole "data must cross a transport" premise of these tests vacuous.
+    entry = sender.read_path_entry(dest_hash)
+    assert entry is not None and entry["hops"] >= 2, (
+        f"{sender.role_label} learned a path to {receiver.role_label} but it "
+        f"is not multi-hop: expected hops>=2 via {transport.role_label}, got "
+        f"path entry {entry!r}. The multi-hop link tests are only meaningful "
+        f"over a >=2-hop path."
+    )
+
     return sender, transport, receiver, dest_hash
 
 
 @conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "announce", "link_open"],
-    verifies="A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout",
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "read_path_entry", "link_open",
+    ],
+    verifies="A 2-hop Link (sender → TCP transport → receiver) establishes with a 16-byte link_id within the establishment timeout, over a path the sender's path table records as hops>=2",
 )
 def test_link_establishes_multihop(wire_3peer):
     """Baseline: a 2-hop Link must establish successfully across a transport.
@@ -143,8 +159,11 @@ def test_link_establishes_multihop(wire_3peer):
 
 
 @conformance_case(
-    commands=["link_open", "link_send", "link_poll"],
-    verifies="Bytes sent over an established multi-hop Link arrive at the receiver intact — catches HEADER_2 transport_id mis-wrapping at the sender",
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "read_path_entry", "link_open", "link_send", "link_poll",
+    ],
+    verifies="Bytes sent over an established multi-hop (hops>=2) Link arrive at the receiver as exactly one packet equal to what was sent — catches HEADER_2 transport_id mis-wrapping at the sender",
 )
 def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     """The real test: once the link is established, sent bytes must
@@ -185,16 +204,23 @@ def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
         f"the transport dropped them as 'in transport for other "
         f"transport instance'."
     )
-    assert payload in received, (
-        f"{receiver.role_label} received link data, but the payload does "
-        f"not match what {sender.role_label} sent. Got: "
-        f"{[r.hex() for r in received]!r}; expected: {payload.hex()}."
+    # Exactly one packet, equal to what was sent (L10/L9): a single
+    # link_send must deliver precisely one DATA packet with the same bytes —
+    # tighter than a membership check, which would tolerate spurious extra
+    # packets or duplicates alongside the expected payload.
+    assert received == [payload], (
+        f"{receiver.role_label} received link data, but it does not exactly "
+        f"match the single packet {sender.role_label} sent. Got: "
+        f"{[r.hex() for r in received]!r}; expected: [{payload.hex()}]."
     )
 
 
 @conformance_case(
-    commands=["link_open", "link_send", "link_poll"],
-    verifies="Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset — catches 'only first packet routes' regressions",
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "read_path_entry", "link_open", "link_send", "link_poll",
+    ],
+    verifies="Five back-to-back link DATA packets (16-48 bytes each) all arrive at the receiver as a multiset over a multi-hop (hops>=2) Link — catches 'only first packet routes' regressions",
 )
 def test_link_data_roundtrip_multiple_packets(wire_trio, wire_3peer):
     """Extension: multiple consecutive sends must all arrive. This

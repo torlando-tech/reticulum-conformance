@@ -364,6 +364,14 @@ def cmd_wire_start_tcp_server(params):
     passphrase = params.get("passphrase") or ""
     bind_port = int(params.get("bind_port", 0))
     share_instance = bool(params.get("share_instance", False))
+    # enable_transport (default True) lets a test bring up a transport-DISABLED
+    # shared master — the rnsd default posture, and the only way to exercise R3
+    # (CONFORMANCE_GAPS.md §3): local-client forwarding BYPASSES transport_enabled
+    # (Transport.py:1536/:1884/:2172/:2254). With this False + share_instance=True,
+    # an attached local client's announces/links must still reach a TCP peer even
+    # though Reticulum.transport_enabled() is False on the master; an impl that
+    # gates local-client forwarding on transport_enabled black-holes them.
+    enable_transport = bool(params.get("enable_transport", True))
     share_instance_type = params.get("share_instance_type")
     if share_instance_type is not None:
         share_instance_type = str(share_instance_type).lower()
@@ -421,6 +429,7 @@ def cmd_wire_start_tcp_server(params):
         shared_instance_port=shared_instance_port,
         instance_control_port=instance_control_port,
         rpc_key=rpc_key_hex,
+        enable_transport=enable_transport,
     )
 
     RNS = _get_rns()
@@ -442,12 +451,19 @@ def cmd_wire_start_tcp_server(params):
             "shared_instance_port": shared_instance_port,
             "instance_control_port": instance_control_port,
             "rpc_key": rpc_key_hex,
+            "enable_transport": enable_transport,
         }
 
     response = {
         "handle": handle,
         "port": bind_port,
         "identity_hash": identity_hash.hex(),
+        # Surface the resolved transport posture so a test can assert it took
+        # (and so wire_start_tcp_server(enable_transport=False) is self-
+        # documenting in logs). RNS.Reticulum.transport_enabled() is the
+        # ground-truth observable a test should pin, but echoing the config
+        # value here lets the fixture record it without a second round-trip.
+        "transport_enabled": bool(enable_transport),
     }
     if share_instance:
         response["instance_name"] = instance_name
@@ -596,6 +612,178 @@ def cmd_wire_start_tcp_client(params):
         }
 
     return {"handle": handle, "identity_hash": identity_hash.hex()}
+
+
+def _pipe_command(read_fifo: str, write_fifo: str) -> str:
+    """Build the PipeInterface `command` that bridges this peer to another via
+    a pair of named FIFOs.
+
+    PipeInterface writes RNS's OUTGOING bytes to the spawned command's STDIN
+    and reads INCOMING bytes from its STDOUT. So the command must:
+      - copy STDIN (RNS outgoing) into `write_fifo` (this peer -> other peer)
+      - copy `read_fifo` (other peer -> this peer) into STDOUT (RNS incoming)
+    The peer on the other end uses the same template with read/write swapped,
+    so the two FIFOs cross-connect the two processes. Validated to carry
+    announces + link establishment between two separate RNS processes over
+    loopback (the only inter-process channel available to the separate-bridge-
+    subprocess wire harness, which has no shared in-process Transport).
+    """
+    return f"bash -c 'cat {read_fifo} & cat > {write_fifo}'"
+
+
+def _write_pipe_relay_config(
+    config_dir: str,
+    pipe_iface_name: str,
+    read_fifo: str,
+    write_fifo: str,
+    tcp_listen_port: int | None,
+    network_name: str,
+    passphrase: str,
+    enable_transport: bool,
+):
+    """Write an RNS config with a PipeInterface and (optionally) a
+    TCPServerInterface in the SAME instance — the mixed interface-type relay
+    used to exercise the in-transit link-MTU strip (CONFORMANCE_GAPS.md §2c).
+
+    When tcp_listen_port is None this is a pipe-ONLY leaf peer (the A end);
+    when set, this is the relay (the B middle) bridging a PipeInterface (to A)
+    and a TCPServerInterface (to C). PipeInterface inherits Interface's
+    AUTOCONFIGURE_MTU=False / FIXED_MTU=False, so a LINKREQUEST forwarded OUT
+    the pipe has its 3-byte LINK_MTU_SIZE signalling field stripped.
+    """
+    os.makedirs(config_dir, exist_ok=True)
+    ifac_lines = ""
+    if network_name:
+        ifac_lines += f"      network_name = {network_name}\n"
+    if passphrase:
+        ifac_lines += f"      passphrase = {passphrase}\n"
+
+    pipe_block = (
+        f"  [[{pipe_iface_name}]]\n"
+        "    type = PipeInterface\n"
+        "    enabled = Yes\n"
+        f"    command = {_pipe_command(read_fifo, write_fifo)}\n"
+        f"{ifac_lines}"
+    )
+    tcp_block = ""
+    if tcp_listen_port is not None:
+        tcp_block = (
+            f"  [[{pipe_iface_name} TCP]]\n"
+            "    type = TCPServerInterface\n"
+            "    enabled = Yes\n"
+            "    listen_ip = 127.0.0.1\n"
+            f"    listen_port = {tcp_listen_port}\n"
+            f"{ifac_lines}"
+        )
+
+    transport_value = "Yes" if enable_transport else "No"
+    with open(os.path.join(config_dir, "config"), "w") as f:
+        f.write(
+            "[reticulum]\n"
+            f"  enable_transport = {transport_value}\n"
+            "  share_instance = No\n"
+            "  respond_to_probes = No\n\n"
+            "[interfaces]\n"
+            f"{pipe_block}"
+            f"{tcp_block}"
+        )
+
+
+def cmd_wire_start_pipe_peer(params):
+    """Bring up RNS with a single PipeInterface bridged to a peer via FIFOs.
+
+    The leaf (A) end of the mixed pipe<->TCP relay topology. read_fifo and
+    write_fifo are named-FIFO paths the test fixture created; the peer on the
+    other end of the pipe (the relay) uses the same two FIFOs with read/write
+    swapped. enable_transport defaults False (a leaf host, not a transport
+    node). Returns {handle, identity_hash}.
+    """
+    network_name = params.get("network_name") or ""
+    passphrase = params.get("passphrase") or ""
+    read_fifo = params["read_fifo"]
+    write_fifo = params["write_fifo"]
+    enable_transport = bool(params.get("enable_transport", False))
+
+    config_dir = tempfile.mkdtemp(prefix="rns_wire_pipe_")
+    _write_pipe_relay_config(
+        config_dir,
+        pipe_iface_name="Wire Pipe Peer",
+        read_fifo=read_fifo,
+        write_fifo=write_fifo,
+        tcp_listen_port=None,
+        network_name=network_name,
+        passphrase=passphrase,
+        enable_transport=enable_transport,
+    )
+
+    RNS = _get_rns()
+    rns = _ensure_wire_rns_started(config_dir)
+    identity_hash = RNS.Transport.identity.hash
+
+    handle = secrets.token_hex(8)
+    with _instances_lock:
+        _instances[handle] = {
+            "rns": rns,
+            "config_dir": config_dir,
+            "identity_hash": identity_hash,
+            "role": "pipe_peer",
+            "destinations": [],
+        }
+    return {"handle": handle, "identity_hash": identity_hash.hex()}
+
+
+def cmd_wire_start_pipe_tcp_relay(params):
+    """Bring up RNS as a transport relay bridging a PipeInterface (to A) and a
+    TCPServerInterface (to C) — the mixed interface-type middle node B.
+
+    A LINKREQUEST arriving on one interface and forwarded out the other crosses
+    interface types. When forwarded OUT the PipeInterface (which does not
+    support MTU autoconfiguration), RNS strips the 3-byte LINK_MTU_SIZE
+    signalling field (Transport.py:1593-1600) so the destination's link falls
+    back to Reticulum.MTU (500). enable_transport defaults True (this node MUST
+    be a transport node to forward). If bind_port=0 a free TCP port is
+    allocated. Returns {handle, port, identity_hash}.
+    """
+    network_name = params.get("network_name") or ""
+    passphrase = params.get("passphrase") or ""
+    read_fifo = params["read_fifo"]
+    write_fifo = params["write_fifo"]
+    bind_port = int(params.get("bind_port", 0))
+    enable_transport = bool(params.get("enable_transport", True))
+    if bind_port == 0:
+        bind_port = _allocate_free_port()
+
+    config_dir = tempfile.mkdtemp(prefix="rns_wire_piperelay_")
+    _write_pipe_relay_config(
+        config_dir,
+        pipe_iface_name="Wire Pipe Relay",
+        read_fifo=read_fifo,
+        write_fifo=write_fifo,
+        tcp_listen_port=bind_port,
+        network_name=network_name,
+        passphrase=passphrase,
+        enable_transport=enable_transport,
+    )
+
+    RNS = _get_rns()
+    rns = _ensure_wire_rns_started(config_dir)
+    identity_hash = RNS.Transport.identity.hash
+
+    handle = secrets.token_hex(8)
+    with _instances_lock:
+        _instances[handle] = {
+            "rns": rns,
+            "config_dir": config_dir,
+            "identity_hash": identity_hash,
+            "role": "pipe_tcp_relay",
+            "port": bind_port,
+            "destinations": [],
+        }
+    return {
+        "handle": handle,
+        "port": bind_port,
+        "identity_hash": identity_hash.hex(),
+    }
 
 
 def cmd_wire_announce(params):
@@ -1925,6 +2113,219 @@ def cmd_wire_set_proof_strategy(params):
 
 
 # ---------------------------------------------------------------------------
+# Transport posture, link MTU, and single-packet PacketReceipt observation
+#
+# These three unblock CONFORMANCE_GAPS.md §3 (R3 transport-off bypass,
+# proof_for_local_client receipt return) and §2c (in-transit link-MTU strip).
+# All read straight off the real RNS objects — nothing is recomputed.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_transport_enabled(params):
+    """Return the GROUND-TRUTH RNS.Reticulum.transport_enabled() for this peer.
+
+    This is the discriminating observable for R3: a shared master started with
+    enable_transport=False must report transport_enabled() == False here, yet
+    an attached local client's announces/links must still reach a TCP peer
+    (local-client forwarding bypasses the transport gate). Asserting the config
+    value alone would be vacuous — this reads the live process-wide flag RNS
+    set at Reticulum.__init__ time, so a test can pin "transport really is off"
+    independently of whether forwarding happened.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    return {
+        "transport_enabled": bool(RNS.Reticulum.transport_enabled()),
+        # is_connected_to_shared_instance / is_shared_instance let a test
+        # disambiguate the peer's role without inferring it from the handle.
+        "is_shared_instance": bool(getattr(inst["rns"], "is_shared_instance", False)),
+        "is_connected_to_shared_instance": bool(
+            getattr(inst["rns"], "is_connected_to_shared_instance", False)
+        ),
+    }
+
+
+def _find_link_by_id(inst, link_id):
+    """Locate a real RNS.Link by its 16-byte link_id on this peer.
+
+    Checks both outbound links opened via wire_link_open (the initiator side)
+    AND inbound links accepted by any wire_listen destination (the receiver
+    side). The in-transit link-MTU strip (Transport.py:1593-1600) is observed
+    on the DESTINATION side — the receiver's inbound link carries the reduced
+    mtu — so wire_link_mtu must be able to read a listener's inbound link too,
+    not just an initiator's outbound one.
+    """
+    link = inst.get("out_links", {}).get(link_id)
+    if link is not None:
+        return link
+    for listener in inst.get("listeners", {}).values():
+        with listener["recv_lock"]:
+            inbound = list(listener.get("inbound_links", []))
+        for lk in inbound:
+            if getattr(lk, "link_id", None) == link_id:
+                return lk
+    return None
+
+
+def cmd_wire_link_mtu(params):
+    """Read the negotiated MTU (and MDU / mode) of an established link.
+
+    Returns {mtu, mdu, mode, status, status_name}. mtu is link.mtu read
+    straight off the real RNS.Link — the value the link-MTU-discovery
+    signalling settled on. On a direct loopback TCP link this is the large
+    autoconfigured value (TCP HW_MTU); when an in-transit relay forwarded the
+    LINKREQUEST out a next-hop interface that does NOT support MTU
+    autoconfiguration, RNS strips the 3-byte LINK_MTU_SIZE signalling field
+    (Transport.py:1593-1600) and the destination's link falls back to
+    Reticulum.MTU (500). So a test that establishes a link across a mixed
+    interface-type relay can assert link.mtu == 500 here to prove the strip
+    happened.
+
+    link_id may be either an outbound link (initiator side) or an inbound
+    link accepted by a wire_listen destination (receiver side). get_mtu()/
+    get_mdu() return None until the link is ACTIVE, so we read the raw .mtu/
+    .mdu fields (always populated post-establishment) and also surface status
+    so a test can gate on ACTIVE.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    status = getattr(link, "status", None)
+    return {
+        "mtu": int(link.mtu) if getattr(link, "mtu", None) is not None else None,
+        "mdu": int(link.mdu) if getattr(link, "mdu", None) is not None else None,
+        "mode": int(link.mode) if getattr(link, "mode", None) is not None else None,
+        "status": int(status) if status is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status),
+    }
+
+
+def cmd_wire_send_packet(params):
+    """Send a single SINGLE-destination DATA Packet with a tracked PacketReceipt.
+
+    Distinct from wire_link_send (which sends over an established Link): this is
+    the raw single-packet path. The receiver's destination, if it has
+    proof_strategy == PROVE_ALL, returns a PROOF; RNS validates it against the
+    originating PacketReceipt, which then transitions SENT -> DELIVERED. The
+    return path is the discriminating observable for proof_for_local_client
+    (CONFORMANCE_GAPS.md §3): when the originator sits behind a shared master,
+    the PROOF is routed back to it via the master's reverse_table
+    (Transport.py:2254-2261) because the reverse entry's received-iface is a
+    local-client iface — a path NOT exercised by any LRPROOF/link_table test.
+
+    Requires the destination identity to be known (via a received announce), as
+    with wire_link_open. Builds an OUT SINGLE Destination from the recalled
+    identity + the supplied app_name/aspects, constructs a Packet with
+    create_receipt=True (the default), sends it, and stashes the returned
+    PacketReceipt under a fresh receipt_id for wire_packet_receipt_status to
+    poll. Returns {receipt_id, sent, hops}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data", ""))
+    create_receipt = bool(params.get("create_receipt", True))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    packet = RNS.Packet(out_destination, payload, create_receipt=create_receipt)
+    receipt = packet.send()
+    # packet.send() returns the PacketReceipt when create_receipt=True, None
+    # when create_receipt=False, or False when the send itself failed (no
+    # path / outbound rejected). Distinguish those for a clear test signal.
+    if receipt is False:
+        return {"sent": False, "receipt_id": None, "hops": None}
+
+    hops = int(RNS.Transport.hops_to(destination_hash))
+    receipt_id = None
+    if receipt is not None:
+        receipt_id = secrets.token_hex(8)
+        inst.setdefault("receipts", {})[receipt_id] = receipt
+    # Keep the OUT destination referenced so it isn't GC'd before the proof
+    # round-trips and the receipt callback fires.
+    inst["destinations"].append((identity, out_destination))
+    return {"sent": True, "receipt_id": receipt_id, "hops": hops}
+
+
+_PACKET_RECEIPT_STATUS_NAMES = {0x00: "FAILED", 0x01: "SENT", 0x02: "DELIVERED", 0xFF: "CULLED"}
+
+
+def cmd_wire_packet_receipt_status(params):
+    """Poll a tracked PacketReceipt until it concludes, or timeout.
+
+    Returns {status, status_name, delivered, proved}. status is the real
+    RNS.PacketReceipt.status int (SENT=0x01, DELIVERED=0x02, FAILED=0x00,
+    CULLED=0xFF). `delivered` is True iff status == DELIVERED, the observable
+    a proof_for_local_client test asserts: the single packet's PROOF made it
+    all the way back to the originator. Polls up to timeout_ms (blocking the
+    bridge thread, same pattern as wire_poll_path) so the test doesn't have to
+    sleep on raw timing; returns the current status immediately when
+    timeout_ms == 0.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    receipt_id = params["receipt_id"]
+    timeout_ms = int(params.get("timeout_ms", 0))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    receipt = inst.get("receipts", {}).get(receipt_id)
+    if receipt is None:
+        raise ValueError(f"Unknown receipt_id: {receipt_id}")
+
+    DELIVERED = RNS.PacketReceipt.DELIVERED
+    FAILED = RNS.PacketReceipt.FAILED
+    CULLED = RNS.PacketReceipt.CULLED
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while True:
+        status = receipt.get_status()
+        if status in (DELIVERED, FAILED, CULLED):
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.05)
+
+    status = receipt.get_status()
+    return {
+        "status": int(status),
+        "status_name": _PACKET_RECEIPT_STATUS_NAMES.get(status),
+        "delivered": status == DELIVERED,
+        "proved": bool(getattr(receipt, "proved", False)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Channel out-of-order / duplicate injection + window observation
 #
 # RNS.Channel reorders and de-duplicates received envelopes by sequence
@@ -2287,6 +2688,8 @@ WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
     "wire_start_local_client": cmd_wire_start_local_client,
+    "wire_start_pipe_peer": cmd_wire_start_pipe_peer,
+    "wire_start_pipe_tcp_relay": cmd_wire_start_pipe_tcp_relay,
     "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
@@ -2316,6 +2719,11 @@ WIRE_COMMANDS = {
     "wire_link_teardown": cmd_wire_link_teardown,
     "wire_listener_link_status": cmd_wire_listener_link_status,
     "wire_set_proof_strategy": cmd_wire_set_proof_strategy,
+    # Transport posture / link MTU / single-packet PacketReceipt observation
+    "wire_transport_enabled": cmd_wire_transport_enabled,
+    "wire_link_mtu": cmd_wire_link_mtu,
+    "wire_send_packet": cmd_wire_send_packet,
+    "wire_packet_receipt_status": cmd_wire_packet_receipt_status,
     # Channel out-of-order / duplicate injection + window observation
     "wire_channel_inject": cmd_wire_channel_inject,
     "wire_channel_received": cmd_wire_channel_received,

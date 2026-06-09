@@ -16,6 +16,8 @@ for the `wire_*` command surface these fixtures drive.
 
 import os
 import secrets
+import shutil
+import tempfile
 
 import pytest
 
@@ -85,6 +87,7 @@ class _WirePeer:
         mode: str | None = None,
         share_instance: bool = False,
         share_instance_type: str | None = None,
+        enable_transport: bool = True,
     ) -> int:
         """Bring up a TCPServerInterface on this peer.
 
@@ -100,6 +103,16 @@ class _WirePeer:
         When share_instance is True, the returned `shared_instance_port`
         is stored on the peer (`self.shared_instance_port`) for the test
         to pass into the local-client peer's start.
+
+        enable_transport (default True) controls whether this peer enables
+        transport. Set False to bring up a transport-DISABLED shared master
+        (the rnsd default posture) — the only way to exercise R3
+        (CONFORMANCE_GAPS.md §3): local-client forwarding bypasses the
+        transport gate, so an attached local client's announces/links must
+        still reach a TCP peer even with transport off. The resolved posture
+        is recorded on `self.configured_transport_enabled`; assert the GROUND
+        TRUTH via the `transport_enabled()` method
+        (RNS.Reticulum.transport_enabled()) rather than this echoed config value.
         """
         kwargs: dict = {"network_name": network_name, "passphrase": passphrase}
         if mode is not None:
@@ -108,10 +121,18 @@ class _WirePeer:
             kwargs["share_instance"] = True
             if share_instance_type is not None:
                 kwargs["share_instance_type"] = share_instance_type
+        if not enable_transport:
+            kwargs["enable_transport"] = False
         resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
         self.port = int(resp["port"])
+        # Echoed config posture; the ground-truth observable is the
+        # transport_enabled() METHOD below. Named distinctly so it does not
+        # shadow that method on the instance.
+        self.configured_transport_enabled: bool = bool(
+            resp.get("transport_enabled", True)
+        )
         # Surface the shared-instance state for tests that need to chain a
         # local-client peer onto this master. All None when
         # share_instance=False or share_instance_type != "tcp".
@@ -168,6 +189,62 @@ class _WirePeer:
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
         self.shared_instance_port: int | None = int(shared_instance_port)
+
+    def start_pipe_peer(
+        self,
+        read_fifo: str,
+        write_fifo: str,
+        network_name: str = "",
+        passphrase: str = "",
+        enable_transport: bool = False,
+    ):
+        """Bring up this peer as a PipeInterface leaf bridged via a FIFO pair.
+
+        The A end of the mixed pipe<->TCP relay topology. The relay peer on
+        the other end of the pipe uses the SAME two FIFOs with read/write
+        swapped. enable_transport defaults False (a leaf host).
+        """
+        kwargs: dict = {
+            "read_fifo": read_fifo,
+            "write_fifo": write_fifo,
+            "network_name": network_name,
+            "passphrase": passphrase,
+        }
+        if not enable_transport:
+            kwargs["enable_transport"] = False
+        resp = self.bridge.execute("wire_start_pipe_peer", **kwargs)
+        self.handle = resp["handle"]
+        self.identity_hash = bytes.fromhex(resp["identity_hash"])
+
+    def start_pipe_tcp_relay(
+        self,
+        read_fifo: str,
+        write_fifo: str,
+        network_name: str = "",
+        passphrase: str = "",
+        enable_transport: bool = True,
+    ) -> int:
+        """Bring up this peer as the mixed relay B: a PipeInterface (to A) plus
+        a TCPServerInterface (to C), transport ON.
+
+        A LINKREQUEST forwarded OUT the PipeInterface (non-autoconfigure) has
+        its 3-byte LINK_MTU_SIZE field stripped, so the destination's link
+        falls back to Reticulum.MTU=500. Returns and stores the TCP port C
+        connects to (`self.port`).
+        """
+        kwargs: dict = {
+            "read_fifo": read_fifo,
+            "write_fifo": write_fifo,
+            "network_name": network_name,
+            "passphrase": passphrase,
+        }
+        if not enable_transport:
+            kwargs["enable_transport"] = False
+        resp = self.bridge.execute("wire_start_pipe_tcp_relay", **kwargs)
+        self.handle = resp["handle"]
+        self.identity_hash = bytes.fromhex(resp["identity_hash"])
+        self.port = int(resp["port"])
+        return self.port
 
     def start_tcp_client(
         self,
@@ -644,6 +721,78 @@ class _WirePeer:
             strategy=strategy,
         )
 
+    # --- Transport posture / link MTU / single-packet PacketReceipt -------
+
+    def transport_enabled(self) -> dict:
+        """Read the GROUND-TRUTH transport posture of this peer.
+
+        Returns {transport_enabled, is_shared_instance,
+        is_connected_to_shared_instance}. Use this to pin "the master really
+        has transport off" in an R3 test, independently of whether
+        local-client forwarding happened.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_transport_enabled", handle=self.handle)
+
+    def link_mtu(self, link_id: bytes) -> dict:
+        """Read an established link's negotiated MTU/MDU/mode.
+
+        Returns {mtu, mdu, mode, status, status_name}. `link_id` may be an
+        outbound link (from link_open) or an inbound link accepted by a
+        listening destination — the in-transit link-MTU strip is observed on
+        the destination's inbound link (mtu falls back to Reticulum.MTU=500
+        when a relay forwarded the LINKREQUEST out a non-autoconfigure
+        next-hop interface).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_mtu", handle=self.handle, link_id=link_id.hex()
+        )
+
+    def send_packet(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        data: bytes = b"",
+        create_receipt: bool = True,
+    ) -> dict:
+        """Send a single SINGLE-destination DATA packet with a tracked receipt.
+
+        Distinct from link_send (over a Link): this is the raw single-packet
+        path whose returning PROOF drives a PacketReceipt to DELIVERED. Returns
+        {sent, receipt_id, hops}; pass receipt_id to packet_receipt_status to
+        observe delivery (the proof_for_local_client return path). The
+        destination identity must already be known via a received announce.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_packet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            data=data.hex(),
+            create_receipt=bool(create_receipt),
+        )
+
+    def packet_receipt_status(
+        self, receipt_id: str, timeout_ms: int = 0
+    ) -> dict:
+        """Poll a tracked PacketReceipt until it concludes, or timeout.
+
+        Returns {status, status_name, delivered, proved}. `delivered` is True
+        iff the returning PROOF validated against the receipt — the
+        proof_for_local_client observable.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_packet_receipt_status",
+            handle=self.handle,
+            receipt_id=receipt_id,
+            timeout_ms=timeout_ms,
+        )
+
     # --- Channel out-of-order / duplicate / window ------------------------
 
     def channel_inject(self, link_id: bytes, envelopes: list) -> list:
@@ -983,6 +1132,83 @@ def wire_peers(wire_pair):
                 b.close()
             except Exception:
                 pass
+
+
+@pytest.fixture
+def wire_mixed_relay_3peer():
+    """Mixed interface-type relay: A (PipeInterface leaf) <-pipe-> B (Pipe+TCP
+    relay, transport ON) <-TCP-> C (TCP client).
+
+    Topology:
+
+        a_leaf (A, PipeInterface, hosts D)
+                 \\
+                  v  named-FIFO pair (loopback byte bridge)
+        relay   (B, PipeInterface + TCPServerInterface, transport ON)
+                  ^
+                  |  TCP loopback
+        c_tcp   (C, TCPClientInterface)
+
+    Purpose: exercise the in-transit link-MTU strip (CONFORMANCE_GAPS.md §2c,
+    Transport.py:1593-1600). When C opens a Link to D, the LINKREQUEST is
+    forwarded by B OUT the PipeInterface to A; PipeInterface is
+    non-autoconfigure, so RNS strips the 3-byte LINK_MTU_SIZE signalling field
+    and A's inbound link.mtu falls back to Reticulum.MTU (500). A test reads
+    A's inbound link mtu via `a_leaf.link_mtu(link_id)` and asserts == 500;
+    a direct TCP link (the positive control) negotiates a larger MTU.
+
+    Reference-only (NOT impl-parametrized): PipeInterface FIFO-bridging is a
+    Python-RNS construct (the separate-bridge-subprocess wire harness has no
+    shared in-process Transport, so the only inter-process channel is the FIFO
+    pair). The pipe hop is what makes the next-hop non-autoconfigure; a
+    TCP-only relay cannot reproduce the strip (TCP is AUTOCONFIGURE_MTU=True).
+
+    Start order: bring up the relay first, then the leaf and the TCP client
+    (the FIFO `cat` commands block until both pipe ends are present, so the
+    relay and leaf rendezvous once both are spawned). Call:
+        port = relay.start_pipe_tcp_relay(relay.pipe_read_fifo,
+                                          relay.pipe_write_fifo)
+        a_leaf.start_pipe_peer(a_leaf.pipe_read_fifo, a_leaf.pipe_write_fifo)
+        c_tcp.start_tcp_client(..., target_port=port)
+    The FIFO paths are pre-created and attached to a_leaf / relay (swapped).
+
+    Yields (a_leaf, relay, c_tcp) as `_WirePeer` objects.
+    """
+    fifodir = tempfile.mkdtemp(prefix="wire_mixed_fifos_")
+    f_relay2a = os.path.join(fifodir, "relay2a")  # relay writes, leaf reads
+    f_a2relay = os.path.join(fifodir, "a2relay")   # leaf writes, relay reads
+    os.mkfifo(f_relay2a)
+    os.mkfifo(f_a2relay)
+
+    bridges = [
+        BridgeClient(resolve_command("reference"), env=_env_for("reference")),
+        BridgeClient(resolve_command("reference"), env=_env_for("reference")),
+        BridgeClient(resolve_command("reference"), env=_env_for("reference")),
+    ]
+    a_leaf = _WirePeer(bridges[0], role_label="a_leaf(reference)")
+    relay = _WirePeer(bridges[1], role_label="relay(reference)")
+    c_tcp = _WirePeer(bridges[2], role_label="c_tcp(reference)")
+
+    # Pre-wire the FIFO paths (read/write swapped between the two pipe ends).
+    a_leaf.pipe_read_fifo = f_relay2a
+    a_leaf.pipe_write_fifo = f_a2relay
+    relay.pipe_read_fifo = f_a2relay
+    relay.pipe_write_fifo = f_relay2a
+
+    try:
+        yield a_leaf, relay, c_tcp
+    finally:
+        for peer in (a_leaf, c_tcp, relay):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
+        shutil.rmtree(fifodir, ignore_errors=True)
 
 
 @pytest.fixture

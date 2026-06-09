@@ -623,10 +623,13 @@ def cmd_packet_build(params):
     which hand-assembled the header and bit-packed the flags byte. RNS only
     produces a packet's wire format through Packet.pack() against a real
     Destination — there is no "format these arbitrary header fields" entry
-    point. dest_type selects the destination kind (which sets the
-    destination_type flag bits and decides whether the payload is encrypted:
-    PLAIN carries the payload in the clear so the wire bytes round-trip
-    exactly, SINGLE encrypts non-announce data so only the header bytes do).
+    point. dest_type selects the destination kind ('plain', 'single' or
+    'group'), which sets the destination_type flag bits and decides whether the
+    payload is encrypted: PLAIN carries the payload in the clear so the wire
+    bytes round-trip exactly, SINGLE encrypts non-announce data with the
+    recipient identity so only the header bytes do, and GROUP encrypts
+    non-announce data with a symmetric Token key (same "header-only" round-trip
+    as SINGLE).
 
     header_type selects the wire header format and accepts either the
     human-friendly numbers 1 / 2 (default 1 = HEADER_1) or the strings
@@ -697,9 +700,25 @@ def cmd_packet_build(params):
             RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
             "conformance", "packet",
         )
+    elif dest_type == 'group':
+        # GROUP destinations are symmetric-key. RNS forbids an outbound
+        # destination of any non-PLAIN type without identity material
+        # (Destination.py:178-179), and the GROUP encrypt path raises unless a
+        # symmetric key exists (Destination.py:601-609), so build with an
+        # Identity and call create_keys() to mint the Token key before pack().
+        # The GROUP destination_type bits (RNS.Destination.GROUP == 0x01) are
+        # set by get_packed_flags from destination.type (Packet.py:173); a DATA
+        # packet's payload is then encrypted by destination.encrypt, exactly as
+        # for SINGLE, so only the header bytes round-trip through unpack().
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP,
+            "conformance", "packet",
+        )
+        destination.create_keys()
     else:
         raise ValueError(
-            f"unsupported dest_type: {dest_type!r} (use 'plain' or 'single')"
+            f"unsupported dest_type: {dest_type!r} "
+            "(use 'plain', 'single' or 'group')"
         )
 
     packet = RNS.Packet(

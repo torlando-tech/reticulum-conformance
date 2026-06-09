@@ -18,6 +18,7 @@ import os
 import secrets
 import shutil
 import tempfile
+import time
 
 import pytest
 
@@ -88,6 +89,7 @@ class _WirePeer:
         share_instance: bool = False,
         share_instance_type: str | None = None,
         enable_transport: bool = True,
+        fixed_mtu: int | None = None,
     ) -> int:
         """Bring up a TCPServerInterface on this peer.
 
@@ -113,10 +115,20 @@ class _WirePeer:
         is recorded on `self.configured_transport_enabled`; assert the GROUND
         TRUTH via the `transport_enabled()` method
         (RNS.Reticulum.transport_enabled()) rather than this echoed config value.
+
+        fixed_mtu (int, optional): pin the interface to a fixed link MTU so the
+        negotiated link SDU stays small. With a small enough MTU a modest
+        Resource payload chunks into >74 parts and the real on-wire HMU
+        handshake (Resource.py:140/:483-495, Link.py:1100/:1122) is driven —
+        unlike resource_create(force_sdu=...), which only forces the per-part
+        SDU at construction time without sending anything. Both peers of a link
+        must use the same fixed_mtu for the small SDU to survive negotiation.
         """
         kwargs: dict = {"network_name": network_name, "passphrase": passphrase}
         if mode is not None:
             kwargs["mode"] = mode
+        if fixed_mtu is not None:
+            kwargs["fixed_mtu"] = int(fixed_mtu)
         if share_instance:
             kwargs["share_instance"] = True
             if share_instance_type is not None:
@@ -253,7 +265,15 @@ class _WirePeer:
         target_host: str,
         target_port: int,
         mode: str | None = None,
+        fixed_mtu: int | None = None,
     ):
+        """Bring up a TCPClientInterface pointing at a remote.
+
+        fixed_mtu (int, optional): mirror of start_tcp_server(fixed_mtu=...).
+        Both ends of a link must pin the same fixed MTU for the small link SDU
+        to survive negotiation and drive a >74-part Resource into the on-wire
+        HMU handshake.
+        """
         kwargs: dict = {
             "network_name": network_name,
             "passphrase": passphrase,
@@ -262,6 +282,8 @@ class _WirePeer:
         }
         if mode is not None:
             kwargs["mode"] = mode
+        if fixed_mtu is not None:
+            kwargs["fixed_mtu"] = int(fixed_mtu)
         resp = self.bridge.execute("wire_start_tcp_client", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
@@ -465,6 +487,34 @@ class _WirePeer:
             timeout_ms=timeout_ms,
         )
 
+    def link_request_large(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int = 30000,
+    ) -> dict:
+        """Issue link.request expecting a response larger than the link MDU.
+
+        A handler returning ~50 KB cannot answer in a single packet, so RNS
+        delivers the response as a Resource and the RequestReceipt only reaches
+        READY once that Resource has fully transferred (Link.py:496-517/:898-901/
+        :939-952). This variant blocks long enough for the resource-backed
+        response to complete and returns {status, response, response_time_s}
+        with `status == "ready"` and `response` the full byte-exact response
+        (hex). Register the large response first via register_request_handler;
+        the >MDU request-data path is exercised by passing a large `data`.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_request_large",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            path=path,
+            data=data.hex(),
+            timeout_ms=timeout_ms,
+        )
+
     def get_request_log(self, destination_hash: bytes, path: str) -> list:
         """Drain the handler-invocation log for (destination, path).
 
@@ -506,21 +556,42 @@ class _WirePeer:
             "hash": bytes.fromhex(resp["hash"]),
         }
 
-    def listen(self, app_name: str, aspects: list) -> bytes:
+    def listen(
+        self,
+        app_name: str,
+        aspects: list,
+        resource_strategy: str | None = None,
+    ) -> bytes:
         """Register an IN destination that accepts incoming Links.
 
         Returns the destination_hash. The listening identity's hash and raw
         public_key are recorded on the peer (see `listening_identity`) so
         recall tests can assert the recalled key is byte-identical to the
         announced one (N-M3), not merely the right length.
+
+        resource_strategy ('all'|'none'|'app', default None -> bridge default
+        of 'all'): how an inbound Link accepts incoming Resources
+        (Link.set_resource_strategy, Link.py:1087-1098).
+          - 'all'  -> RNS.Link.ACCEPT_ALL: every Resource is accepted.
+          - 'none' -> RNS.Link.ACCEPT_NONE: no parts flow; the sender's
+            transfer ends FAILED.
+          - 'app'  -> RNS.Link.ACCEPT_APP: a per-Resource callback decides;
+            it returns True for some advertised payloads and False for others,
+            so a rejected Resource drives RESOURCE_RCL back to the sender
+            (status REJECTED) while an accepted one transfers normally. The
+            accept/reject predicate is defined deterministically by the wire
+            command handler (see [wire-cmds] wire_listen) — keep test payloads
+            on the two sides of whatever boundary it advertises.
         """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_listen",
-            handle=self.handle,
-            app_name=app_name,
-            aspects=list(aspects),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "app_name": app_name,
+            "aspects": list(aspects),
+        }
+        if resource_strategy is not None:
+            params["resource_strategy"] = str(resource_strategy)
+        resp = self.bridge.execute("wire_listen", **params)
         dest_hash = bytes.fromhex(resp["destination_hash"])
         self.listen_identities[dest_hash] = {
             "identity_hash": bytes.fromhex(resp["identity_hash"]),
@@ -582,23 +653,47 @@ class _WirePeer:
         return [bytes.fromhex(p) for p in resp.get("packets", [])]
 
     def resource_send(
-        self, link_id: bytes, data: bytes, timeout_ms: int = 30000
+        self,
+        link_id: bytes,
+        data: bytes,
+        timeout_ms: int = 30000,
+        metadata: bytes | None = None,
+        wait: bool = True,
     ) -> dict:
         """Send arbitrary-size bytes via the RNS Resource API.
 
-        Returns the bridge's response dict with `success`, `status`,
-        `size`, `timed_out`. Used to exercise multi-packet chunked
-        transfer over a Link (the path LXMF uses for image/file
+        Returns the bridge's response dict. Used to exercise multi-packet
+        chunked transfer over a Link (the path LXMF uses for image/file
         attachments).
+
+        metadata (bytes, optional): packed into the Resource's 'x' metadata
+        field (Resource.py:260-268 — 3-byte BE length + body; flag bit 5 set,
+        Resource.py:207-208). When present the response reports
+        has_metadata=True and the receiver round-trips both the payload and
+        the metadata. None omits the field entirely (has_metadata=False).
+
+        wait (bool, default True): when True the bridge blocks until the
+        transfer concludes and returns {success, status, size, timed_out}
+        (plus original_hash / total_segments / parts / compressed /
+        has_metadata, all read off the real RNS.Resource). When False the
+        bridge starts the transfer on a background thread and returns
+        immediately with {resource_id, started} so the test can abort it
+        mid-flight via resource_cancel(resource_id) — the only way to drive
+        RESOURCE_ICL (a blocking send can't be cancelled on the same bridge
+        connection).
         """
         assert self.handle, "start_* must be called first"
-        return self.bridge.execute(
-            "wire_resource_send",
-            handle=self.handle,
-            link_id=link_id.hex(),
-            data=data.hex(),
-            timeout_ms=timeout_ms,
-        )
+        params: dict = {
+            "handle": self.handle,
+            "link_id": link_id.hex(),
+            "data": data.hex(),
+            "timeout_ms": timeout_ms,
+        }
+        if metadata is not None:
+            params["metadata"] = metadata.hex()
+        if not wait:
+            params["wait"] = False
+        return self.bridge.execute("wire_resource_send", **params)
 
     def resource_create(
         self,
@@ -607,6 +702,7 @@ class _WirePeer:
         force_sdu: int | None = None,
         include_parts: bool = True,
         auto_compress: bool = True,
+        metadata: bytes | None = None,
     ) -> dict:
         """Construct a real RNS.Resource on an established Link and report
         the attributes the implementation computed — WITHOUT advertising or
@@ -617,7 +713,15 @@ class _WirePeer:
         RNS.Resource (full __init__, advertise=False so nothing hits the
         wire) and reads back `hash`, `truncated_hash`, `random_hash`,
         `expected_proof`, `hashmap`, `parts`, `num_parts`, `total_segments`,
-        `segment_index`, and the size/flag fields — nothing is recomputed.
+        `segment_index`, `original_hash`, `compressed`, `has_metadata`, and
+        the size/flag fields — nothing is recomputed.
+
+        metadata (bytes, optional): packed into the Resource's 'x' metadata
+        field (Resource.py:260-268). When present the response reports
+        has_metadata=True and the flag's bit 5 is set; None omits it
+        (has_metadata=False). `original_hash` is the pre-segmentation hash RNS
+        chains multi-segment transfers against (Resource.py:445-448), surfaced
+        so a >2-segment chaining test can pin it.
 
         Coverage knobs (CONFORMANCE_REAUDIT.md §5 Resource):
           force_sdu: force a small per-part SDU so a modest payload exceeds
@@ -637,7 +741,79 @@ class _WirePeer:
         }
         if force_sdu is not None:
             params["force_sdu"] = int(force_sdu)
+        if metadata is not None:
+            params["metadata"] = metadata.hex()
         return self.bridge.execute("wire_resource_create", **params)
+
+    def resource_cancel(self, resource_id: str) -> dict:
+        """Abort an in-flight outbound Resource transfer (RNS.Resource.cancel).
+
+        `resource_id` is the handle returned by a non-blocking
+        resource_send(..., wait=False). Cancelling mid-transfer is the only way
+        to drive RESOURCE_ICL (initiator cancel, Link.py:1131): the receiver's
+        inbound Resource concludes with status FAILED and its accepting Link
+        observes the ICL. Returns {cancelled} (and echoes resource_id).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_cancel",
+            handle=self.handle,
+            resource_id=resource_id,
+        )
+
+    def resource_receiver_status(
+        self, destination_hash: bytes, timeout_ms: int = 0
+    ) -> dict:
+        """Read the receiver-side state of the most recent inbound Resource on
+        a listening destination.
+
+        The discriminating observable for the HMU and bz2-bomb cases:
+          hmu_requests_sent       -> count of hashmap-update requests the
+            receiver issued (request_next over the >74-part hashmap,
+            Resource.py:483-495/:503),
+          hashmap_updates_received-> hashmap segments the receiver took in
+            (Resource.hashmap_height, Resource.py:492-499),
+          status / status_name    -> the inbound Resource's RNS status int
+            (TRANSFERRING=3 / ASSEMBLING=5 / COMPLETE=6 / FAILED=7 /
+            CORRUPT=8),
+          corrupt                 -> True iff status == CORRUPT (the
+            decompression-bomb / over-bound guard fired, Resource.py:686-689).
+        Optionally polls up to timeout_ms for an inbound Resource to appear /
+        conclude. Pair with listener_link_status to confirm the link was torn
+        down after a CORRUPT verdict.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_receiver_status",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def resource_send_bomb(
+        self, link_id: bytes, decompressed_size: int, timeout_ms: int = 30000
+    ) -> dict:
+        """Send a crafted Resource whose advertised compressed payload expands
+        past the receiver's decompression bound (Resource.py:686-687,
+        max_length=AUTO_COMPRESS_MAX_SIZE).
+
+        Drives the decompression-bomb guard on the real receive path: the
+        receiver's BZ2Decompressor.decompress(max_length=...) stops short of
+        EOF, so RNS marks the Resource CORRUPT and tears the link down. The
+        sender's return dict reports {success, status} (the transfer ends
+        FAILED on the sender); observe the CORRUPT verdict via
+        resource_receiver_status and the teardown via listener_link_status on
+        the receiver. `decompressed_size` sets how far over the bound the
+        crafted payload inflates.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_send_bomb",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            decompressed_size=int(decompressed_size),
+            timeout_ms=timeout_ms,
+        )
 
     # --- Link lifecycle observation ---------------------------------------
 
@@ -645,6 +821,17 @@ class _WirePeer:
         """Lifecycle snapshot of an outbound link: status/status_name,
         teardown_reason/teardown_reason_name, no_inbound_for_ms,
         last_keepalive_ago_ms, keepalive_s, stale_time_s, rtt.
+
+        Also surfaces the negotiated link parameters (Link.py:148-151/:405-406/
+        :609/:618/:636) once the link is established:
+          mtu  -> link.mtu (None before ACTIVE),
+          mdu  -> link.mdu (the update_mdu floor),
+          mode -> link.mode (1 == MODE_AES256_CBC),
+          remote_identity_hash -> hex of the remote Identity once identified,
+            else None (Link.get_remote_identity),
+          remote_identified    -> bool (Link.py:683-687/:1022-1024).
+        remote_identity_hash is returned as a hex string (or None) — decode
+        with bytes.fromhex when comparing against an identity hash.
         """
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
@@ -793,6 +980,69 @@ class _WirePeer:
             timeout_ms=timeout_ms,
         )
 
+    # --- Link DATA proof strategy / keepalive byte values -----------------
+
+    def send_link_data(
+        self, link_id: bytes, data: bytes, create_receipt: bool = True
+    ) -> dict:
+        """Send a DATA packet OVER an established Link with a tracked receipt.
+
+        Distinct from link_send (fire-and-forget over a Link) and send_packet
+        (single SINGLE-destination packet): this drives the link-DATA proof
+        path (Link.py:999-1008). With create_receipt=True the returning PROOF —
+        emitted per the destination's proof strategy — drives a PacketReceipt
+        to DELIVERED, which makes PROVE_ALL / PROVE_NONE / PROVE_APP observable:
+          set_proof_strategy('all')  -> receipt reaches DELIVERED,
+          set_proof_strategy('none') -> no proof, receipt never DELIVERS,
+          set_proof_strategy('app')  -> DELIVERED only when the callback
+            returns True for the packet.
+        Returns {sent, receipt_id}; poll the receipt via packet_receipt_status
+        (the bridge stashes it in the same receipts table as send_packet).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_link_data",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            create_receipt=bool(create_receipt),
+        )
+
+    def send_keepalive_probe(self, link_id: bytes) -> dict:
+        """Inject a decrypted 0xFF keepalive into a link's receive path.
+
+        RNS keepalive is a single byte: the initiator emits 0xFF and a
+        NON-initiator answers with 0xFE (Link.py:848-849/:1149-1151/:974). On a
+        listener's inbound link (the non-initiator) this injects the 0xFF the
+        initiator would send and reports the link's response so the 0xFE answer
+        is observable; on an initiator's link it exercises the "don't bump
+        last_data on my own 0xFF echo" branch. Returns {response} where
+        `response` is the hex of the byte the link emitted in reply (e.g. "fe"
+        for a non-initiator), plus whether last_inbound/last_data advanced.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_keepalive_probe",
+            handle=self.handle,
+            link_id=link_id.hex(),
+        )
+
+    def last_keepalive(self, link_id: bytes) -> dict:
+        """Read the last keepalive payload byte this link emitted/answered.
+
+        Returns {payload} (hex of the last keepalive byte, or None if none
+        yet): "ff" for an initiator's probe, "fe" for a non-initiator's answer
+        (Link.py:848-849/:1149-1151). Lets a test assert the exact keepalive
+        byte values rather than only the timing observed by link_status'
+        last_keepalive_ago_ms.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_last_keepalive",
+            handle=self.handle,
+            link_id=link_id.hex(),
+        )
+
     # --- Channel out-of-order / duplicate / window ------------------------
 
     def channel_inject(self, link_id: bytes, envelopes: list) -> list:
@@ -838,6 +1088,118 @@ class _WirePeer:
         return self.bridge.execute(
             "wire_channel_window", handle=self.handle, link_id=link_id.hex()
         )
+
+    def channel_send(
+        self,
+        link_id: bytes,
+        data: bytes,
+        drop_acks: bool = False,
+        msgtype: int | None = None,
+        timeout_ms: int = 20000,
+    ) -> dict:
+        """Perform a REAL Channel.send over an established link.
+
+        The honest replacement for the dead cmd_rns_channel_send (zero callers).
+        Sends a message through the link's real RNS.Channel (Channel.py:551-584)
+        and, by default, waits for it to DELIVER or fail.
+
+        channel_id contract: RNS has no separate channel id — a Channel is
+        identified by its Link — so the wire command's `channel_id` parameter
+        carries this link_id. Both keys are sent for robustness against either
+        spelling on the handler side.
+
+        drop_acks (default False): suppress the peer's ack of THIS message so
+        the send receipt never DELIVERS. RNS then retransmits with an
+        increasing timeout window and, after 5 unanswered tries, tears the link
+        down (Channel.py:555-584/:295/:707) and shrinks the window. The return
+        dict surfaces {sent, delivered, tries, sequence}; observe the resulting
+        window shrink via channel_window (window/window_max decrement) and the
+        teardown via link_status (status CLOSED).
+
+        msgtype (optional): request a specific Channel MSGTYPE. A value
+        >= 0xf000 is reserved (Channel.py:328-345) and must be rejected — the
+        return dict reports {rejected, error} instead of sending.
+
+        timeout_ms bounds how long the bridge waits for the delivery/teardown
+        outcome before returning the current state.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            # A Channel is keyed by its Link; send under both the contract's
+            # `channel_id` name and the `link_id` name the other channel_*
+            # commands use, so the handler resolves it regardless of spelling.
+            "channel_id": link_id.hex(),
+            "link_id": link_id.hex(),
+            "data": data.hex(),
+            "drop_acks": bool(drop_acks),
+            "timeout_ms": int(timeout_ms),
+        }
+        if msgtype is not None:
+            params["msgtype"] = int(msgtype)
+        return self.bridge.execute("wire_channel_send", **params)
+
+    # --- Buffer / RawChannelReader / RawChannelWriter streaming -----------
+
+    def buffer_stream(
+        self,
+        link_id: bytes,
+        data: bytes,
+        bomb: bool = False,
+        timeout_ms: int = 30000,
+    ) -> dict:
+        """Stream bytes over a link via RNS.Buffer (RawChannelWriter).
+
+        Writes `data` through a RawChannelWriter on the link's Channel; the
+        payload is chunked into StreamDataMessages (Channel SMT_STREAM_DATA
+        0xff00) and reassembled by the peer's RawChannelReader. Drive a payload
+        spanning several MAX_CHUNK_LEN (16 KiB) chunks plus a partial final
+        chunk to exercise multi-chunk reassembly + EOF; read the result back
+        with buffer_received on the receiver.
+
+        bomb (default False): instead of `data`, write a single crafted chunk
+        whose advertised compressed body decompresses past MAX_CHUNK_LEN
+        (Buffer.py:95-97). The reader must abort (IOError, not silent
+        truncation); buffer_received reports {aborted: True}.
+
+        Returns {written, eof} (bytes written + whether EOF was flushed).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_buffer_stream",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            bomb=bool(bomb),
+            timeout_ms=int(timeout_ms),
+        )
+
+    def buffer_received(
+        self, destination_hash: bytes, timeout_ms: int = 30000
+    ) -> dict:
+        """Drain what a listener's RawChannelReader reassembled from a stream.
+
+        Pairs with buffer_stream on the sender. Blocks up to timeout_ms for the
+        stream to conclude (EOF) or abort. Returns {data, eof, aborted, error}:
+          data    -> bytes reassembled byte-exact across all chunks,
+          eof     -> True once the writer's EOF was seen,
+          aborted -> True iff the reader hit the MAX_CHUNK_LEN decompression
+            bound (the bz2-bomb case, Buffer.py:95-97),
+          error   -> the abort reason string when aborted, else None.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_buffer_received",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+        return {
+            "data": bytes.fromhex(resp["data"]) if resp.get("data") else b"",
+            "eof": bool(resp.get("eof", False)),
+            "aborted": bool(resp.get("aborted", False)),
+            "error": resp.get("error"),
+        }
 
     # --- GROUP destination symmetric crypto -------------------------------
 
@@ -1132,6 +1494,79 @@ def wire_peers(wire_pair):
                 b.close()
             except Exception:
                 pass
+
+
+@pytest.fixture
+def wire_link_setup(wire_peers):
+    """Factory fixture: bring up a direct server/client TCP pair and open one
+    established Link from the client to the server's IN destination.
+
+    Yields a callable `setup(**opts) -> (server, client, dest_hash, link_id)`
+    so each phase-2 test can pick the link's parameters without duplicating the
+    start/listen/poll/open boilerplate (the repeated `_establish_link` /
+    `_open_channel_link` helpers across the resource/channel suites). The client
+    is the link initiator (the implementation under test under the wire_pair
+    parametrization); the server anchors the Link.
+
+    Options:
+      app_name (str="conformance"), aspects (seq=("wire",)): the link's
+        destination naming.
+      fixed_mtu (int|None): pin both interfaces to a small fixed link MTU so a
+        modest Resource chunks into >74 parts and drives the on-wire HMU
+        handshake / small-SDU paths. None uses the negotiated (large) TCP MTU.
+      resource_strategy ('all'|'none'|'app'|None): the listener's inbound
+        Resource accept strategy (see _WirePeer.listen). The ACCEPT_APP listener
+        the audit calls for is `resource_strategy='app'`.
+      proof_strategy ('all'|'app'|'none'|None): set the listening destination's
+        packet-proof strategy before the link opens (for send_link_data tests).
+      link_timeout_ms / path_timeout_ms / settle_sec: timing knobs.
+
+    Teardown is handled by the underlying wire_peers finalizer.
+    """
+    server, client = wire_peers
+
+    def _setup(
+        app_name: str = "conformance",
+        aspects=("wire",),
+        *,
+        fixed_mtu: int | None = None,
+        resource_strategy: str | None = None,
+        proof_strategy: str | None = None,
+        link_timeout_ms: int = 15000,
+        path_timeout_ms: int = 10000,
+        settle_sec: float = 1.0,
+    ):
+        aspects = list(aspects)
+        port = server.start_tcp_server(
+            network_name="", passphrase="", fixed_mtu=fixed_mtu
+        )
+        client.start_tcp_client(
+            network_name="",
+            passphrase="",
+            target_host="127.0.0.1",
+            target_port=port,
+            fixed_mtu=fixed_mtu,
+        )
+        if settle_sec:
+            time.sleep(settle_sec)
+        dest_hash = server.listen(
+            app_name=app_name, aspects=aspects, resource_strategy=resource_strategy
+        )
+        if proof_strategy is not None:
+            server.set_proof_strategy(dest_hash, proof_strategy)
+        assert client.poll_path(dest_hash, timeout_ms=path_timeout_ms), (
+            f"{client.role_label} never learned a path to {server.role_label}'s "
+            f"destination — the Link could not be opened."
+        )
+        link_id = client.link_open(
+            dest_hash,
+            app_name=app_name,
+            aspects=aspects,
+            timeout_ms=link_timeout_ms,
+        )
+        return server, client, dest_hash, link_id
+
+    return _setup
 
 
 @pytest.fixture

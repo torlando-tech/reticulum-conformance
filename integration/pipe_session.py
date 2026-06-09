@@ -103,6 +103,14 @@ class PipeSession:
             self.RNS.Transport.path_table = {}
             self.RNS.Transport.packet_hashlist = set()
             self.RNS.Transport.identity = None
+            # RNS gates the Transport jobloop on a class-level
+            # Transport._should_run flag (RNS 1.3.1 Transport.py:210/3401).
+            # exit_handler() flips it False; Transport.start() never resets it,
+            # so the next in-process Reticulum() gets a dead jobloop that
+            # silently drops announces / path requests. This harness creates
+            # multiple Reticulum instances per process, so re-arm it here.
+            if hasattr(self.RNS.Transport, "_should_run"):
+                self.RNS.Transport._should_run = True
             self.reticulum = None
         if self._config_path:
             import shutil

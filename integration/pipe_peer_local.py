@@ -184,6 +184,14 @@ def main():
     pipe_iface.owner = RNS.Transport
     reticulum._add_interface(pipe_iface, mode=iface_mode)
 
+    # Optional IFAC (Interface Access Code) masking, configured to match
+    # integration/pipe_session.py:_configure_ifac so the in-repo peer and the
+    # Python reference interoperate over an IFAC-protected link.
+    ifac_passphrase = os.environ.get("PIPE_PEER_IFAC_PASSPHRASE")
+    ifac_netname = os.environ.get("PIPE_PEER_IFAC_NETNAME")
+    if ifac_passphrase is not None or ifac_netname is not None:
+        _configure_ifac(RNS, pipe_iface, ifac_passphrase, ifac_netname)
+
     handler = _AnnounceHandler(RNS)
     RNS.Transport.register_announce_handler(handler)
 
@@ -316,6 +324,33 @@ def main():
         _path_table_dumper(RNS)
 
 
+def _configure_ifac(RNS, iface, passphrase, netname):
+    """Configure IFAC on a pipe interface.
+
+    Mirrors integration/pipe_session.py:_configure_ifac exactly (same HKDF
+    derivation and ifac_size=16) so this peer interoperates with the Python
+    reference over an IFAC-masked link. A non-matching passphrase/netname
+    derives a different key, so the reference rejects the peer's packets.
+    """
+    ifac_origin = b""
+    if netname is not None:
+        ifac_origin += RNS.Identity.full_hash(netname.encode("utf-8"))
+    if passphrase is not None:
+        ifac_origin += RNS.Identity.full_hash(passphrase.encode("utf-8"))
+
+    ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
+    ifac_key = RNS.Cryptography.hkdf(
+        length=64,
+        derive_from=ifac_origin_hash,
+        salt=RNS.Reticulum.IFAC_SALT,
+        context=None,
+    )
+
+    iface.ifac_key = ifac_key
+    iface.ifac_identity = RNS.Identity.from_bytes(ifac_key)
+    iface.ifac_size = 16
+
+
 class _AnnounceHandler:
     def __init__(self, RNS):
         self.aspect_filter = None
@@ -341,10 +376,15 @@ def _path_table_dumper(RNS):
             entries = []
             for dest_hash in RNS.Transport.path_table:
                 entry = RNS.Transport.path_table[dest_hash]
+                # RNS path_table entry layout (Transport.py:326):
+                #   [timestamp, received_from, hops, expires, random_blobs,
+                #    receiving_interface, announce_packet_hash]
+                expires = entry[3] if len(entry) > 3 else None
                 entries.append({
                     "destination_hash": dest_hash.hex(),
                     "hops": entry[2],
                     "next_hop": entry[1].hex() if isinstance(entry[1], bytes) else str(entry[1]),
+                    "expired": (time.time() > expires) if expires is not None else False,
                 })
             current = json.dumps(entries, sort_keys=True)
             if current != last_dump:
@@ -359,6 +399,10 @@ def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):
     from RNS.Interfaces.Interface import Interface as BaseInterface
 
     class StreamPipeInterface(BaseInterface):
+        # RNS 1.3.1 Reticulum._add_interface reads interface.DEFAULT_IFAC_SIZE
+        # (Reticulum.py:1050); the base Interface defines no default. Match
+        # PipeInterface.DEFAULT_IFAC_SIZE (8) so _add_interface doesn't raise.
+        DEFAULT_IFAC_SIZE = 8
         FLAG = 0x7E
         ESC = 0x7D
         ESC_MASK = 0x20

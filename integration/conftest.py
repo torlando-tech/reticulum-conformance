@@ -26,7 +26,17 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def peer_cmd(request):
-    """Resolve the command to launch the target pipe peer."""
+    """Resolve the command to launch the target pipe peer.
+
+    --python-only: use the in-repo pipe_peer_local.py so PipeSession-based
+    tests (announce / IFAC / channel) exercise the reference end-to-end with
+    no external Swift/Kotlin binary required.
+    --peer-cmd X: use X (typically a built SUT binary).
+    Otherwise: auto-detect a Swift PipePeer build, else skip.
+    """
+    if request.config.getoption("--python-only"):
+        local = os.path.join(os.path.dirname(__file__), "pipe_peer_local.py")
+        return f"python3 {local}"
     cmd = request.config.getoption("--peer-cmd")
     if cmd:
         return cmd

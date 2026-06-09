@@ -40,15 +40,11 @@ writer, Identity._remember_ratchet, always stamps time.time(). Asserting it woul
 require the bridge to hand-build the on-disk msgpack format, which the delegation
 audit correctly rejects; it remains a P2/clock-injection gap.)
 
-Harness note: these destination-level commands are driven through
-`peer.bridge.execute(...)` directly rather than the _WirePeer wrappers. The
-existing wrappers diverge from the registered handlers (see the module-level
-gaps recorded for this workflow): `listen(enable_ratchets=True)` is a no-op
-(cmd_wire_listen ignores it — ratchet-bearing destinations come from
-wire_announce(enable_ratchets=True)); `rotate_ratchet`/`destination_latest_
-ratchet_id` read response keys the handlers don't emit (or call a command name
-that isn't registered). Calling the registered commands directly keeps these
-tests honest against the real RNS machinery.
+Harness note: these destination-level observables are driven through the
+_WirePeer wrappers (peer.announce(enable_ratchets=True), peer.read_ratchets,
+peer.destination_latest_ratchet_id, peer.set_ratchet_interval,
+peer.rotate_ratchet), each of which forwards to the matching registered
+wire_* command and surfaces exactly the response fields these tests assert on.
 """
 
 import secrets
@@ -66,7 +62,7 @@ _ASPECTS = ["enforce-ratchets"]
 
 def _start_ratchet_destination(peer, app_name=_APP, aspects=_ASPECTS):
     """Bring up a real RNS instance on `peer` and create a ratchet-ENABLED
-    SINGLE destination via wire_announce(enable_ratchets=True).
+    SINGLE destination via announce(enable_ratchets=True).
 
     Enabling ratchets sets latest_ratchet_time=0; the immediate announce then
     rotate_ratchets() once (gate open, 0+interval < now) so the destination
@@ -74,20 +70,14 @@ def _start_ratchet_destination(peer, app_name=_APP, aspects=_ASPECTS):
     (Destination.announce -> Identity._remember_ratchet). Returns the
     destination hash (bytes).
 
-    enable_ratchets is honored by cmd_wire_announce (wire_tcp.py:853-890), NOT
-    cmd_wire_listen, and the conftest `announce` wrapper has no enable_ratchets
-    parameter — hence the direct execute.
+    The announce wrapper stashes the bridge response on peer.last_announce so
+    the ratchets_enabled / ratchet_count preconditions stay assertable.
     """
     peer.start_tcp_server(network_name="", passphrase="")
-    resp = peer.bridge.execute(
-        "wire_announce",
-        handle=peer.handle,
-        app_name=app_name,
-        aspects=list(aspects),
-        enable_ratchets=True,
-    )
+    dest_hash = peer.announce(app_name, list(aspects), enable_ratchets=True)
+    resp = peer.last_announce
     assert resp.get("ratchets_enabled") is True, (
-        f"wire_announce(enable_ratchets=True) did not enable ratchets on "
+        f"announce(enable_ratchets=True) did not enable ratchets on "
         f"{peer.role_label}: {resp!r}. The destination-level ratchet "
         f"observables require a ratchet-bearing destination."
     )
@@ -95,7 +85,7 @@ def _start_ratchet_destination(peer, app_name=_APP, aspects=_ASPECTS):
         f"a ratchet-enabled destination must own at least one ratchet after "
         f"announcing (announce rotates the first one); got {resp!r}."
     )
-    return bytes.fromhex(resp["destination_hash"])
+    return dest_hash
 
 
 @conformance_case(
@@ -240,9 +230,7 @@ def test_destination_single_auto_ratchet_latest_id(wire_peers):
 
     # Baseline: announce rotated a ratchet into existence (count >= 1) but no
     # encrypt/decrypt has run, so latest_ratchet_id is still None.
-    before = server.bridge.execute(
-        "wire_read_ratchets", handle=server.handle, destination_hash=dest_hash.hex()
-    )
+    before = server.read_ratchets(dest_hash)
     assert before["latest_ratchet_id"] is None, (
         f"latest_ratchet_id must be None before any Destination.encrypt/decrypt; "
         f"got {before['latest_ratchet_id']!r}."
@@ -251,11 +239,7 @@ def test_destination_single_auto_ratchet_latest_id(wire_peers):
     assert before["current_ratchet_id"] is not None
 
     # One real encrypt+decrypt round trip on the destination.
-    r = server.bridge.execute(
-        "wire_destination_latest_ratchet_id",
-        handle=server.handle,
-        destination_hash=dest_hash.hex(),
-    )
+    r = server.destination_latest_ratchet_id(dest_hash)
     assert r["decrypted"] is True, (
         f"the auto-ratcheted Destination.encrypt/decrypt round trip must "
         f"recover the plaintext; got {r!r}."
@@ -302,22 +286,12 @@ def test_ratchet_rotation_interval_gating(wire_peers):
     server, _client = wire_peers
     dest_hash = _start_ratchet_destination(server)
 
-    interval = server.bridge.execute(
-        "wire_set_ratchet_interval",
-        handle=server.handle,
-        destination_hash=dest_hash.hex(),
-        seconds=100,
-    )
+    interval = server.set_ratchet_interval(dest_hash, seconds=100)
     assert interval["ok"] is True
     assert interval["ratchet_interval"] == 100
 
     # Eligible: last rotation 200s ago (> 100s interval) -> a new ratchet.
-    elig = server.bridge.execute(
-        "wire_rotate_ratchet",
-        handle=server.handle,
-        destination_hash=dest_hash.hex(),
-        last_rotation_ago_s=200,
-    )
+    elig = server.rotate_ratchet(dest_hash, last_rotation_ago_s=200)
     assert elig["rotated"] is True, (
         f"a rotate whose last rotation was 200s ago with a 100s interval must "
         f"insert a new ratchet; got {elig!r}."
@@ -337,12 +311,7 @@ def test_ratchet_rotation_interval_gating(wire_peers):
     )
 
     # Gated: last rotation only 50s ago (< 100s interval) -> NO new ratchet.
-    gated = server.bridge.execute(
-        "wire_rotate_ratchet",
-        handle=server.handle,
-        destination_hash=dest_hash.hex(),
-        last_rotation_ago_s=50,
-    )
+    gated = server.rotate_ratchet(dest_hash, last_rotation_ago_s=50)
     assert gated["rotated"] is False, (
         f"a rotate whose last rotation was only 50s ago with a 100s interval "
         f"must be gated (no new ratchet); got {gated!r}."

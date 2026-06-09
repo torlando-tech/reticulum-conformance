@@ -20,11 +20,11 @@ fixtures:
 These run reference-vs-reference (no SUT binary required); the wire_pair
 parametrization collapses to (reference, reference) under --reference-only.
 
-Several handlers are driven through `peer.bridge.execute(...)` directly rather
-than the _WirePeer convenience wrappers: see the notes on the individual tests
-and the harness-gap record returned to the workflow — the relevant wrappers
-either target a stale command name or drop the response fields these tests
-assert on.
+Every bridge command is driven through its _WirePeer wrapper
+(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=
+True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each
+forwards to the matching registered wire_* command and surfaces exactly the
+response fields these tests assert on.
 """
 
 import secrets
@@ -81,18 +81,14 @@ def test_single_packet_proof_emitted_under_prove_all_not_under_prove_none(
     # opens a link. The single-packet proof path is independent of that link.
     server, client, dest_hash, _link_id = wire_link_setup(_APP, _ASPECTS)
 
-    # The send_packet_with_proof_request HANDLER surfaces the full proof read-
-    # back (proof_data / proved / proof_is_implicit / implicit_proof_config /
-    # impl_length / expl_length). The _WirePeer.send_packet_with_proof_request
-    # WRAPPER maps onto response keys (proof / validates / implicit) the handler
-    # does not emit, so it would silently drop these; drive the command directly.
+    # send_packet_with_proof_request surfaces the full proof read-back
+    # (proof_data / proved / proof_is_implicit / implicit_proof_config /
+    # impl_length / expl_length) straight off the real PacketReceipt.
     def _proof(strategy, timeout_ms):
         server.set_proof_strategy(dest_hash, strategy)
-        return client.bridge.execute(
-            "wire_send_packet_with_proof_request",
-            handle=client.handle,
-            destination_hash=dest_hash.hex(),
-            data=secrets.token_bytes(20).hex(),
+        return client.send_packet_with_proof_request(
+            dest_hash,
+            data=secrets.token_bytes(20),
             app_name=_APP,
             aspects=list(_ASPECTS),
             timeout_ms=timeout_ms,
@@ -210,16 +206,9 @@ def test_validate_announce_rejects_known_key_mismatch(wire_peers):
     server, _client = wire_peers
     server.start_tcp_server(network_name="", passphrase="")
 
-    # The _WirePeer.validate_with_known_key wrapper targets a stale command name
-    # (wire_validate_with_known_key) with a different param/response shape; the
-    # registered handler is wire_known_key_validate, so drive it directly.
     def _validate(plant):
-        return server.bridge.execute(
-            "wire_known_key_validate",
-            handle=server.handle,
-            app_name=_APP,
-            aspects=list(_ASPECTS),
-            plant=plant,
+        return server.known_key_validate(
+            app_name=_APP, aspects=list(_ASPECTS), plant=plant
         )
 
     mismatch = _validate("mismatch")
@@ -296,23 +285,18 @@ def test_create_keys_yields_distinct_identities(wire_peers):
 def _announce_ratcheted_destination(peer):
     """Create a ratchet-bearing SINGLE destination on `peer` and return its hash.
 
-    The _WirePeer.announce wrapper does not forward enable_ratchets, and
-    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=
-    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler
-    that actually calls Destination.enable_ratchets, so drive it directly.
+    announce(enable_ratchets=True) calls Destination.enable_ratchets before
+    announcing; the wrapper stashes the bridge response on peer.last_announce so
+    the ratchets_enabled precondition stays assertable.
     """
-    resp = peer.bridge.execute(
-        "wire_announce",
-        handle=peer.handle,
-        app_name=_APP,
-        aspects=list(_ASPECTS),
-        app_data="",
-        enable_ratchets=True,
+    dest_hash = peer.announce(
+        app_name=_APP, aspects=list(_ASPECTS), app_data=b"", enable_ratchets=True
     )
-    assert resp.get("ratchets_enabled") is True, (
-        f"enable_ratchets did not take on the announced destination: {resp!r}"
+    assert peer.last_announce.get("ratchets_enabled") is True, (
+        f"enable_ratchets did not take on the announced destination: "
+        f"{peer.last_announce!r}"
     )
-    return bytes.fromhex(resp["destination_hash"])
+    return dest_hash
 
 
 @conformance_case(
@@ -334,14 +318,7 @@ def test_retained_ratchets_capped_at_ratchet_count(wire_peers):
     dest_hash = _announce_ratcheted_destination(server)
 
     def _set(n, pad_to=None):
-        params = {
-            "handle": server.handle,
-            "destination_hash": dest_hash.hex(),
-            "n": n,
-        }
-        if pad_to is not None:
-            params["pad_to"] = pad_to
-        return server.bridge.execute("wire_set_retained_ratchets", **params)
+        return server.set_retained_ratchets(dest_hash, n, pad_to=pad_to)
 
     # Valid positive cap read-back.
     r1 = _set(8)
@@ -401,15 +378,8 @@ def test_ratchet_file_persistence_roundtrip(wire_peers):
 
     # Guarantee a non-empty, freshly-persisted store: back-date the last-rotation
     # timestamp far enough that the interval gate opens, so rotate inserts a new
-    # ratchet and persists it (no real wait). rotate_ratchet's _WirePeer wrapper
-    # drops the count fields and cannot pass last_rotation_ago_s, so drive the
-    # command directly.
-    rot = server.bridge.execute(
-        "wire_rotate_ratchet",
-        handle=server.handle,
-        destination_hash=dest_hash.hex(),
-        last_rotation_ago_s=10_000_000,
-    )
+    # ratchet and persists it (no real wait).
+    rot = server.rotate_ratchet(dest_hash, last_rotation_ago_s=10_000_000)
     assert rot["rotated"] is True, (
         f"back-dated rotation must open the interval gate and insert a ratchet: "
         f"{rot!r}"

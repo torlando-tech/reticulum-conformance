@@ -468,13 +468,11 @@ def test_link_identify_on_pending_link_is_noop(wire_link_setup):
     # Negative: the harness builds a fresh initiator link forced to PENDING and
     # calls identify on it. The ACTIVE-only guard (Link.py:468) must make this a
     # silent no-op: no exception, no LINKIDENTIFY packet, link still PENDING.
-    pending = client.bridge.execute(
-        "wire_link_identify_pending",
-        handle=client.handle,
-        destination_hash=dest_hash.hex(),
+    pending = client.link_identify_pending(
+        destination_hash=dest_hash,
         app_name=_APP,
         aspects=list(_ASPECTS),
-        private_key=secrets.token_bytes(64).hex(),
+        private_key=secrets.token_bytes(64),
     )
     assert pending["initiator"] is True, (
         f"the probed link must be an initiator link (identify only ever acts on "

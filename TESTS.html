@@ -11317,18 +11317,14 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="c1"># opens a link. The single-packet proof path is independent of that link.</span>
     <span class="n">server</span><span class="p">,</span> <span class="n">client</span><span class="p">,</span> <span class="n">dest_hash</span><span class="p">,</span> <span class="n">_link_id</span> <span class="o">=</span> <span class="n">wire_link_setup</span><span class="p">(</span><span class="n">_APP</span><span class="p">,</span> <span class="n">_ASPECTS</span><span class="p">)</span>
 
-    <span class="c1"># The send_packet_with_proof_request HANDLER surfaces the full proof read-</span>
-    <span class="c1"># back (proof_data / proved / proof_is_implicit / implicit_proof_config /</span>
-    <span class="c1"># impl_length / expl_length). The _WirePeer.send_packet_with_proof_request</span>
-    <span class="c1"># WRAPPER maps onto response keys (proof / validates / implicit) the handler</span>
-    <span class="c1"># does not emit, so it would silently drop these; drive the command directly.</span>
+    <span class="c1"># send_packet_with_proof_request surfaces the full proof read-back</span>
+    <span class="c1"># (proof_data / proved / proof_is_implicit / implicit_proof_config /</span>
+    <span class="c1"># impl_length / expl_length) straight off the real PacketReceipt.</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_proof</span><span class="p">(</span><span class="n">strategy</span><span class="p">,</span> <span class="n">timeout_ms</span><span class="p">):</span>
         <span class="n">server</span><span class="o">.</span><span class="n">set_proof_strategy</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">strategy</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">client</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-            <span class="s2">&quot;wire_send_packet_with_proof_request&quot;</span><span class="p">,</span>
-            <span class="n">handle</span><span class="o">=</span><span class="n">client</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-            <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-            <span class="n">data</span><span class="o">=</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">20</span><span class="p">)</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+        <span class="k">return</span> <span class="n">client</span><span class="o">.</span><span class="n">send_packet_with_proof_request</span><span class="p">(</span>
+            <span class="n">dest_hash</span><span class="p">,</span>
+            <span class="n">data</span><span class="o">=</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">20</span><span class="p">),</span>
             <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
             <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
             <span class="n">timeout_ms</span><span class="o">=</span><span class="n">timeout_ms</span><span class="p">,</span>
@@ -11483,11 +11479,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -11538,23 +11534,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -11641,11 +11632,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -11696,23 +11687,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -11723,16 +11709,9 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="n">server</span><span class="p">,</span> <span class="n">_client</span> <span class="o">=</span> <span class="n">wire_peers</span>
     <span class="n">server</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
 
-    <span class="c1"># The _WirePeer.validate_with_known_key wrapper targets a stale command name</span>
-    <span class="c1"># (wire_validate_with_known_key) with a different param/response shape; the</span>
-    <span class="c1"># registered handler is wire_known_key_validate, so drive it directly.</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_validate</span><span class="p">(</span><span class="n">plant</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-            <span class="s2">&quot;wire_known_key_validate&quot;</span><span class="p">,</span>
-            <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-            <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-            <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-            <span class="n">plant</span><span class="o">=</span><span class="n">plant</span><span class="p">,</span>
+        <span class="k">return</span> <span class="n">server</span><span class="o">.</span><span class="n">known_key_validate</span><span class="p">(</span>
+            <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">plant</span><span class="o">=</span><span class="n">plant</span>
         <span class="p">)</span>
 
     <span class="n">mismatch</span> <span class="o">=</span> <span class="n">_validate</span><span class="p">(</span><span class="s2">&quot;mismatch&quot;</span><span class="p">)</span>
@@ -11821,11 +11800,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -11876,23 +11855,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -11978,11 +11952,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12033,23 +12007,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -12062,14 +12031,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">server</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_set</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">pad_to</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-        <span class="n">params</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="s2">&quot;handle&quot;</span><span class="p">:</span> <span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-            <span class="s2">&quot;destination_hash&quot;</span><span class="p">:</span> <span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-            <span class="s2">&quot;n&quot;</span><span class="p">:</span> <span class="n">n</span><span class="p">,</span>
-        <span class="p">}</span>
-        <span class="k">if</span> <span class="n">pad_to</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">params</span><span class="p">[</span><span class="s2">&quot;pad_to&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">pad_to</span>
-        <span class="k">return</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;wire_set_retained_ratchets&quot;</span><span class="p">,</span> <span class="o">**</span><span class="n">params</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">server</span><span class="o">.</span><span class="n">set_retained_ratchets</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">pad_to</span><span class="o">=</span><span class="n">pad_to</span><span class="p">)</span>
 
     <span class="c1"># Valid positive cap read-back.</span>
     <span class="n">r1</span> <span class="o">=</span> <span class="n">_set</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span>
@@ -12155,11 +12117,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12210,23 +12172,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -12240,15 +12197,8 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
     <span class="c1"># Guarantee a non-empty, freshly-persisted store: back-date the last-rotation</span>
     <span class="c1"># timestamp far enough that the interval gate opens, so rotate inserts a new</span>
-    <span class="c1"># ratchet and persists it (no real wait). rotate_ratchet&#39;s _WirePeer wrapper</span>
-    <span class="c1"># drops the count fields and cannot pass last_rotation_ago_s, so drive the</span>
-    <span class="c1"># command directly.</span>
-    <span class="n">rot</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_rotate_ratchet&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-        <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">10_000_000</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="c1"># ratchet and persists it (no real wait).</span>
+    <span class="n">rot</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">rotate_ratchet</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">10_000_000</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">rot</span><span class="p">[</span><span class="s2">&quot;rotated&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;back-dated rotation must open the interval gate and insert a ratchet: &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">rot</span><span class="si">!r}</span><span class="s2">&quot;</span>
@@ -12336,11 +12286,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">These run reference-vs-reference (no SUT binary required); the wire_pair</span>
 <span class="sd">parametrization collapses to (reference, reference) under --reference-only.</span>
 
-<span class="sd">Several handlers are driven through `peer.bridge.execute(...)` directly rather</span>
-<span class="sd">than the _WirePeer convenience wrappers: see the notes on the individual tests</span>
-<span class="sd">and the harness-gap record returned to the workflow — the relevant wrappers</span>
-<span class="sd">either target a stale command name or drop the response fields these tests</span>
-<span class="sd">assert on.</span>
+<span class="sd">Every bridge command is driven through its _WirePeer wrapper</span>
+<span class="sd">(send_packet_with_proof_request, known_key_validate, announce(enable_ratchets=</span>
+<span class="sd">True), set_retained_ratchets, rotate_ratchet, ratchet_file_roundtrip); each</span>
+<span class="sd">forwards to the matching registered wire_* command and surfaces exactly the</span>
+<span class="sd">response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12391,23 +12341,18 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="k">def</span><span class="w"> </span><span class="nf">_announce_ratcheted_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Create a ratchet-bearing SINGLE destination on `peer` and return its hash.</span>
 
-<span class="sd">    The _WirePeer.announce wrapper does not forward enable_ratchets, and</span>
-<span class="sd">    cmd_wire_listen ignores it (so wire_ratcheted_link / listen(enable_ratchets=</span>
-<span class="sd">    True) produce a NON-ratcheted destination). cmd_wire_announce is the handler</span>
-<span class="sd">    that actually calls Destination.enable_ratchets, so drive it directly.</span>
+<span class="sd">    announce(enable_ratchets=True) calls Destination.enable_ratchets before</span>
+<span class="sd">    announcing; the wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled precondition stays assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">app_data</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span>
+        <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span> <span class="n">app_data</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span>
-    <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">&quot;</span>
+    <span class="k">assert</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;enable_ratchets did not take on the announced destination: &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span><span class="si">!r}</span><span class="s2">&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -12548,15 +12493,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">require the bridge to hand-build the on-disk msgpack format, which the delegation</span>
 <span class="sd">audit correctly rejects; it remains a P2/clock-injection gap.)</span>
 
-<span class="sd">Harness note: these destination-level commands are driven through</span>
-<span class="sd">`peer.bridge.execute(...)` directly rather than the _WirePeer wrappers. The</span>
-<span class="sd">existing wrappers diverge from the registered handlers (see the module-level</span>
-<span class="sd">gaps recorded for this workflow): `listen(enable_ratchets=True)` is a no-op</span>
-<span class="sd">(cmd_wire_listen ignores it — ratchet-bearing destinations come from</span>
-<span class="sd">wire_announce(enable_ratchets=True)); `rotate_ratchet`/`destination_latest_</span>
-<span class="sd">ratchet_id` read response keys the handlers don&#39;t emit (or call a command name</span>
-<span class="sd">that isn&#39;t registered). Calling the registered commands directly keeps these</span>
-<span class="sd">tests honest against the real RNS machinery.</span>
+<span class="sd">Harness note: these destination-level observables are driven through the</span>
+<span class="sd">_WirePeer wrappers (peer.announce(enable_ratchets=True), peer.read_ratchets,</span>
+<span class="sd">peer.destination_latest_ratchet_id, peer.set_ratchet_interval,</span>
+<span class="sd">peer.rotate_ratchet), each of which forwards to the matching registered</span>
+<span class="sd">wire_* command and surfaces exactly the response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12574,7 +12515,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_start_ratchet_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Bring up a real RNS instance on `peer` and create a ratchet-ENABLED</span>
-<span class="sd">    SINGLE destination via wire_announce(enable_ratchets=True).</span>
+<span class="sd">    SINGLE destination via announce(enable_ratchets=True).</span>
 
 <span class="sd">    Enabling ratchets sets latest_ratchet_time=0; the immediate announce then</span>
 <span class="sd">    rotate_ratchets() once (gate open, 0+interval &lt; now) so the destination</span>
@@ -12582,20 +12523,14 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">    (Destination.announce -&gt; Identity._remember_ratchet). Returns the</span>
 <span class="sd">    destination hash (bytes).</span>
 
-<span class="sd">    enable_ratchets is honored by cmd_wire_announce (wire_tcp.py:853-890), NOT</span>
-<span class="sd">    cmd_wire_listen, and the conftest `announce` wrapper has no enable_ratchets</span>
-<span class="sd">    parameter — hence the direct execute.</span>
+<span class="sd">    The announce wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled / ratchet_count preconditions stay assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">peer</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">app_name</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span><span class="n">app_name</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span>
     <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;wire_announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">. The destination-level ratchet &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;observables require a ratchet-bearing destination.&quot;</span>
     <span class="p">)</span>
@@ -12603,7 +12538,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
         <span class="sa">f</span><span class="s2">&quot;a ratchet-enabled destination must own at least one ratchet after &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;announcing (announce rotates the first one); got </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">.&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
 <details class="test-detail" id="t-10-28" data-search="test_enforce_ratchets_accepts_matching_ratchet identity_keypair ratchet_keypair identity_encrypt identity_decrypt enforce_ratchets positive control (identity.py:891-901): with enforce_ratchets=true a ciphertext encrypted to a ratchet public key is decrypted byte-exact when the matching ratchet private key is supplied (enforcement is not blanket), while the same ciphertext under only a non-matching ratchet returns none — pinning that enforcement accepts iff one of the retained ratchets decrypts"><summary><span class="col num">10.28</span><span class="col name"><code>test_enforce_ratchets_accepts_matching_ratchet</code></span><span class="col cmds"><span class="cmd-chip">identity_keypair</span><span class="cmd-chip">ratchet_keypair</span><span class="cmd-chip">identity_encrypt</span><span class="cmd-chip">identity_decrypt</span></span><span class="col ver">enforce_ratchets positive control (Identity.py:891-901): with enforce_ratchets=True a ciphertext encrypted TO a ratchet public key IS decrypted byte-exact when the matching ratchet private key is supplied (enforcement is not blanket), while the SAME ciphertext under only a non-matching ratchet returns None — pinning that enforcement accepts iff one of the retained ratchets decrypts</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_enforce_ratchets.py</code></span><a href="#t-10-28">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_enforce_ratchets_accepts_matching_ratchet</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;A ratchet-encrypted ciphertext is accepted under enforce_ratchets=True</span>
@@ -12724,15 +12659,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">require the bridge to hand-build the on-disk msgpack format, which the delegation</span>
 <span class="sd">audit correctly rejects; it remains a P2/clock-injection gap.)</span>
 
-<span class="sd">Harness note: these destination-level commands are driven through</span>
-<span class="sd">`peer.bridge.execute(...)` directly rather than the _WirePeer wrappers. The</span>
-<span class="sd">existing wrappers diverge from the registered handlers (see the module-level</span>
-<span class="sd">gaps recorded for this workflow): `listen(enable_ratchets=True)` is a no-op</span>
-<span class="sd">(cmd_wire_listen ignores it — ratchet-bearing destinations come from</span>
-<span class="sd">wire_announce(enable_ratchets=True)); `rotate_ratchet`/`destination_latest_</span>
-<span class="sd">ratchet_id` read response keys the handlers don&#39;t emit (or call a command name</span>
-<span class="sd">that isn&#39;t registered). Calling the registered commands directly keeps these</span>
-<span class="sd">tests honest against the real RNS machinery.</span>
+<span class="sd">Harness note: these destination-level observables are driven through the</span>
+<span class="sd">_WirePeer wrappers (peer.announce(enable_ratchets=True), peer.read_ratchets,</span>
+<span class="sd">peer.destination_latest_ratchet_id, peer.set_ratchet_interval,</span>
+<span class="sd">peer.rotate_ratchet), each of which forwards to the matching registered</span>
+<span class="sd">wire_* command and surfaces exactly the response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12750,7 +12681,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_start_ratchet_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Bring up a real RNS instance on `peer` and create a ratchet-ENABLED</span>
-<span class="sd">    SINGLE destination via wire_announce(enable_ratchets=True).</span>
+<span class="sd">    SINGLE destination via announce(enable_ratchets=True).</span>
 
 <span class="sd">    Enabling ratchets sets latest_ratchet_time=0; the immediate announce then</span>
 <span class="sd">    rotate_ratchets() once (gate open, 0+interval &lt; now) so the destination</span>
@@ -12758,20 +12689,14 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">    (Destination.announce -&gt; Identity._remember_ratchet). Returns the</span>
 <span class="sd">    destination hash (bytes).</span>
 
-<span class="sd">    enable_ratchets is honored by cmd_wire_announce (wire_tcp.py:853-890), NOT</span>
-<span class="sd">    cmd_wire_listen, and the conftest `announce` wrapper has no enable_ratchets</span>
-<span class="sd">    parameter — hence the direct execute.</span>
+<span class="sd">    The announce wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled / ratchet_count preconditions stay assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">peer</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">app_name</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span><span class="n">app_name</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span>
     <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;wire_announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">. The destination-level ratchet &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;observables require a ratchet-bearing destination.&quot;</span>
     <span class="p">)</span>
@@ -12779,7 +12704,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
         <span class="sa">f</span><span class="s2">&quot;a ratchet-enabled destination must own at least one ratchet after &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;announcing (announce rotates the first one); got </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">.&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
 <details class="test-detail" id="t-10-29" data-search="test_destination_single_auto_ratchet_latest_id start_tcp_server announce read_ratchets destination_latest_ratchet_id destination single outbound auto-ratchet selection + inbound latest_ratchet_id tracking (destination.py:595-643): a ratchet-enabled single destination has latest_ratchet_id == none until a real destination.encrypt/decrypt happens; after one round trip encrypt auto-selected the current ratchet (latest_ratchet_id is non-none, equals the encrypt-time id, equals the current ratchet id, and equals the ratchet the announce created) and the packet decrypted — the ratchet path apps use, distinct from identity.encrypt(ratchet=...)"><summary><span class="col num">10.29</span><span class="col name"><code>test_destination_single_auto_ratchet_latest_id</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">announce</span><span class="cmd-chip">read_ratchets</span><span class="cmd-chip">destination_latest_ratchet_id</span></span><span class="col ver">Destination SINGLE outbound auto-ratchet selection + inbound latest_ratchet_id tracking (Destination.py:595-643): a ratchet-enabled SINGLE destination has latest_ratchet_id == None until a real Destination.encrypt/decrypt happens; after one round trip encrypt auto-selected the current ratchet (latest_ratchet_id is non-None, equals the encrypt-time id, equals the current ratchet id, and equals the ratchet the announce created) and the packet decrypted — the ratchet path apps use, distinct from Identity.encrypt(ratchet=...)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_enforce_ratchets.py</code></span><a href="#t-10-29">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_destination_single_auto_ratchet_latest_id</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;latest_ratchet_id is None before any encrypt, then tracks the current</span>
@@ -12790,9 +12715,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
     <span class="c1"># Baseline: announce rotated a ratchet into existence (count &gt;= 1) but no</span>
     <span class="c1"># encrypt/decrypt has run, so latest_ratchet_id is still None.</span>
-    <span class="n">before</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_read_ratchets&quot;</span><span class="p">,</span> <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span> <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
-    <span class="p">)</span>
+    <span class="n">before</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">read_ratchets</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">before</span><span class="p">[</span><span class="s2">&quot;latest_ratchet_id&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;latest_ratchet_id must be None before any Destination.encrypt/decrypt; &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="n">before</span><span class="p">[</span><span class="s1">&#39;latest_ratchet_id&#39;</span><span class="p">]</span><span class="si">!r}</span><span class="s2">.&quot;</span>
@@ -12801,11 +12724,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="k">assert</span> <span class="n">before</span><span class="p">[</span><span class="s2">&quot;current_ratchet_id&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
     <span class="c1"># One real encrypt+decrypt round trip on the destination.</span>
-    <span class="n">r</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_destination_latest_ratchet_id&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-    <span class="p">)</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">destination_latest_ratchet_id</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">r</span><span class="p">[</span><span class="s2">&quot;decrypted&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;the auto-ratcheted Destination.encrypt/decrypt round trip must &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;recover the plaintext; got </span><span class="si">{</span><span class="n">r</span><span class="si">!r}</span><span class="s2">.&quot;</span>
@@ -12909,15 +12828,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">require the bridge to hand-build the on-disk msgpack format, which the delegation</span>
 <span class="sd">audit correctly rejects; it remains a P2/clock-injection gap.)</span>
 
-<span class="sd">Harness note: these destination-level commands are driven through</span>
-<span class="sd">`peer.bridge.execute(...)` directly rather than the _WirePeer wrappers. The</span>
-<span class="sd">existing wrappers diverge from the registered handlers (see the module-level</span>
-<span class="sd">gaps recorded for this workflow): `listen(enable_ratchets=True)` is a no-op</span>
-<span class="sd">(cmd_wire_listen ignores it — ratchet-bearing destinations come from</span>
-<span class="sd">wire_announce(enable_ratchets=True)); `rotate_ratchet`/`destination_latest_</span>
-<span class="sd">ratchet_id` read response keys the handlers don&#39;t emit (or call a command name</span>
-<span class="sd">that isn&#39;t registered). Calling the registered commands directly keeps these</span>
-<span class="sd">tests honest against the real RNS machinery.</span>
+<span class="sd">Harness note: these destination-level observables are driven through the</span>
+<span class="sd">_WirePeer wrappers (peer.announce(enable_ratchets=True), peer.read_ratchets,</span>
+<span class="sd">peer.destination_latest_ratchet_id, peer.set_ratchet_interval,</span>
+<span class="sd">peer.rotate_ratchet), each of which forwards to the matching registered</span>
+<span class="sd">wire_* command and surfaces exactly the response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -12935,7 +12850,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_start_ratchet_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Bring up a real RNS instance on `peer` and create a ratchet-ENABLED</span>
-<span class="sd">    SINGLE destination via wire_announce(enable_ratchets=True).</span>
+<span class="sd">    SINGLE destination via announce(enable_ratchets=True).</span>
 
 <span class="sd">    Enabling ratchets sets latest_ratchet_time=0; the immediate announce then</span>
 <span class="sd">    rotate_ratchets() once (gate open, 0+interval &lt; now) so the destination</span>
@@ -12943,20 +12858,14 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">    (Destination.announce -&gt; Identity._remember_ratchet). Returns the</span>
 <span class="sd">    destination hash (bytes).</span>
 
-<span class="sd">    enable_ratchets is honored by cmd_wire_announce (wire_tcp.py:853-890), NOT</span>
-<span class="sd">    cmd_wire_listen, and the conftest `announce` wrapper has no enable_ratchets</span>
-<span class="sd">    parameter — hence the direct execute.</span>
+<span class="sd">    The announce wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled / ratchet_count preconditions stay assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">peer</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">app_name</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span><span class="n">app_name</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span>
     <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;wire_announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">. The destination-level ratchet &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;observables require a ratchet-bearing destination.&quot;</span>
     <span class="p">)</span>
@@ -12964,7 +12873,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
         <span class="sa">f</span><span class="s2">&quot;a ratchet-enabled destination must own at least one ratchet after &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;announcing (announce rotates the first one); got </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">.&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
 <details class="test-detail" id="t-10-30" data-search="test_ratchet_rotation_interval_gating start_tcp_server announce set_ratchet_interval rotate_ratchet ratchet rotation-interval gating (destination.py:227-241): with ratchet_interval set to 100s, a rotate attempt whose last-rotation timestamp is backdated 200s (&gt; interval) inserts a new ratchet (after_count == before_count+1, the new current differs from the old and the old becomes previous); a rotate backdated only 50s (&lt; interval) is gated and leaves the ratchet list and current id unchanged — deterministic via a backdated latest_ratchet_time, no real wait"><summary><span class="col num">10.30</span><span class="col name"><code>test_ratchet_rotation_interval_gating</code></span><span class="col cmds"><span class="cmd-chip">start_tcp_server</span><span class="cmd-chip">announce</span><span class="cmd-chip">set_ratchet_interval</span><span class="cmd-chip">rotate_ratchet</span></span><span class="col ver">Ratchet rotation-INTERVAL gating (Destination.py:227-241): with ratchet_interval set to 100s, a rotate attempt whose last-rotation timestamp is backdated 200s (&gt; interval) inserts a NEW ratchet (after_count == before_count+1, the new current differs from the old and the old becomes previous); a rotate backdated only 50s (&lt; interval) is gated and leaves the ratchet list and current id unchanged — deterministic via a backdated latest_ratchet_time, no real wait</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/wire/test_enforce_ratchets.py</code></span><a href="#t-10-30">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_ratchet_rotation_interval_gating</span><span class="p">(</span><span class="n">wire_peers</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;rotate_ratchets inserts a ratchet only once the interval has elapsed;</span>
@@ -12973,22 +12882,12 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="n">server</span><span class="p">,</span> <span class="n">_client</span> <span class="o">=</span> <span class="n">wire_peers</span>
     <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">_start_ratchet_destination</span><span class="p">(</span><span class="n">server</span><span class="p">)</span>
 
-    <span class="n">interval</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_set_ratchet_interval&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-        <span class="n">seconds</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">interval</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">set_ratchet_interval</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">seconds</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">interval</span><span class="p">[</span><span class="s2">&quot;ok&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span>
     <span class="k">assert</span> <span class="n">interval</span><span class="p">[</span><span class="s2">&quot;ratchet_interval&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="mi">100</span>
 
     <span class="c1"># Eligible: last rotation 200s ago (&gt; 100s interval) -&gt; a new ratchet.</span>
-    <span class="n">elig</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_rotate_ratchet&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-        <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">200</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">elig</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">rotate_ratchet</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">elig</span><span class="p">[</span><span class="s2">&quot;rotated&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;a rotate whose last rotation was 200s ago with a 100s interval must &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;insert a new ratchet; got </span><span class="si">{</span><span class="n">elig</span><span class="si">!r}</span><span class="s2">.&quot;</span>
@@ -13008,12 +12907,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="p">)</span>
 
     <span class="c1"># Gated: last rotation only 50s ago (&lt; 100s interval) -&gt; NO new ratchet.</span>
-    <span class="n">gated</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_rotate_ratchet&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">server</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
-        <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">gated</span> <span class="o">=</span> <span class="n">server</span><span class="o">.</span><span class="n">rotate_ratchet</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">,</span> <span class="n">last_rotation_ago_s</span><span class="o">=</span><span class="mi">50</span><span class="p">)</span>
     <span class="k">assert</span> <span class="n">gated</span><span class="p">[</span><span class="s2">&quot;rotated&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;a rotate whose last rotation was only 50s ago with a 100s interval &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;must be gated (no new ratchet); got </span><span class="si">{</span><span class="n">gated</span><span class="si">!r}</span><span class="s2">.&quot;</span>
@@ -13104,15 +12998,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">require the bridge to hand-build the on-disk msgpack format, which the delegation</span>
 <span class="sd">audit correctly rejects; it remains a P2/clock-injection gap.)</span>
 
-<span class="sd">Harness note: these destination-level commands are driven through</span>
-<span class="sd">`peer.bridge.execute(...)` directly rather than the _WirePeer wrappers. The</span>
-<span class="sd">existing wrappers diverge from the registered handlers (see the module-level</span>
-<span class="sd">gaps recorded for this workflow): `listen(enable_ratchets=True)` is a no-op</span>
-<span class="sd">(cmd_wire_listen ignores it — ratchet-bearing destinations come from</span>
-<span class="sd">wire_announce(enable_ratchets=True)); `rotate_ratchet`/`destination_latest_</span>
-<span class="sd">ratchet_id` read response keys the handlers don&#39;t emit (or call a command name</span>
-<span class="sd">that isn&#39;t registered). Calling the registered commands directly keeps these</span>
-<span class="sd">tests honest against the real RNS machinery.</span>
+<span class="sd">Harness note: these destination-level observables are driven through the</span>
+<span class="sd">_WirePeer wrappers (peer.announce(enable_ratchets=True), peer.read_ratchets,</span>
+<span class="sd">peer.destination_latest_ratchet_id, peer.set_ratchet_interval,</span>
+<span class="sd">peer.rotate_ratchet), each of which forwards to the matching registered</span>
+<span class="sd">wire_* command and surfaces exactly the response fields these tests assert on.</span>
 <span class="sd">&quot;&quot;&quot;</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
@@ -13130,7 +13020,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_start_ratchet_destination</span><span class="p">(</span><span class="n">peer</span><span class="p">,</span> <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span> <span class="n">aspects</span><span class="o">=</span><span class="n">_ASPECTS</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Bring up a real RNS instance on `peer` and create a ratchet-ENABLED</span>
-<span class="sd">    SINGLE destination via wire_announce(enable_ratchets=True).</span>
+<span class="sd">    SINGLE destination via announce(enable_ratchets=True).</span>
 
 <span class="sd">    Enabling ratchets sets latest_ratchet_time=0; the immediate announce then</span>
 <span class="sd">    rotate_ratchets() once (gate open, 0+interval &lt; now) so the destination</span>
@@ -13138,20 +13028,14 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">    (Destination.announce -&gt; Identity._remember_ratchet). Returns the</span>
 <span class="sd">    destination hash (bytes).</span>
 
-<span class="sd">    enable_ratchets is honored by cmd_wire_announce (wire_tcp.py:853-890), NOT</span>
-<span class="sd">    cmd_wire_listen, and the conftest `announce` wrapper has no enable_ratchets</span>
-<span class="sd">    parameter — hence the direct execute.</span>
+<span class="sd">    The announce wrapper stashes the bridge response on peer.last_announce so</span>
+<span class="sd">    the ratchets_enabled / ratchet_count preconditions stay assertable.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">peer</span><span class="o">.</span><span class="n">start_tcp_server</span><span class="p">(</span><span class="n">network_name</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">passphrase</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
-    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_announce&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">peer</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">app_name</span><span class="o">=</span><span class="n">app_name</span><span class="p">,</span>
-        <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span>
-        <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="n">dest_hash</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">announce</span><span class="p">(</span><span class="n">app_name</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="n">aspects</span><span class="p">),</span> <span class="n">enable_ratchets</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">resp</span> <span class="o">=</span> <span class="n">peer</span><span class="o">.</span><span class="n">last_announce</span>
     <span class="k">assert</span> <span class="n">resp</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;ratchets_enabled&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;wire_announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;announce(enable_ratchets=True) did not enable ratchets on &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">peer</span><span class="o">.</span><span class="n">role_label</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">. The destination-level ratchet &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;observables require a ratchet-bearing destination.&quot;</span>
     <span class="p">)</span>
@@ -13159,7 +13043,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
         <span class="sa">f</span><span class="s2">&quot;a ratchet-enabled destination must own at least one ratchet after &quot;</span>
         <span class="sa">f</span><span class="s2">&quot;announcing (announce rotates the first one); got </span><span class="si">{</span><span class="n">resp</span><span class="si">!r}</span><span class="s2">.&quot;</span>
     <span class="p">)</span>
-    <span class="k">return</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;destination_hash&quot;</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">dest_hash</span>
 </code></pre></details></div></details>
 </div>
 </div>
@@ -18708,13 +18592,11 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
     <span class="c1"># Negative: the harness builds a fresh initiator link forced to PENDING and</span>
     <span class="c1"># calls identify on it. The ACTIVE-only guard (Link.py:468) must make this a</span>
     <span class="c1"># silent no-op: no exception, no LINKIDENTIFY packet, link still PENDING.</span>
-    <span class="n">pending</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">bridge</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
-        <span class="s2">&quot;wire_link_identify_pending&quot;</span><span class="p">,</span>
-        <span class="n">handle</span><span class="o">=</span><span class="n">client</span><span class="o">.</span><span class="n">handle</span><span class="p">,</span>
-        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+    <span class="n">pending</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">link_identify_pending</span><span class="p">(</span>
+        <span class="n">destination_hash</span><span class="o">=</span><span class="n">dest_hash</span><span class="p">,</span>
         <span class="n">app_name</span><span class="o">=</span><span class="n">_APP</span><span class="p">,</span>
         <span class="n">aspects</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_ASPECTS</span><span class="p">),</span>
-        <span class="n">private_key</span><span class="o">=</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span><span class="o">.</span><span class="n">hex</span><span class="p">(),</span>
+        <span class="n">private_key</span><span class="o">=</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">64</span><span class="p">),</span>
     <span class="p">)</span>
     <span class="k">assert</span> <span class="n">pending</span><span class="p">[</span><span class="s2">&quot;initiator&quot;</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">,</span> <span class="p">(</span>
         <span class="sa">f</span><span class="s2">&quot;the probed link must be an initiator link (identify only ever acts on &quot;</span>

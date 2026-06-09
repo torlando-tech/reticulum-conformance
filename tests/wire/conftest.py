@@ -80,6 +80,10 @@ class _WirePeer:
         # for each wire_listen registered on this peer (N-M3: lets recall
         # tests assert byte-identity against the listening identity).
         self.listen_identities: dict[bytes, dict] = {}
+        # Full bridge response from the most recent announce(); lets a caller
+        # that enabled ratchets read back the echoed ratchets_enabled /
+        # ratchet_count without a second round trip.
+        self.last_announce: dict | None = None
 
     def start_tcp_server(
         self,
@@ -400,15 +404,39 @@ class _WirePeer:
             return None
         return bytes.fromhex(resp["random_hash"])
 
-    def announce(self, app_name: str, aspects: list, app_data: bytes = b"") -> bytes:
+    def announce(
+        self,
+        app_name: str,
+        aspects: list,
+        app_data: bytes = b"",
+        enable_ratchets: bool = False,
+    ) -> bytes:
+        """Create and announce a fresh SINGLE IN destination; return its hash.
+
+        enable_ratchets (bool, default False): enable per-destination ratchets
+        (Destination.enable_ratchets) BEFORE announcing, so the announce carries
+        the latest ratchet public key and the destination grows a real ratchet
+        store. cmd_wire_announce honors this (wire_tcp.py) — it is the
+        "A enables ratchets + announces" precondition for the destination-level
+        ratchet observables (read_ratchets / destination_latest_ratchet_id /
+        rotate_ratchet / set_ratchet_interval / set_retained_ratchets /
+        ratchet_file_roundtrip).
+
+        The full bridge response is stashed on `self.last_announce`, so a caller
+        that enabled ratchets can assert the echoed `ratchets_enabled` /
+        `ratchet_count` without a second round trip.
+        """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_announce",
-            handle=self.handle,
-            app_name=app_name,
-            aspects=list(aspects),
-            app_data=app_data.hex(),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "app_name": app_name,
+            "aspects": list(aspects),
+            "app_data": app_data.hex(),
+        }
+        if enable_ratchets:
+            params["enable_ratchets"] = True
+        resp = self.bridge.execute("wire_announce", **params)
+        self.last_announce = resp
         return bytes.fromhex(resp["destination_hash"])
 
     def poll_path(self, destination_hash: bytes, timeout_ms: int = 5000) -> bool:
@@ -607,11 +635,12 @@ class _WirePeer:
 
         enable_ratchets (bool, default False): register the destination with
         ratchets enabled (Destination.enable_ratchets) so the destination-level
-        ratchet observables — destination_latest_ratchet_id, rotate_ratchet,
-        set_ratchet_interval, set_retained_ratchets, ratchet_file_roundtrip,
-        get_ratchet — operate on a ratchet-bearing destination
-        (CONFORMANCE_GAPS.md §4c). Depends on the [wire-cmds] wire_listen
-        handler honoring an `enable_ratchets` param; older bridges ignore it.
+        ratchet observables — read_ratchets, destination_latest_ratchet_id,
+        rotate_ratchet, set_ratchet_interval, set_retained_ratchets,
+        ratchet_file_roundtrip — operate on a ratchet-bearing destination
+        (CONFORMANCE_GAPS.md §4c). cmd_wire_listen honors this param
+        (wire_tcp.py), enabling ratchets on the IN destination before its
+        immediate announce, exactly as cmd_wire_announce does.
 
         resource_strategy ('all'|'none'|'app', default None -> bridge default
         of 'all'): how an inbound Link accepts incoming Resources
@@ -1374,70 +1403,20 @@ class _WirePeer:
 
     # --- Destination-level ratchets (real Destination.encrypt/decrypt) ----
 
-    def destination_latest_ratchet_id(self, destination_hash: bytes) -> bytes | None:
-        """Return a listening destination's latest_ratchet_id, or None.
+    def read_ratchets(self, destination_hash: bytes) -> dict:
+        """Read a ratchet-enabled destination's current ratchet state
+        (wire_read_ratchets — Destination ratchet snapshot).
 
-        Destination.encrypt/decrypt set latest_ratchet_id to the id of the
-        ratchet actually used (Destination.py:595-599/:621-643); it is None
-        until a ratcheted encrypt/decrypt has happened on the destination. The
-        destination must have been registered with ratchets enabled
-        (listen(enable_ratchets=True)) and must have processed a real encrypted
-        packet (e.g. an inbound link DATA / send_packet_with_proof_request).
+        Returns {ratchet_count, current_ratchet_id, previous_ratchet_id,
+        ratchet_interval, retained_ratchets, latest_ratchet_id,
+        latest_ratchet_time}; the three ratchet ids are decoded to bytes (or
+        None). current/previous id + count are the rotation-gating observables;
+        latest_ratchet_id is None until a real Destination.encrypt/decrypt has
+        happened on the destination.
         """
         assert self.handle, "start_* must be called first"
         resp = self.bridge.execute(
-            "wire_destination_latest_ratchet_id",
-            handle=self.handle,
-            destination_hash=destination_hash.hex(),
-        )
-        rid = resp.get("ratchet_id")
-        return bytes.fromhex(rid) if rid else None
-
-    def set_ratchet_interval(
-        self,
-        destination_hash: bytes,
-        seconds: int,
-        last_rotation_age_s: float | None = None,
-    ) -> dict:
-        """Set a ratchet-enabled destination's rotation interval, optionally
-        back-dating its last-rotation timestamp (Destination.py:227-241).
-
-        Destination.rotate_ratchets only generates a new ratchet once
-        now > latest_ratchet_time + ratchet_interval. To make INTERVAL gating
-        observable WITHOUT a real wait, pass last_rotation_age_s to age
-        latest_ratchet_time that many seconds into the past:
-          last_rotation_age_s > seconds -> the next rotate_ratchet is eligible,
-          last_rotation_age_s < seconds -> it is gated (the negative control).
-        Returns the read-back state dict (ratchet_interval, latest_ratchet_time,
-        and whatever else the [wire-cmds] handler surfaces).
-        """
-        assert self.handle, "start_* must be called first"
-        params: dict = {
-            "handle": self.handle,
-            "destination_hash": destination_hash.hex(),
-            "seconds": int(seconds),
-        }
-        if last_rotation_age_s is not None:
-            params["last_rotation_age_s"] = float(last_rotation_age_s)
-        return self.bridge.execute("wire_set_ratchet_interval", **params)
-
-    def rotate_ratchet(self, destination_hash: bytes) -> dict:
-        """Attempt a ratchet rotation (Destination.rotate_ratchets,
-        Destination.py:227-241) and report the resulting ratchet state.
-
-        Returns {rotated, ratchet_id, previous_ratchet_id, ratchet_count}:
-          rotated             -> True iff a NEW ratchet was generated (the
-            interval gate was open); False iff the interval gated it.
-          ratchet_id          -> current (newest) ratchet id (bytes) or None.
-          previous_ratchet_id -> the id that was newest before this call (bytes)
-            or None — lets a rotation test assert the current id changed.
-          ratchet_count       -> len(destination.ratchets) after the attempt
-            (read it to assert the retained-ratchets cap, see
-            set_retained_ratchets).
-        """
-        assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_rotate_ratchet",
+            "wire_read_ratchets",
             handle=self.handle,
             destination_hash=destination_hash.hex(),
         )
@@ -1446,38 +1425,150 @@ class _WirePeer:
             v = resp.get(key)
             return bytes.fromhex(v) if v else None
 
-        count = resp.get("ratchet_count")
         return {
-            "rotated": bool(resp.get("rotated", False)),
-            "ratchet_id": _id("ratchet_id"),
+            "ratchet_count": int(resp.get("ratchet_count", 0)),
+            "current_ratchet_id": _id("current_ratchet_id"),
             "previous_ratchet_id": _id("previous_ratchet_id"),
-            "ratchet_count": int(count) if count is not None else None,
+            "ratchet_interval": resp.get("ratchet_interval"),
+            "retained_ratchets": resp.get("retained_ratchets"),
+            "latest_ratchet_id": _id("latest_ratchet_id"),
+            "latest_ratchet_time": resp.get("latest_ratchet_time"),
         }
 
-    def set_retained_ratchets(self, destination_hash: bytes, count: int) -> dict:
-        """Set how many past ratchets a destination retains, and read the count
-        back (Destination.set_retained_ratchets / RATCHET_COUNT cap,
-        Destination.py:504-517).
+    def destination_latest_ratchet_id(self, destination_hash: bytes) -> dict:
+        """Drive a real Destination.encrypt+decrypt round trip on a ratchet-
+        enabled destination and report the latest_ratchet_id tracking
+        (Destination.py:595-643).
 
-        set_retained_ratchets(n) trims destination.ratchets to at most n entries
-        via _clean_ratchets. Returns {set, retained_ratchets, ratchet_count} so
-        a test can rotate more than n times and assert ratchet_count never
-        exceeds the cap.
+        Destination.encrypt auto-selects the current ratchet and records
+        latest_ratchet_id; decrypt re-derives it. It is None until a real
+        encrypt/decrypt happens. The destination must have been registered with
+        ratchets enabled (announce(enable_ratchets=True) /
+        listen(enable_ratchets=True)).
+
+        Returns {decrypted, plaintext, latest_ratchet_id, encrypt_ratchet_id,
+        current_ratchet_id, match, ratchet_count}; the three ratchet ids are
+        decoded to bytes (or None) and plaintext to bytes (or None).
         """
         assert self.handle, "start_* must be called first"
         resp = self.bridge.execute(
-            "wire_set_retained_ratchets",
+            "wire_destination_latest_ratchet_id",
             handle=self.handle,
             destination_hash=destination_hash.hex(),
-            count=int(count),
         )
-        retained = resp.get("retained_ratchets")
-        rc = resp.get("ratchet_count")
+
+        def _id(key):
+            v = resp.get(key)
+            return bytes.fromhex(v) if v else None
+
         return {
-            "set": bool(resp.get("set", resp.get("ok", True))),
-            "retained_ratchets": int(retained) if retained is not None else None,
-            "ratchet_count": int(rc) if rc is not None else None,
+            "decrypted": bool(resp.get("decrypted", False)),
+            "plaintext": _id("plaintext"),
+            "latest_ratchet_id": _id("latest_ratchet_id"),
+            "encrypt_ratchet_id": _id("encrypt_ratchet_id"),
+            "current_ratchet_id": _id("current_ratchet_id"),
+            "match": bool(resp.get("match", False)),
+            "ratchet_count": int(resp.get("ratchet_count", 0)),
         }
+
+    def set_ratchet_interval(self, destination_hash: bytes, seconds: int) -> dict:
+        """Set a ratchet-enabled destination's minimum rotation interval in
+        seconds (real RNS.Destination.set_ratchet_interval, Destination.py:
+        519-531).
+
+        Returns {ok, ratchet_interval}: `ok` is False for a non-positive /
+        non-int value (RNS rejects it and leaves the interval unchanged). To
+        make INTERVAL gating observable without a real wait, pass
+        rotate_ratchet(last_rotation_ago_s=...) to backdate the last-rotation
+        timestamp at rotation time.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_set_ratchet_interval",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            seconds=int(seconds),
+        )
+
+    def rotate_ratchet(
+        self, destination_hash: bytes, last_rotation_ago_s: float | None = None
+    ) -> dict:
+        """Attempt a ratchet rotation and observe the rotation-INTERVAL gate
+        (Destination.rotate_ratchets, Destination.py:227-241) without a real
+        wait.
+
+        last_rotation_ago_s (optional): deterministically backdate the
+        destination's latest_ratchet_time this many seconds into the past so the
+        interval gate is open (value > ratchet_interval -> a new ratchet) or
+        shut (value < ratchet_interval -> gated), no real sleep required.
+
+        Returns {rotated, before_count, after_count, before_current_id,
+        current_ratchet_id, previous_ratchet_id, ratchet_interval,
+        latest_ratchet_time}:
+          rotated             -> True iff a new ratchet was inserted
+            (after_count > before_count); False iff the interval gated it.
+          before_count/after_count -> len(destination.ratchets) around the
+            attempt (read to assert the retained-ratchets cap).
+          before_current_id   -> the newest ratchet id before this call (bytes)
+            or None.
+          current_ratchet_id  -> the newest ratchet id after this call (bytes)
+            or None — differs from before_current_id on a real rotation.
+          previous_ratchet_id -> the second-newest ratchet id after this call
+            (bytes) or None; equals before_current_id after a rotation.
+        The three ratchet ids are decoded to bytes (or None).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+        }
+        if last_rotation_ago_s is not None:
+            params["last_rotation_ago_s"] = float(last_rotation_ago_s)
+        resp = self.bridge.execute("wire_rotate_ratchet", **params)
+
+        def _id(key):
+            v = resp.get(key)
+            return bytes.fromhex(v) if v else None
+
+        return {
+            "rotated": bool(resp.get("rotated", False)),
+            "before_count": int(resp.get("before_count", 0)),
+            "after_count": int(resp.get("after_count", 0)),
+            "before_current_id": _id("before_current_id"),
+            "current_ratchet_id": _id("current_ratchet_id"),
+            "previous_ratchet_id": _id("previous_ratchet_id"),
+            "ratchet_interval": resp.get("ratchet_interval"),
+            "latest_ratchet_time": resp.get("latest_ratchet_time"),
+        }
+
+    def set_retained_ratchets(
+        self, destination_hash: bytes, n: int, pad_to: int | None = None
+    ) -> dict:
+        """Set how many past ratchets a destination retains and read the cap
+        back (real RNS.Destination.set_retained_ratchets / _clean_ratchets,
+        Destination.py:504-517/:205-208).
+
+        set_retained_ratchets(n) sets retained_ratchets and runs _clean_ratchets,
+        which truncates destination.ratchets to Destination.RATCHET_COUNT when
+        the list exceeds the cap.
+
+        pad_to (optional): first inflate the ratchet list with that many real
+        freshly-generated ratchets before applying the cap, so RATCHET_COUNT
+        truncation is observable cheaply.
+
+        Returns {ok, retained_ratchets, ratchet_count, ratchet_count_cap}; `ok`
+        is False for a non-positive / non-int n (RNS rejects it and leaves
+        retained_ratchets unchanged).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "n": int(n),
+        }
+        if pad_to is not None:
+            params["pad_to"] = int(pad_to)
+        return self.bridge.execute("wire_set_retained_ratchets", **params)
 
     def ratchet_file_roundtrip(self, destination_hash: bytes) -> dict:
         """Persist + reload a destination's ratchet store via RNS's own
@@ -1500,32 +1591,6 @@ class _WirePeer:
             destination_hash=destination_hash.hex(),
         )
 
-    def get_ratchet(
-        self, destination_hash: bytes, age_received_s: float | None = None
-    ) -> bytes | None:
-        """Read Identity.get_ratchet(destination_hash); optionally age the
-        stored ratchet past RATCHET_EXPIRY first (Identity.py:499-522).
-
-        Identity.get_ratchet returns None for a stored ratchet whose `received`
-        timestamp is older than Identity.RATCHET_EXPIRY. Pass age_received_s to
-        back-date the persisted ratchet's `received` field that many seconds
-        into the past (deterministic, no real sleep):
-          age_received_s > RATCHET_EXPIRY -> returns None (expired),
-          a small / None age              -> returns the ratchet bytes (the
-            positive control).
-        Returns the ratchet key bytes, or None when expired/absent.
-        """
-        assert self.handle, "start_* must be called first"
-        params: dict = {
-            "handle": self.handle,
-            "destination_hash": destination_hash.hex(),
-        }
-        if age_received_s is not None:
-            params["age_received_s"] = float(age_received_s)
-        resp = self.bridge.execute("wire_get_ratchet", **params)
-        r = resp.get("ratchet")
-        return bytes.fromhex(r) if r else None
-
     # --- PROOF emission for a single (non-link) packet --------------------
 
     def send_packet_with_proof_request(
@@ -1534,19 +1599,20 @@ class _WirePeer:
         data: bytes = b"",
         app_name: str = "conformance",
         aspects: list | None = None,
-        timeout_ms: int = 5000,
+        timeout_ms: int = 10000,
     ) -> dict:
-        """Send a single SINGLE-destination DATA packet that requests a PROOF
-        and capture the returning proof (Destination.py:359-368,
-        Identity.py:959-970).
+        """Send a single SINGLE-destination DATA packet (tracked PacketReceipt)
+        and capture the PROOF the receiver returns per its proof strategy
+        (Destination.py:359-368, Identity.py:959-970).
 
-        Per its proof strategy the receiver returns a PROOF; this captures it
-        and reports whether it validates against the receiver's public key and
-        whether it is the implicit or explicit form
-        (Destination.should_use_implicit_proof, Destination.py:359-368). Returns
-        {sent, proof (bytes|None), validates (bool), implicit (bool), delivered
-        (bool), receipt_id}. The destination identity must already be known via
-        a received announce.
+        Returns the read-back straight off the real PacketReceipt/proof:
+        {sent, receipt_id, hops, delivered, proved, implicit_proof_config,
+        proof_data, proof_len, proof_is_implicit, proof_is_explicit,
+        impl_length, expl_length}. `proof_data` is decoded to bytes (or None
+        when no proof returned); proof_is_implicit/proof_is_explicit reflect
+        whether the captured proof matches RNS's IMPL_LENGTH/EXPL_LENGTH, and
+        implicit_proof_config is RNS.Reticulum.should_use_implicit_proof(). The
+        destination identity must already be known via a received announce.
         """
         assert self.handle, "start_* must be called first"
         resp = self.bridge.execute(
@@ -1558,14 +1624,20 @@ class _WirePeer:
             aspects=list(aspects if aspects is not None else ("wire",)),
             timeout_ms=int(timeout_ms),
         )
-        proof_hex = resp.get("proof")
+        proof_hex = resp.get("proof_data")
         return {
             "sent": bool(resp.get("sent", False)),
-            "proof": bytes.fromhex(proof_hex) if proof_hex else None,
-            "validates": bool(resp.get("validates", False)),
-            "implicit": bool(resp.get("implicit", False)),
-            "delivered": bool(resp.get("delivered", False)),
             "receipt_id": resp.get("receipt_id"),
+            "hops": resp.get("hops"),
+            "delivered": bool(resp.get("delivered", False)),
+            "proved": bool(resp.get("proved", False)),
+            "implicit_proof_config": resp.get("implicit_proof_config"),
+            "proof_data": bytes.fromhex(proof_hex) if proof_hex else None,
+            "proof_len": resp.get("proof_len"),
+            "proof_is_implicit": resp.get("proof_is_implicit"),
+            "proof_is_explicit": resp.get("proof_is_explicit"),
+            "impl_length": resp.get("impl_length"),
+            "expl_length": resp.get("expl_length"),
         }
 
     # --- PLAIN destination no-op encrypt / decrypt ------------------------
@@ -1616,33 +1688,53 @@ class _WirePeer:
 
     # --- Known-public-key mismatch rejection ------------------------------
 
-    def validate_with_known_key(
+    def known_key_validate(
         self,
-        known_public_key: bytes | None = None,
-        announce_public_key: bytes | None = None,
+        app_name: str,
+        aspects: list | None = None,
+        plant: str = "mismatch",
+        app_data: bytes | None = None,
     ) -> dict:
-        """Validate an announce whose public key differs from the one already
-        known for its destination hash, and report the verdict
-        (Identity.validate_announce known-key guard, Identity.py:583-589).
+        """Validate a genuinely-signed announce against a planted known public
+        key for the same destination hash (Identity.validate_announce known-key
+        guard, Identity.py:583-589).
 
         validate_announce rejects an otherwise-valid announce when the
         destination hash is already bound to a DIFFERENT public key (the
-        anti-path-hijack / hash-collision guard). The [wire-cmds] handler
-        remembers a known public key for a destination hash, then validates an
-        announce carrying a different public key for the SAME hash. With both
-        args omitted the handler self-generates the two identities plus a
-        same-key positive control. Returns {matching_accepted, mismatched_accepted}:
-        a conforming impl yields matching_accepted=True (same-key re-announce
-        accepted) and mismatched_accepted=False (different key for a known hash
-        rejected).
+        anti-path-hijack / hash-collision guard). The handler builds a real
+        SINGLE destination + signed announce, then seeds
+        Identity.known_destinations[dest_hash] per `plant` before validating:
+          plant='mismatch' -> a DIFFERENT valid key is stored (announce REJECTED),
+          plant='match'    -> the announce's own key is stored (accepted),
+          plant='none'     -> no prior entry (accepted).
+        The same announce flips accept/reject solely on the stored key.
+
+        Returns {validated, destination_hash, public_key, planted_public_key,
+        plant}; the destination hash and the two public keys are decoded to
+        bytes (planted_public_key is None for plant='none').
         """
         assert self.handle, "start_* must be called first"
-        params: dict = {"handle": self.handle}
-        if known_public_key is not None:
-            params["known_public_key"] = known_public_key.hex()
-        if announce_public_key is not None:
-            params["announce_public_key"] = announce_public_key.hex()
-        return self.bridge.execute("wire_validate_with_known_key", **params)
+        params: dict = {
+            "handle": self.handle,
+            "app_name": app_name,
+            "aspects": list(aspects if aspects is not None else ()),
+            "plant": plant,
+        }
+        if app_data is not None:
+            params["app_data"] = app_data.hex()
+        resp = self.bridge.execute("wire_known_key_validate", **params)
+
+        def _b(key):
+            v = resp.get(key)
+            return bytes.fromhex(v) if v else None
+
+        return {
+            "validated": bool(resp.get("validated", False)),
+            "destination_hash": _b("destination_hash"),
+            "public_key": _b("public_key"),
+            "planted_public_key": _b("planted_public_key"),
+            "plant": resp.get("plant"),
+        }
 
     # --- Link teardown forgery / identify-before-ACTIVE (deferred edges) --
 
@@ -1668,22 +1760,34 @@ class _WirePeer:
             forged_id=forged_id.hex(),
         )
 
-    def link_identify_pending(self, link_id: bytes, private_key: bytes) -> dict:
-        """Call Link.identify on a PENDING (pre-ACTIVE) link; assert it no-ops
-        without crashing (Link.identify guard, Link.py:459-475/:468).
+    def link_identify_pending(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        private_key: bytes,
+    ) -> dict:
+        """Build a fresh PENDING (pre-ACTIVE) initiator link to the recalled
+        destination and call Link.identify on it, asserting it no-ops without
+        crashing (Link.identify ACTIVE-only guard, Link.py:459-475/:468).
 
         Link.identify only acts when initiator and status == ACTIVE; on a
         PENDING link it must be a silent no-op — no LINKIDENTIFY packet emitted,
-        no exception. Returns {identified, status, status_name, sent}: a
-        conforming impl reports identified=False / sent=False with the link
-        still PENDING and no error. Contrast with link_identify on an ACTIVE
-        link, which DOES emit the identification.
+        no exception. The handler recalls the destination identity, builds an
+        initiator Link forced to PENDING, and calls identify with an Identity
+        from `private_key`. Returns {crashed, identify_packet_sent, status,
+        status_name, initiator} read off the real Link: a conforming impl
+        reports crashed=False, identify_packet_sent=False, status PENDING,
+        initiator True. The destination identity must already be known via a
+        received announce.
         """
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_link_identify_pending",
             handle=self.handle,
-            link_id=link_id.hex(),
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
             private_key=private_key.hex(),
         )
 
@@ -1965,8 +2069,8 @@ def wire_ratcheted_link(wire_link_setup):
 
     Yields setup(**opts) -> (server, client, dest_hash, link_id) — identical to
     wire_link_setup but with enable_ratchets defaulted True on the listening
-    destination, so destination_latest_ratchet_id / rotate_ratchet /
-    set_ratchet_interval / set_retained_ratchets / get_ratchet /
+    destination, so read_ratchets / destination_latest_ratchet_id /
+    rotate_ratchet / set_ratchet_interval / set_retained_ratchets /
     ratchet_file_roundtrip all operate on the (ratchet-bearing) `dest_hash`.
 
     Note: latest_ratchet_id is None until the server destination performs a

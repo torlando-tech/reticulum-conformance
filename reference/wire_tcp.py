@@ -1007,6 +1007,16 @@ def cmd_wire_listen(params):
         reassembles a StreamDataMessage stream and detects the MAX_CHUNK_LEN
         decompression-bomb abort — read via wire_buffer_received.
 
+    enable_ratchets (bool, default False): enable per-destination ratchets
+    (Destination.enable_ratchets, Destination.py:466-489) on the IN SINGLE
+    destination BEFORE its immediate announce, exactly as cmd_wire_announce
+    does — so the listening destination carries the latest ratchet public key
+    and grows a real ratchet store. This lets the destination-level ratchet
+    observables (wire_read_ratchets / wire_destination_latest_ratchet_id /
+    wire_rotate_ratchet / wire_set_ratchet_interval / wire_set_retained_ratchets
+    / wire_ratchet_file_roundtrip) operate on a destination that also accepts
+    Links. Default False leaves the destination non-ratcheted (unchanged).
+
     Tests poll via wire_link_poll (single-packet data), wire_resource_poll
     (completed resource payloads), wire_resource_receiver_status (inbound
     Resource state), wire_channel_received, or wire_buffer_received.
@@ -1020,6 +1030,7 @@ def cmd_wire_listen(params):
         raise ValueError(
             f"resource_strategy must be 'all', 'none' or 'app' (got {resource_strategy!r})"
         )
+    enable_ratchets = bool(params.get("enable_ratchets", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -1034,6 +1045,17 @@ def cmd_wire_listen(params):
         app_name,
         *aspects,
     )
+
+    # Enable ratchets BEFORE the immediate announce below, mirroring
+    # cmd_wire_announce (so the announce carries the latest ratchet public key
+    # and the destination owns a real ratchet store).
+    ratchets_enabled = False
+    if enable_ratchets:
+        ratchets_path = os.path.join(
+            inst.get("config_dir") or tempfile.gettempdir(),
+            f"ratchets_{destination.hash.hex()}_{secrets.token_hex(4)}",
+        )
+        ratchets_enabled = bool(destination.enable_ratchets(ratchets_path))
 
     # Per-destination receive buffers.
     recv_buffer = []         # single-packet link data
@@ -1196,7 +1218,7 @@ def cmd_wire_listen(params):
     # Keep strong reference so it isn't garbage collected.
     inst["destinations"].append((identity, destination))
 
-    return {
+    response = {
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
         # public_key surfaces the listening identity's raw key so recall
@@ -1206,6 +1228,13 @@ def cmd_wire_listen(params):
         "public_key": identity.get_public_key().hex(),
         "resource_strategy": resource_strategy,
     }
+    if enable_ratchets:
+        response["ratchets_enabled"] = ratchets_enabled
+        response["current_ratchet_id"] = _current_ratchet_id(destination)
+        response["ratchet_count"] = (
+            len(destination.ratchets) if destination.ratchets is not None else 0
+        )
+    return response
 
 
 def _make_detecting_stream_message_class(buffer_state):

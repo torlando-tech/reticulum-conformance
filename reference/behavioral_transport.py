@@ -9,11 +9,27 @@ No internal state introspection. If a property matters for correctness, it's
 visible in what the Transport emits — otherwise it's an implementation detail.
 
 Commands added:
-  behavioral_start(identity_seed, enable_transport=True) -> {handle, identity_hash}
+  behavioral_start(identity_seed, enable_transport=True,
+                   announce_rate_target=None, announce_rate_grace=0,
+                   announce_rate_penalty=0, announce_cap=None, bitrate=None)
+      -> {handle, identity_hash}
+      (the announce_* / bitrate args become per-instance defaults applied to
+       every interface attached afterward; see N-M9 throttle coverage.)
   behavioral_stop(handle) -> {}
-  behavioral_attach_mock_interface(handle, name, mode='FULL', mtu=500) -> {iface_id}
+  behavioral_attach_mock_interface(handle, name, mode='FULL', mtu=500,
+                                   announce_rate_target=..., announce_rate_grace=...,
+                                   announce_rate_penalty=..., announce_cap=..., bitrate=...)
+      -> {iface_id, interface_hash}
+      (each throttle knob overrides the instance default for this interface.)
   behavioral_inject(handle, iface_id, raw_hex) -> {}
   behavioral_drain_tx(handle, iface_id) -> {packets: [raw_hex, ...]}
+  behavioral_read_path_table(handle, dest) -> {found, hops, next_hop, timestamp,
+       expires, random_blobs[], receiving_interface, receiving_interface_hash,
+       packet_hash}  (decomposed RNS.Transport.path_table[dest] entry; H5/N-H1)
+  behavioral_packet_filter(handle, raw, remember=True)
+      -> {accepted, packet_hash, remembered}
+      (runs the real Transport.packet_filter gate + add_packet_hash remember
+       step; identical packet twice -> True then False = hashlist replay drop)
 """
 
 import os
@@ -43,6 +59,35 @@ def _get_rns():
     return _get_full_rns()
 
 
+# Path-table entry indices. RNS exposes `RNS.Transport` as the Transport CLASS,
+# so the module-level IDX_PT_* globals (RNS/Transport.py:3545-3551) are NOT
+# reachable as class attributes. Resolve them from the real module, with a
+# fallback pinned to RNS 1.3.1 in case the module object is ever shadowed.
+_IDX_PT_FALLBACK = {
+    "IDX_PT_TIMESTAMP": 0,
+    "IDX_PT_NEXT_HOP": 1,
+    "IDX_PT_HOPS": 2,
+    "IDX_PT_EXPIRES": 3,
+    "IDX_PT_RANDBLOBS": 4,
+    "IDX_PT_RVCD_IF": 5,
+    "IDX_PT_PACKET": 6,
+}
+
+
+def _pt_indices():
+    """Return the path_table tuple indices used by the installed RNS."""
+    RNS = _get_rns()
+    import importlib
+    try:
+        mod = importlib.import_module(RNS.Transport.__module__)
+    except Exception:
+        mod = None
+    out = {}
+    for name, default in _IDX_PT_FALLBACK.items():
+        out[name] = getattr(mod, name, default) if mod is not None else default
+    return out
+
+
 def _make_mock_interface_class():
     """Build the MockInterface class lazily so it can subclass RNS.Interfaces.Interface.Interface.
 
@@ -57,7 +102,9 @@ def _make_mock_interface_class():
         """Zero-wire Interface. Transmitted bytes land in a thread-safe queue
         drainable by tests; injected bytes drive Transport.inbound directly."""
 
-        def __init__(self, name, mode_name="FULL", mtu=500):
+        def __init__(self, name, mode_name="FULL", mtu=500,
+                     announce_rate_target=None, announce_rate_grace=0,
+                     announce_rate_penalty=0, announce_cap=None, bitrate=None):
             super().__init__()
             self.IN = True
             self.OUT = True
@@ -65,7 +112,9 @@ def _make_mock_interface_class():
             self.RPT = False
             self.name = name
             self.online = True
-            self.bitrate = 10_000_000
+            # 10 Mbit/s default keeps announce egress-spacing math negligible
+            # unless a test deliberately lowers bitrate / announce_cap.
+            self.bitrate = 10_000_000 if bitrate is None else int(bitrate)
 
             mode_map = {
                 "FULL": BaseInterface.MODE_FULL,
@@ -86,10 +135,25 @@ def _make_mock_interface_class():
             self._tx_queue = deque()
             self._tx_lock = threading.Lock()
 
-            # Frequency-tracking attributes the base class expects
-            self.announce_rate_target = None
-            self.announce_rate_grace = 0
-            self.announce_rate_penalty = 0
+            # Inbound announce-rate limiting (RNS Transport.py:1836-1858). The
+            # base Interface does NOT define these, and Transport reads
+            # receiving_interface.announce_rate_target on every accepted
+            # announce, so they MUST exist. Default None = rate limiting OFF
+            # (preserves prior behavior); a test can enable per-destination
+            # inbound throttling by passing a target (seconds), grace (count),
+            # and penalty (seconds).
+            self.announce_rate_target = announce_rate_target
+            self.announce_rate_grace = int(announce_rate_grace or 0)
+            self.announce_rate_penalty = int(announce_rate_penalty or 0)
+
+            # Outbound announce bandwidth cap (RNS Transport.py:1250-1258,
+            # Interface.process_announce_queue). announce_cap is a FRACTION of
+            # link bandwidth (RNS configures real interfaces with
+            # Reticulum.ANNOUNCE_CAP/100.0 = 0.02). Only set it when a test
+            # supplies a value; otherwise RNS lazily defaults it, matching the
+            # un-configured path. Smaller cap -> longer egress spacing.
+            if announce_cap is not None:
+                self.announce_cap = float(announce_cap)
 
         def process_outgoing(self, data):
             """Called by Transport.transmit when emitting bytes on this interface.
@@ -211,6 +275,19 @@ def cmd_behavioral_start(params):
     identity_seed_hex = params.get("identity_seed")
     enable_transport = bool(params.get("enable_transport", True))
 
+    # Instance-level announce-throttle defaults. These flow down to every
+    # interface attached after start unless that attach overrides them. They
+    # are exposed here (rather than only on attach) so a test can configure
+    # the throttle posture for the whole instance up front; see N-M9
+    # (announce_rate inbound suppression / announce_cap egress spacing).
+    iface_defaults = {
+        "announce_rate_target": params.get("announce_rate_target"),
+        "announce_rate_grace": params.get("announce_rate_grace", 0),
+        "announce_rate_penalty": params.get("announce_rate_penalty", 0),
+        "announce_cap": params.get("announce_cap"),
+        "bitrate": params.get("bitrate"),
+    }
+
     # Only allocate a config dir on the first call; subsequent calls reuse
     # the singleton and would leave the new dir orphaned.
     config_dir = (
@@ -240,6 +317,7 @@ def cmd_behavioral_start(params):
             "identity_hash": identity.hash,
             "interfaces": {},
             "mock_interface_class": _make_mock_interface_class(),
+            "iface_defaults": iface_defaults,
         }
 
     return {"handle": handle, "identity_hash": identity.hash.hex()}
@@ -278,8 +356,22 @@ def cmd_behavioral_attach_mock_interface(params):
     if inst is None:
         raise ValueError(f"Unknown handle: {handle}")
 
+    # Per-interface announce-throttle knobs. Each falls back to the instance
+    # default captured at behavioral_start, which in turn defaults to "off".
+    defaults = inst.get("iface_defaults", {})
+
+    def _knob(key):
+        return params[key] if key in params else defaults.get(key)
+
     MockInterface = inst["mock_interface_class"]
-    iface = MockInterface(name=name, mode_name=mode, mtu=mtu)
+    iface = MockInterface(
+        name=name, mode_name=mode, mtu=mtu,
+        announce_rate_target=_knob("announce_rate_target"),
+        announce_rate_grace=_knob("announce_rate_grace") or 0,
+        announce_rate_penalty=_knob("announce_rate_penalty") or 0,
+        announce_cap=_knob("announce_cap"),
+        bitrate=_knob("bitrate"),
+    )
     iface_id = secrets.token_hex(6)
 
     inst["interfaces"][iface_id] = iface
@@ -325,10 +417,124 @@ def cmd_behavioral_drain_tx(params):
     return {"packets": [p.hex() for p in packets]}
 
 
+def cmd_behavioral_read_path_table(params):
+    """Read this Transport's PATH TABLE entry for a destination.
+
+    Surfaces RNS.Transport.path_table[dest] decomposed into its fields so a
+    test can assert the *cached path* an impl actually holds — not merely what
+    it re-emits. The path table is otherwise wire-observable only via a
+    path-request answer (Transport.py:2954); exposing it directly lets the
+    path-replacement test (H5 / N-H1) verify the surviving entry's hop count
+    rather than the announce_table retransmit hops (which can diverge from the
+    path table in a buggy impl).
+
+    Each SUT bridge implements this against its OWN path table, so the check
+    stays cross-implementation. Delegates entirely to the real RNS table;
+    field indices come from RNS/Transport.py (IDX_PT_*).
+
+    params: handle, dest (destination hash hex)
+    returns: {found, hops, next_hop, timestamp, expires, random_blobs[],
+              receiving_interface, receiving_interface_hash, packet_hash}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    idx = _pt_indices()
+    table = RNS.Transport.path_table
+    if dest not in table:
+        return {"found": False}
+
+    entry = table[dest]
+    rvcd_if = entry[idx["IDX_PT_RVCD_IF"]]
+    try:
+        rvcd_if_hash = rvcd_if.get_hash().hex()
+    except Exception:
+        rvcd_if_hash = None
+    next_hop = entry[idx["IDX_PT_NEXT_HOP"]]
+    packet_hash = entry[idx["IDX_PT_PACKET"]]
+    random_blobs = entry[idx["IDX_PT_RANDBLOBS"]]
+
+    return {
+        "found": True,
+        "hops": int(entry[idx["IDX_PT_HOPS"]]),
+        "next_hop": next_hop.hex() if isinstance(next_hop, (bytes, bytearray)) else None,
+        "timestamp": float(entry[idx["IDX_PT_TIMESTAMP"]]),
+        "expires": float(entry[idx["IDX_PT_EXPIRES"]]),
+        "random_blobs": [
+            b.hex() for b in random_blobs if isinstance(b, (bytes, bytearray))
+        ],
+        "receiving_interface": str(rvcd_if),
+        "receiving_interface_hash": rvcd_if_hash,
+        "packet_hash": packet_hash.hex() if isinstance(packet_hash, (bytes, bytearray)) else None,
+    }
+
+
+def cmd_behavioral_packet_filter(params):
+    """Run a raw packet through RNS's duplicate/replay filter and report the
+    verdict, mirroring exactly what Transport.inbound does at its gate.
+
+    Transport.inbound (Transport.py:1484-1504) accepts a packet only if
+    Transport.packet_filter(packet) returns True, then — for packets it should
+    remember — records the hash via add_packet_hash so a subsequent identical
+    packet is dropped (Transport.py:1374). This command reproduces that gate so
+    a test can inject an identical packet twice and observe True-then-False
+    (the hashlist replay/loop drop, the branch's namesake). It does NOT clear
+    packet_hashlist — that is the whole point.
+
+    Both calls delegate to the real RNS staticmethods (packet_filter,
+    add_packet_hash); no filtering logic is reimplemented here. A correct impl
+    returns True for a novel packet and False on replay; an impl with no
+    duplicate detection returns True twice and fails the test.
+
+    Note: per RNS, SINGLE-destination ANNOUNCE packets are deliberately NOT
+    deduplicated by the hashlist (they have their own random_blob replay
+    protection), so replay tests must use a non-announce DATA packet to a
+    SINGLE destination.
+
+    params: handle, raw (hex), remember (default True)
+    returns: {accepted, packet_hash, remembered}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    raw = bytes.fromhex(params["raw"])
+    remember = bool(params.get("remember", True))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    packet = RNS.Packet(None, raw)
+    if not packet.unpack():
+        raise ValueError("packet failed to unpack")
+
+    accepted = bool(RNS.Transport.packet_filter(packet))
+    remembered = False
+    if accepted and remember:
+        # Mirror inbound's remember step (Transport.py:1503-1504) so a
+        # subsequent identical packet is filtered as a duplicate.
+        RNS.Transport.add_packet_hash(packet.packet_hash)
+        remembered = True
+
+    return {
+        "accepted": accepted,
+        "packet_hash": packet.packet_hash.hex(),
+        "remembered": remembered,
+    }
+
+
 BEHAVIORAL_COMMANDS = {
     "behavioral_start": cmd_behavioral_start,
     "behavioral_stop": cmd_behavioral_stop,
     "behavioral_attach_mock_interface": cmd_behavioral_attach_mock_interface,
     "behavioral_inject": cmd_behavioral_inject,
     "behavioral_drain_tx": cmd_behavioral_drain_tx,
+    "behavioral_read_path_table": cmd_behavioral_read_path_table,
+    "behavioral_packet_filter": cmd_behavioral_packet_filter,
 }

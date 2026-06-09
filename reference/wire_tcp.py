@@ -41,6 +41,60 @@ Commands:
   wire_read_path_random_hash(handle, destination_hash)
     -> {found: bool, random_hash: hex}
     Extract the 10-byte random_hash segment of the cached announce.
+
+  --- Resource (segmentation / HMU / compression coverage) ---
+  wire_resource_create(handle, link_id, data, force_sdu=None,
+                       include_parts=True, auto_compress=True)
+    -> {hash, truncated_hash, random_hash, expected_proof, hashmap, num_parts,
+        total_segments, segment_index, encrypted, compressed, split, size,
+        total_size, sdu, parts?}
+    Builds a real RNS.Resource (advertise=False) and reads its attributes.
+    force_sdu forces >74 parts (HMU threshold); a >1 MiB payload yields
+    total_segments>1; a compressible payload yields compressed=True.
+
+  --- Link lifecycle (status / STALE / teardown / keepalive) ---
+  wire_link_status(handle, link_id)
+    -> {status, status_name, teardown_reason, teardown_reason_name,
+        no_inbound_for_ms, last_keepalive_ago_ms, keepalive_s, stale_time_s, rtt}
+  wire_link_set_watchdog(handle, link_id, keepalive_s=None, stale_time_s=None)
+    -> {keepalive_s, stale_time_s}   (compress timings; keepalive_s>=stale_time_s
+       forces a deterministic ACTIVE->STALE->CLOSED/TIMEOUT teardown)
+  wire_link_await_status(handle, link_id, target_status, timeout_ms=15000)
+    -> link_status fields + {reached: bool}   (>= ordering; STALE also matches CLOSED)
+  wire_link_teardown(handle, link_id) -> {torn_down: bool}   (graceful initiator close)
+  wire_listener_link_status(handle, destination_hash, timeout_ms=0)
+    -> link_status fields + {found, link_count}   (receiver-side inbound link)
+  wire_set_proof_strategy(handle, destination_hash, strategy)
+    -> {strategy, proof_strategy}   (strategy in {"all","app","none"})
+
+  --- Channel (out-of-order / duplicate / window) ---
+  wire_channel_inject(handle, link_id, envelopes=[{sequence:int, data:hex}])
+    -> {injected: [int]}   (feeds crafted envelopes into Channel._receive)
+  wire_channel_received(handle, link_id) -> {messages: [hex]}   (delivery order)
+  wire_channel_window(handle, link_id)
+    -> {window, window_min, window_max, window_flexibility,
+        next_rx_sequence, next_sequence, rx_ring, tx_ring}
+
+  --- GROUP destination symmetric crypto ---
+  wire_group_create(handle, app_name, aspects=[], key=None)
+    -> {destination_hash, key}
+  wire_group_encrypt(handle, destination_hash, plaintext) -> {ciphertext}
+  wire_group_decrypt(handle, destination_hash, ciphertext)
+    -> {plaintext: hex|None, decrypted: bool}
+
+  --- Identity ratchet crypto (enforce_ratchets rejection) ---
+  wire_identity_keypair() -> {private_key, public_key, hash}
+  wire_ratchet_keypair() -> {private_key, public_key}   (X25519)
+  wire_identity_encrypt(public_key, plaintext, ratchet_pub=None) -> {ciphertext}
+  wire_identity_decrypt(private_key, ciphertext, ratchets=[], enforce_ratchets=False)
+    -> {plaintext: hex|None, decrypted: bool}
+
+  --- IFAC (issue-29 golden vector via genuine RNS) ---
+  wire_ifac_compute(handle, packet_data, ifac_size=None)
+    -> {ifac_key, ifac_size, signature, ifac}
+    Reads the live interface's RNS-derived ifac_identity/ifac_key and signs
+    packet_data (Transport.transmit's exact computation).
+
   wire_stop(handle) -> {stopped: bool}
 
 Each bridge process hosts at most one wire RNS singleton. Attempting a second
@@ -691,9 +745,16 @@ def cmd_wire_listen(params):
     # Per-destination receive buffers.
     recv_buffer = []         # single-packet link data
     resource_buffer = []     # completed resources (bytes)
+    inbound_links = []        # RNS.Link objects accepted on this destination
     recv_lock = threading.Lock()
 
     def on_link_established(link):
+        # Keep a reference to the inbound (receiver-side) Link so lifecycle
+        # tests can observe its status / teardown_reason after the initiator
+        # tears it down (DESTINATION/INITIATOR_CLOSED is only observable on
+        # the *peer* of whoever called teardown). See wire_listener_link_status.
+        with recv_lock:
+            inbound_links.append(link)
         def on_packet(message, packet):
             with recv_lock:
                 recv_buffer.append(bytes(message))
@@ -726,6 +787,7 @@ def cmd_wire_listen(params):
         "identity": identity,
         "recv_buffer": recv_buffer,
         "resource_buffer": resource_buffer,
+        "inbound_links": inbound_links,
         "recv_lock": recv_lock,
     }
     # Keep strong reference so it isn't garbage collected.
@@ -734,6 +796,11 @@ def cmd_wire_listen(params):
     return {
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
+        # public_key surfaces the listening identity's raw key so recall
+        # tests can assert byte-identity (recalled.public_key == this), not
+        # just length (N-M3). The hash above is a truncated SHA-256 of this
+        # key, so asserting both pins the full key material end-to-end.
+        "public_key": identity.get_public_key().hex(),
     }
 
 
@@ -934,11 +1001,36 @@ def cmd_wire_resource_create(params):
     `data` return a different `hash` and different `parts`. The invariant
     tests in tests/wire/test_resource_invariants.py assert exactly that —
     on both the reference and the SUT.
+
+    Optional params for the segmentation / HMU / compression coverage cases
+    (CONFORMANCE_REAUDIT.md §5 "Resource"):
+      force_sdu (int): temporarily override the link's transfer SDU so a
+        modest payload produces >74 parts, the threshold above which RNS
+        sends the hashmap across multiple advertisements (HMU,
+        ResourceAdvertisement.HASHMAP_MAX_LEN=74). The override is applied
+        only for the duration of this construction and then restored, so the
+        live link is left untouched. Lets a test assert num_parts>74 without
+        moving a megabyte of data.
+      include_parts (bool, default True): when False, omit the per-part
+        `parts` list from the response. Set False for >1 MiB multi-segment
+        payloads, where the first segment alone is thousands of parts and
+        hex-encoding them all would bloat the JSON pipe.
+      auto_compress (bool, default True): pass-through to RNS.Resource; the
+        compressible-payload case relies on the default to observe
+        compressed=True.
+
+    A payload exceeding RNS.Resource.MAX_EFFICIENT_SIZE (1 MiB - 1) makes RNS
+    split the transfer into total_segments>1; this command reports the first
+    segment's attributes plus total_segments/segment_index, which is the
+    observable a multi-segment test pins.
     """
     RNS = _get_rns()
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
     payload = bytes.fromhex(params.get("data", ""))
+    force_sdu = params.get("force_sdu")
+    include_parts = bool(params.get("include_parts", True))
+    auto_compress = bool(params.get("auto_compress", True))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -949,11 +1041,32 @@ def cmd_wire_resource_create(params):
     if link is None:
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
 
-    # Real RNS.Resource, real established link, full __init__ — just no
-    # advertise/send. Every field below is read straight off the object.
-    resource = RNS.Resource(payload, link, advertise=False)
+    # Forced-small-MDU path: RNS.Resource derives its per-part SDU from the
+    # link as `link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE` (Resource.py
+    # __init__). Temporarily shrinking link.mtu to force_sdu + that overhead
+    # makes the resource chunk at force_sdu bytes/part, so e.g. a 4 KiB
+    # payload at force_sdu=50 exceeds the 74-part HMU threshold. mtu must
+    # stay a valid int (RNS.Packet construction reads it), so we shrink it
+    # rather than null it, and restore it after — the live link's negotiated
+    # MTU is untouched once this returns.
+    saved_mtu = None
+    restore_link = False
+    if force_sdu is not None:
+        force_sdu = int(force_sdu)
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        restore_link = True
+        link.mtu = force_sdu + overhead
 
-    return {
+    try:
+        # Real RNS.Resource, real established link, full __init__ — just no
+        # advertise/send. Every field below is read straight off the object.
+        resource = RNS.Resource(payload, link, advertise=False, auto_compress=auto_compress)
+    finally:
+        if restore_link:
+            link.mtu = saved_mtu
+
+    out = {
         "hash": resource.hash.hex(),
         "truncated_hash": resource.truncated_hash.hex(),
         "random_hash": resource.random_hash.hex(),
@@ -963,13 +1076,22 @@ def cmd_wire_resource_create(params):
         "encrypted": bool(resource.encrypted),
         "compressed": bool(resource.compressed),
         "split": bool(resource.split),
+        # total_segments>1 is the observable that a >1 MiB payload triggered
+        # multi-segment transfer (Resource.py: total_segments derived from
+        # total_size // MAX_EFFICIENT_SIZE). segment_index is which segment
+        # this object represents (1-based).
+        "total_segments": int(resource.total_segments),
+        "segment_index": int(resource.segment_index),
         "size": resource.size,
         "total_size": resource.total_size,
+        "sdu": int(resource.sdu),
+    }
+    if include_parts:
         # Packed wire bytes of each part — for the "two resources from
         # byte-identical input produce different encrypted output"
         # invariant (the data-stream random prefix + per-token IV).
-        "parts": [p.raw.hex() for p in resource.parts],
-    }
+        out["parts"] = [p.raw.hex() for p in resource.parts]
+    return out
 
 
 def cmd_wire_resource_poll(params):
@@ -1563,6 +1685,604 @@ def cmd_wire_stop(params):
     return {"stopped": True}
 
 
+# ---------------------------------------------------------------------------
+# Link lifecycle observation (status / STALE / teardown / keepalive)
+#
+# All values are read straight off the real RNS.Link instance — RNS's own
+# watchdog (Link.__watchdog_job) drives the ACTIVE→STALE→CLOSED transitions
+# and sets teardown_reason; these commands only observe.
+# ---------------------------------------------------------------------------
+
+_LINK_STATUS_NAMES = {0: "PENDING", 1: "HANDSHAKE", 2: "ACTIVE", 3: "STALE", 4: "CLOSED"}
+# Link.TIMEOUT=1, Link.INITIATOR_CLOSED=2, Link.DESTINATION_CLOSED=3
+_LINK_TEARDOWN_NAMES = {1: "TIMEOUT", 2: "INITIATOR_CLOSED", 3: "DESTINATION_CLOSED"}
+
+
+def _link_status_dict(link):
+    """Snapshot the observable lifecycle fields of an RNS.Link.
+
+    keepalive observation: when a link is healthy, RNS's watchdog sends a
+    keepalive every `keepalive_s` and the peer's response refreshes
+    last_inbound, so `no_inbound_for_ms` stays small. A link that has lost
+    its peer shows no_inbound_for_ms climbing past keepalive_s, then transits
+    to STALE/CLOSED with teardown_reason=TIMEOUT.
+    """
+    status = getattr(link, "status", None)
+    reason = getattr(link, "teardown_reason", None)
+    last_inbound = getattr(link, "last_inbound", 0) or 0
+    last_keepalive = getattr(link, "last_keepalive", 0) or 0
+    now = time.time()
+    return {
+        "status": int(status) if status is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status),
+        "teardown_reason": int(reason) if reason is not None else None,
+        "teardown_reason_name": _LINK_TEARDOWN_NAMES.get(reason),
+        "no_inbound_for_ms": int(max(0.0, now - last_inbound) * 1000) if last_inbound else None,
+        "last_keepalive_ago_ms": int(max(0.0, now - last_keepalive) * 1000) if last_keepalive else None,
+        "keepalive_s": getattr(link, "keepalive", None),
+        "stale_time_s": getattr(link, "stale_time", None),
+        "rtt": getattr(link, "rtt", None),
+    }
+
+
+def cmd_wire_link_status(params):
+    """Return the lifecycle snapshot of an outbound link (initiator side).
+
+    Fields: status / status_name (PENDING/HANDSHAKE/ACTIVE/STALE/CLOSED),
+    teardown_reason / teardown_reason_name (TIMEOUT/INITIATOR_CLOSED/
+    DESTINATION_CLOSED), no_inbound_for_ms, last_keepalive_ago_ms,
+    keepalive_s, stale_time_s, rtt. All read off the real RNS.Link.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    return _link_status_dict(link)
+
+
+def cmd_wire_link_set_watchdog(params):
+    """Compress an established link's keepalive / stale timings so the
+    ACTIVE→STALE→CLOSED watchdog path is observable inside a test timeout.
+
+    RNS's full defaults are keepalive=360s / stale_time=720s; even the
+    loopback-negotiated values (~5s / ~10s) are slow for a tight test.
+    Setting these small lets a test exercise keepalive churn and, if the peer
+    actually stops answering, reach STALE→CLOSED/TIMEOUT quickly.
+
+    Teardown-reason reality (validated reference-vs-reference over loopback):
+      - INITIATOR_CLOSED / DESTINATION_CLOSED come from an explicit
+        teardown or a clean disconnect and fire immediately, *independent*
+        of these timings.
+      - TIMEOUT requires inbound to go *silent* (a stalled, not cleanly
+        closed, peer) for stale_time. A clean TCP disconnect propagates as
+        DESTINATION_CLOSED instead. While the peer keeps answering
+        keepalives, last_inbound is refreshed every watchdog pass and the
+        link never goes STALE — so this knob alone cannot force TIMEOUT;
+        it only shortens the window once inbound genuinely ceases.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    keepalive_s = params.get("keepalive_s")
+    stale_time_s = params.get("stale_time_s")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    if keepalive_s is not None:
+        link.keepalive = float(keepalive_s)
+    if stale_time_s is not None:
+        link.stale_time = float(stale_time_s)
+    return {"keepalive_s": link.keepalive, "stale_time_s": link.stale_time}
+
+
+def cmd_wire_link_await_status(params):
+    """Block until an outbound link reaches at least `target_status`, or
+    timeout. Returns the final lifecycle snapshot plus `reached`.
+
+    `target_status` accepts an int or a name ("STALE"/"CLOSED"/...). The
+    comparison is `link.status >= target` on the PENDING(0) < HANDSHAKE(1) <
+    ACTIVE(2) < STALE(3) < CLOSED(4) ordering, so awaiting STALE also returns
+    if the link has already raced through STALE to CLOSED (STALE is a
+    short-lived transitional state in RNS's watchdog).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    target = params["target_status"]
+    timeout_ms = int(params.get("timeout_ms", 15000))
+    if isinstance(target, str):
+        name_to_int = {v: k for k, v in _LINK_STATUS_NAMES.items()}
+        if target.upper() not in name_to_int:
+            raise ValueError(f"Unknown target_status name: {target!r}")
+        target_int = name_to_int[target.upper()]
+    else:
+        target_int = int(target)
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    deadline = time.time() + timeout_ms / 1000.0
+    reached = False
+    while time.time() < deadline:
+        status = getattr(link, "status", None)
+        if status is not None and int(status) >= target_int:
+            reached = True
+            break
+        time.sleep(0.05)
+    out = _link_status_dict(link)
+    out["reached"] = reached
+    return out
+
+
+def cmd_wire_link_teardown(params):
+    """Gracefully tear down an outbound link from the initiator side
+    (real RNS.Link.teardown). The *peer* observes this as a CLOSED link
+    with teardown_reason=INITIATOR_CLOSED (observe via
+    wire_listener_link_status on the receiver).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    link.teardown()
+    return {"torn_down": True}
+
+
+def cmd_wire_listener_link_status(params):
+    """Observe the *receiver-side* (inbound) link a wire_listen destination
+    accepted, by destination_hash. Optionally polls up to timeout_ms for the
+    inbound link to appear (link establishment is asynchronous).
+
+    Returns the lifecycle snapshot of the most recently accepted inbound
+    link plus `link_count`. This is how a test sees teardown_reason on the
+    side that did NOT initiate the close (e.g. INITIATOR_CLOSED after the
+    initiator calls wire_link_teardown).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 0))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        with listener["recv_lock"]:
+            links = list(listener.get("inbound_links", []))
+        if links or time.time() >= deadline:
+            break
+        time.sleep(0.05)
+    if not links:
+        return {"found": False, "link_count": 0}
+    out = _link_status_dict(links[-1])
+    out["found"] = True
+    out["link_count"] = len(links)
+    return out
+
+
+_PROOF_STRATEGY_MAP = {
+    "all": "PROVE_ALL",
+    "app": "PROVE_APP",
+    "none": "PROVE_NONE",
+}
+
+
+def cmd_wire_set_proof_strategy(params):
+    """Set a listening destination's packet-proof strategy
+    (real RNS.Destination.set_proof_strategy). Replaces the dead
+    rns_set_proof_strategy bridge command (CONFORMANCE_REAUDIT.md §5,
+    "Dead-but-counted surface").
+
+    strategy: "all" (PROVE_ALL), "app" (PROVE_APP) or "none" (PROVE_NONE).
+    Returns the resolved constant so a test can assert the strategy took on
+    the real destination object.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    strategy = str(params["strategy"]).lower()
+    if strategy not in _PROOF_STRATEGY_MAP:
+        raise ValueError(f"strategy must be one of {sorted(_PROOF_STRATEGY_MAP)} (got {strategy!r})")
+    const = getattr(RNS.Destination, _PROOF_STRATEGY_MAP[strategy])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, destination_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {destination_hash.hex()} on "
+            f"handle {handle}; call wire_listen first."
+        )
+    destination.set_proof_strategy(const)
+    return {
+        "strategy": strategy,
+        "proof_strategy": int(destination.proof_strategy),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Channel out-of-order / duplicate injection + window observation
+#
+# RNS.Channel reorders and de-duplicates received envelopes by sequence
+# (Channel._receive / _emplace_envelope). These commands feed crafted
+# envelopes straight into the real channel's receive path and observe the
+# order in which the channel delivers them to its message handler — testing
+# RNS's reassembly logic without needing the wire to deliver out of order.
+# ---------------------------------------------------------------------------
+
+_WIRE_CHANNEL_MSGTYPE = 0x0101
+_channel_message_class = None
+
+
+def _get_channel_message_class():
+    """A minimal MessageBase whose payload is opaque bytes, registered on
+    the channel so RNS's Envelope.unpack can reconstruct injected messages.
+    """
+    global _channel_message_class
+    if _channel_message_class is None:
+        from RNS.Channel import MessageBase
+
+        class _WireChannelMessage(MessageBase):
+            MSGTYPE = _WIRE_CHANNEL_MSGTYPE
+
+            def __init__(self, data=b""):
+                self.data = bytes(data)
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = bytes(raw)
+
+        _channel_message_class = _WireChannelMessage
+    return _channel_message_class
+
+
+def _ensure_channel_state(inst, link_id):
+    """Lazily wire a recording message handler onto a link's real Channel."""
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    channels = inst.setdefault("channels", {})
+    state = channels.get(link_id)
+    if state is not None:
+        return state
+
+    channel = link.get_channel()
+    msgclass = _get_channel_message_class()
+    received = []
+    rlock = threading.Lock()
+    try:
+        channel.register_message_type(msgclass)
+    except Exception:
+        # Already registered on this channel — fine.
+        pass
+
+    def _on_message(message):
+        with rlock:
+            received.append(bytes(getattr(message, "data", b"")))
+        return True  # consume
+
+    channel.add_message_handler(_on_message)
+    state = {"channel": channel, "received": received, "lock": rlock}
+    channels[link_id] = state
+    return state
+
+
+def cmd_wire_channel_inject(params):
+    """Feed crafted envelopes into a link's real RNS.Channel receive path.
+
+    envelopes: list of {sequence: int, data: hex}. Each is packed into a real
+    RNS.Channel.Envelope (struct ">HHH" MSGTYPE/sequence/len + payload) and
+    handed to Channel._receive — exactly the bytes the channel would see off
+    the wire. RNS then reorders by sequence and drops duplicates; delivered
+    payloads (in delivery order) are observable via wire_channel_received.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    envelopes = params.get("envelopes", []) or []
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+    msgclass = _get_channel_message_class()
+    from RNS.Channel import Envelope
+
+    injected = []
+    for env in envelopes:
+        seq = int(env["sequence"])
+        data = bytes.fromhex(env.get("data", ""))
+        message = msgclass(data)
+        envelope = Envelope(outlet=channel._outlet, message=message, sequence=seq)
+        raw = envelope.pack()
+        channel._receive(raw)
+        injected.append(seq)
+    return {"injected": injected}
+
+
+def cmd_wire_channel_received(params):
+    """Drain the in-order payloads the channel has delivered to its handler.
+
+    Returns {messages: [hex, ...]} in the exact order RNS delivered them —
+    which for out-of-order injection is the reassembled sequence order, and
+    for duplicates excludes the dropped copy.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = inst.get("channels", {}).get(link_id)
+    if state is None:
+        return {"messages": []}
+    with state["lock"]:
+        out = [d.hex() for d in state["received"]]
+        state["received"].clear()
+    return {"messages": out}
+
+
+def cmd_wire_channel_window(params):
+    """Report a link channel's real window + sequence state.
+
+    Fields read straight off RNS.Channel: window / window_min / window_max /
+    window_flexibility, next_rx_sequence (the low edge of the receive
+    window — advances as contiguous envelopes are delivered), next_sequence
+    (tx), and the current rx/tx ring depths.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = _ensure_channel_state(inst, link_id)
+    ch = state["channel"]
+    return {
+        "window": int(ch.window),
+        "window_min": int(ch.window_min),
+        "window_max": int(ch.window_max),
+        "window_flexibility": int(ch.window_flexibility),
+        "next_rx_sequence": int(ch._next_rx_sequence),
+        "next_sequence": int(ch._next_sequence),
+        "rx_ring": len(ch._rx_ring),
+        "tx_ring": len(ch._tx_ring),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GROUP destination symmetric encrypt / decrypt
+# ---------------------------------------------------------------------------
+
+def cmd_wire_group_create(params):
+    """Create a real RNS.Destination of type GROUP and either generate or
+    load its symmetric key (RNS.Destination.create_keys / load_private_key).
+
+    Returns the destination_hash (a handle for subsequent encrypt/decrypt on
+    this peer) and the symmetric `key` (hex). GROUP encryption is symmetric
+    and identity-independent, so a second peer that loads the same key can
+    decrypt; a peer with a different key cannot.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", []) or []
+    key_hex = params.get("key")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    destination = RNS.Destination(
+        None, RNS.Destination.IN, RNS.Destination.GROUP, app_name, *aspects
+    )
+    if key_hex:
+        destination.load_private_key(bytes.fromhex(key_hex))
+    else:
+        destination.create_keys()
+
+    inst.setdefault("group_dests", {})[destination.hash] = destination
+    # Strong ref so it isn't GC'd (identity slot is None for GROUP).
+    inst["destinations"].append((None, destination))
+    return {
+        "destination_hash": destination.hash.hex(),
+        "key": destination.get_private_key().hex(),
+    }
+
+
+def cmd_wire_group_encrypt(params):
+    """Encrypt plaintext for a GROUP destination (real Destination.encrypt → Token)."""
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = inst.get("group_dests", {}).get(destination_hash)
+    if destination is None:
+        raise ValueError(f"No GROUP destination {destination_hash.hex()} on handle {handle}")
+    ciphertext = destination.encrypt(plaintext)
+    return {"ciphertext": ciphertext.hex()}
+
+
+def cmd_wire_group_decrypt(params):
+    """Decrypt ciphertext for a GROUP destination (real Destination.decrypt).
+
+    Returns {plaintext: hex|None, decrypted: bool}. A wrong key yields
+    decrypted=False (RNS returns None on Token auth failure).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    ciphertext = bytes.fromhex(params.get("ciphertext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = inst.get("group_dests", {}).get(destination_hash)
+    if destination is None:
+        raise ValueError(f"No GROUP destination {destination_hash.hex()} on handle {handle}")
+    plaintext = destination.decrypt(ciphertext)
+    return {
+        "plaintext": plaintext.hex() if plaintext is not None else None,
+        "decrypted": plaintext is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Identity ratchet encrypt / decrypt (enforce_ratchets rejection support)
+#
+# Pure RNS crypto — no started wire instance required.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_identity_keypair(params):
+    """Generate a fresh RNS.Identity; return its private/public key + hash."""
+    RNS = _get_rns()
+    identity = RNS.Identity()
+    return {
+        "private_key": identity.get_private_key().hex(),
+        "public_key": identity.get_public_key().hex(),
+        "hash": identity.hash.hex(),
+    }
+
+
+def cmd_wire_ratchet_keypair(params):
+    """Generate a fresh X25519 ratchet keypair (RNS.Cryptography.X25519).
+
+    The public bytes are passed to wire_identity_encrypt(ratchet_pub=...);
+    the private bytes go into wire_identity_decrypt(ratchets=[...]).
+    """
+    _get_rns()
+    from RNS.Cryptography import X25519PrivateKey
+    k = X25519PrivateKey.generate()
+    return {
+        "private_key": k.private_bytes().hex(),
+        "public_key": k.public_key().public_bytes().hex(),
+    }
+
+
+def cmd_wire_identity_encrypt(params):
+    """Encrypt for an identity's public key (real RNS.Identity.encrypt).
+
+    When `ratchet_pub` is supplied the message is encrypted to that ratchet
+    public key (forward secrecy); otherwise to the identity's base key.
+    """
+    RNS = _get_rns()
+    public_key = bytes.fromhex(params["public_key"])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    ratchet_pub = params.get("ratchet_pub")
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    if ratchet_pub:
+        ciphertext = identity.encrypt(plaintext, ratchet=bytes.fromhex(ratchet_pub))
+    else:
+        ciphertext = identity.encrypt(plaintext)
+    return {"ciphertext": ciphertext.hex()}
+
+
+def cmd_wire_identity_decrypt(params):
+    """Decrypt for an identity's private key (real RNS.Identity.decrypt),
+    with full ratchet-enforcement support.
+
+    ratchets: list of ratchet PRIVATE keys (hex) to try. enforce_ratchets:
+    when True, RNS REJECTS (returns None) any ciphertext that none of the
+    supplied ratchets can decrypt — even though the identity's base key
+    could — which is the forward-secrecy guarantee. Returns {plaintext:
+    hex|None, decrypted: bool}.
+    """
+    RNS = _get_rns()
+    private_key = bytes.fromhex(params["private_key"])
+    ciphertext = bytes.fromhex(params["ciphertext"])
+    ratchets_hex = params.get("ratchets", []) or []
+    enforce = bool(params.get("enforce_ratchets", False))
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    ratchets = [bytes.fromhex(r) for r in ratchets_hex] or None
+    plaintext = identity.decrypt(ciphertext, ratchets=ratchets, enforce_ratchets=enforce)
+    return {
+        "plaintext": plaintext.hex() if plaintext is not None else None,
+        "decrypted": plaintext is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# IFAC (issue-29 golden vector) — computed from the ifac_key RNS itself
+# derived for this peer's configured interface; nothing is re-derived here.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_ifac_compute(params):
+    """Compute the IFAC access code RNS.Transport.transmit (Transport.py:1054)
+    would prepend, using the live interface's RNS-derived ifac_identity /
+    ifac_key.
+
+    The peer must have been started with network_name + passphrase so RNS
+    derived an IFAC key during config parse (Reticulum._add_interface). This
+    command reads `interface.ifac_identity` / `interface.ifac_key` straight
+    off the live interface and signs `packet_data` with it — i.e. the exact
+    Ed25519 sign + trailing-bytes slice RNS uses — so the reticulum-kt#29
+    golden vector (network=testnet, pass=testpass, packet=bytes(range(64)))
+    is reproduced via genuine RNS, not a hand-rolled HKDF/Ed25519.
+
+    Returns ifac_key (hex), the full 64-byte Ed25519 signature, the ifac_size
+    used, and the `ifac` tag (signature[-ifac_size:]).
+    """
+    handle = params["handle"]
+    packet_data = bytes.fromhex(params["packet_data"])
+    ifac_size_override = params.get("ifac_size")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    ifac_iface = None
+    for iface in _interfaces_matching_handle(inst["rns"], inst["role"]):
+        if getattr(iface, "ifac_identity", None) is not None:
+            ifac_iface = iface
+            break
+    if ifac_iface is None:
+        raise RuntimeError(
+            "No IFAC-configured interface on this handle. Start the peer with "
+            "network_name + passphrase so RNS derives an ifac_key."
+        )
+
+    size = int(ifac_size_override) if ifac_size_override is not None else int(ifac_iface.ifac_size)
+    signature = ifac_iface.ifac_identity.sign(packet_data)
+    return {
+        "ifac_key": ifac_iface.ifac_key.hex(),
+        "ifac_size": size,
+        "signature": signature.hex(),
+        "ifac": signature[-size:].hex(),
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -1589,5 +2309,27 @@ WIRE_COMMANDS = {
     "wire_resource_send": cmd_wire_resource_send,
     "wire_resource_create": cmd_wire_resource_create,
     "wire_resource_poll": cmd_wire_resource_poll,
+    # Link lifecycle observation
+    "wire_link_status": cmd_wire_link_status,
+    "wire_link_set_watchdog": cmd_wire_link_set_watchdog,
+    "wire_link_await_status": cmd_wire_link_await_status,
+    "wire_link_teardown": cmd_wire_link_teardown,
+    "wire_listener_link_status": cmd_wire_listener_link_status,
+    "wire_set_proof_strategy": cmd_wire_set_proof_strategy,
+    # Channel out-of-order / duplicate injection + window observation
+    "wire_channel_inject": cmd_wire_channel_inject,
+    "wire_channel_received": cmd_wire_channel_received,
+    "wire_channel_window": cmd_wire_channel_window,
+    # GROUP destination symmetric crypto
+    "wire_group_create": cmd_wire_group_create,
+    "wire_group_encrypt": cmd_wire_group_encrypt,
+    "wire_group_decrypt": cmd_wire_group_decrypt,
+    # Identity ratchet crypto (enforce_ratchets rejection)
+    "wire_identity_keypair": cmd_wire_identity_keypair,
+    "wire_ratchet_keypair": cmd_wire_ratchet_keypair,
+    "wire_identity_encrypt": cmd_wire_identity_encrypt,
+    "wire_identity_decrypt": cmd_wire_identity_decrypt,
+    # IFAC issue-29 golden vector
+    "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,
 }

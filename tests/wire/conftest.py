@@ -73,6 +73,10 @@ class _WirePeer:
         self.handle: str | None = None
         self.identity_hash: bytes | None = None
         self.port: int | None = None
+        # destination_hash -> {"identity_hash": bytes, "public_key": bytes}
+        # for each wire_listen registered on this peer (N-M3: lets recall
+        # tests assert byte-identity against the listening identity).
+        self.listen_identities: dict[bytes, dict] = {}
 
     def start_tcp_server(
         self,
@@ -426,7 +430,13 @@ class _WirePeer:
         }
 
     def listen(self, app_name: str, aspects: list) -> bytes:
-        """Register an IN destination that accepts incoming Links."""
+        """Register an IN destination that accepts incoming Links.
+
+        Returns the destination_hash. The listening identity's hash and raw
+        public_key are recorded on the peer (see `listening_identity`) so
+        recall tests can assert the recalled key is byte-identical to the
+        announced one (N-M3), not merely the right length.
+        """
         assert self.handle, "start_* must be called first"
         resp = self.bridge.execute(
             "wire_listen",
@@ -434,7 +444,26 @@ class _WirePeer:
             app_name=app_name,
             aspects=list(aspects),
         )
-        return bytes.fromhex(resp["destination_hash"])
+        dest_hash = bytes.fromhex(resp["destination_hash"])
+        self.listen_identities[dest_hash] = {
+            "identity_hash": bytes.fromhex(resp["identity_hash"]),
+            # public_key was added to wire_listen for byte-identity asserts;
+            # tolerate older bridges that don't return it yet.
+            "public_key": (
+                bytes.fromhex(resp["public_key"]) if resp.get("public_key") else None
+            ),
+        }
+        return dest_hash
+
+    def listening_identity(self, destination_hash: bytes) -> dict:
+        """Return {identity_hash, public_key} for a destination this peer is
+        listening on. Raises if `listen` was not called for it first.
+        """
+        if destination_hash not in self.listen_identities:
+            raise KeyError(
+                f"No listen() recorded for {destination_hash.hex()} on {self.role_label}"
+            )
+        return self.listen_identities[destination_hash]
 
     def link_open(
         self,
@@ -494,7 +523,14 @@ class _WirePeer:
             timeout_ms=timeout_ms,
         )
 
-    def resource_create(self, link_id: bytes, data: bytes) -> dict:
+    def resource_create(
+        self,
+        link_id: bytes,
+        data: bytes,
+        force_sdu: int | None = None,
+        include_parts: bool = True,
+        auto_compress: bool = True,
+    ) -> dict:
         """Construct a real RNS.Resource on an established Link and report
         the attributes the implementation computed — WITHOUT advertising or
         sending it.
@@ -503,16 +539,280 @@ class _WirePeer:
         resource_* primitive commands: the bridge builds a real
         RNS.Resource (full __init__, advertise=False so nothing hits the
         wire) and reads back `hash`, `truncated_hash`, `random_hash`,
-        `expected_proof`, `hashmap`, `parts`, and the size/flag fields —
-        nothing is recomputed. Used by tests/wire/test_resource_invariants.py.
+        `expected_proof`, `hashmap`, `parts`, `num_parts`, `total_segments`,
+        `segment_index`, and the size/flag fields — nothing is recomputed.
+
+        Coverage knobs (CONFORMANCE_REAUDIT.md §5 Resource):
+          force_sdu: force a small per-part SDU so a modest payload exceeds
+            the 74-part HMU threshold (assert num_parts>74).
+          include_parts=False: omit the per-part `parts` list (use for >1 MiB
+            multi-segment payloads where total_segments>1 is the observable).
+          auto_compress: leave True to observe compressed=True on a
+            compressible payload.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "link_id": link_id.hex(),
+            "data": data.hex(),
+            "include_parts": include_parts,
+            "auto_compress": auto_compress,
+        }
+        if force_sdu is not None:
+            params["force_sdu"] = int(force_sdu)
+        return self.bridge.execute("wire_resource_create", **params)
+
+    # --- Link lifecycle observation ---------------------------------------
+
+    def link_status(self, link_id: bytes) -> dict:
+        """Lifecycle snapshot of an outbound link: status/status_name,
+        teardown_reason/teardown_reason_name, no_inbound_for_ms,
+        last_keepalive_ago_ms, keepalive_s, stale_time_s, rtt.
         """
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
-            "wire_resource_create",
+            "wire_link_status", handle=self.handle, link_id=link_id.hex()
+        )
+
+    def link_set_watchdog(
+        self,
+        link_id: bytes,
+        keepalive_s: float | None = None,
+        stale_time_s: float | None = None,
+    ) -> dict:
+        """Compress a link's keepalive/stale timings to fit a test window.
+
+        Note: small timings alone do NOT force TIMEOUT — RNS only goes
+        STALE→CLOSED/TIMEOUT once inbound genuinely ceases (a stalled peer).
+        An explicit teardown or clean disconnect yields INITIATOR_CLOSED /
+        DESTINATION_CLOSED immediately regardless of these values.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {"handle": self.handle, "link_id": link_id.hex()}
+        if keepalive_s is not None:
+            params["keepalive_s"] = float(keepalive_s)
+        if stale_time_s is not None:
+            params["stale_time_s"] = float(stale_time_s)
+        return self.bridge.execute("wire_link_set_watchdog", **params)
+
+    def link_await_status(
+        self, link_id: bytes, target_status, timeout_ms: int = 15000
+    ) -> dict:
+        """Block until the link reaches at least `target_status` (int or name
+        like "STALE"/"CLOSED"), or timeout. Returns the snapshot + `reached`.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_await_status",
             handle=self.handle,
             link_id=link_id.hex(),
-            data=data.hex(),
+            target_status=target_status,
+            timeout_ms=timeout_ms,
         )
+
+    def link_teardown(self, link_id: bytes) -> None:
+        """Gracefully tear down an outbound link (initiator side)."""
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_link_teardown", handle=self.handle, link_id=link_id.hex()
+        )
+
+    def listener_link_status(
+        self, destination_hash: bytes, timeout_ms: int = 0
+    ) -> dict:
+        """Observe the receiver-side (inbound) link accepted on a listening
+        destination. Returns the snapshot + {found, link_count}; optionally
+        polls up to timeout_ms for the inbound link to appear.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_listener_link_status",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def set_proof_strategy(self, destination_hash: bytes, strategy: str) -> dict:
+        """Set a listening destination's proof strategy: "all"/"app"/"none".
+        Returns {strategy, proof_strategy} read back off the real destination.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_set_proof_strategy",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            strategy=strategy,
+        )
+
+    # --- Channel out-of-order / duplicate / window ------------------------
+
+    def channel_inject(self, link_id: bytes, envelopes: list) -> list:
+        """Feed crafted envelopes into a link's real Channel receive path.
+
+        envelopes: list of {"sequence": int, "data": bytes}. Returns the
+        injected sequence list.
+        """
+        assert self.handle, "start_* must be called first"
+        wire_envelopes = [
+            {
+                "sequence": int(e["sequence"]),
+                "data": (
+                    e["data"].hex()
+                    if isinstance(e.get("data"), (bytes, bytearray))
+                    else (e.get("data") or "")
+                ),
+            }
+            for e in envelopes
+        ]
+        resp = self.bridge.execute(
+            "wire_channel_inject",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            envelopes=wire_envelopes,
+        )
+        return list(resp.get("injected", []))
+
+    def channel_received(self, link_id: bytes) -> list:
+        """Drain the in-order payloads the channel delivered (bytes list)."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_channel_received", handle=self.handle, link_id=link_id.hex()
+        )
+        return [bytes.fromhex(m) for m in resp.get("messages", [])]
+
+    def channel_window(self, link_id: bytes) -> dict:
+        """Report the channel's window + sequence state (window, window_min,
+        window_max, window_flexibility, next_rx_sequence, next_sequence,
+        rx_ring, tx_ring).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_window", handle=self.handle, link_id=link_id.hex()
+        )
+
+    # --- GROUP destination symmetric crypto -------------------------------
+
+    def group_create(
+        self, app_name: str, aspects: list, key: bytes | None = None
+    ) -> dict:
+        """Create a GROUP destination; generate (key=None) or load a key.
+        Returns {destination_hash: bytes, key: bytes}.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "app_name": app_name,
+            "aspects": list(aspects),
+        }
+        if key is not None:
+            params["key"] = key.hex()
+        resp = self.bridge.execute("wire_group_create", **params)
+        return {
+            "destination_hash": bytes.fromhex(resp["destination_hash"]),
+            "key": bytes.fromhex(resp["key"]),
+        }
+
+    def group_encrypt(self, destination_hash: bytes, plaintext: bytes) -> bytes:
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_group_encrypt",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            plaintext=plaintext.hex(),
+        )
+        return bytes.fromhex(resp["ciphertext"])
+
+    def group_decrypt(self, destination_hash: bytes, ciphertext: bytes) -> bytes | None:
+        """Decrypt for a GROUP destination. Returns plaintext bytes, or None
+        when decryption failed (e.g. wrong key).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_group_decrypt",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            ciphertext=ciphertext.hex(),
+        )
+        if not resp.get("decrypted"):
+            return None
+        return bytes.fromhex(resp["plaintext"])
+
+    # --- Identity ratchet crypto (enforce_ratchets rejection) -------------
+
+    def identity_keypair(self) -> dict:
+        """Generate an RNS.Identity. Returns {private_key, public_key, hash}."""
+        resp = self.bridge.execute("wire_identity_keypair")
+        return {
+            "private_key": bytes.fromhex(resp["private_key"]),
+            "public_key": bytes.fromhex(resp["public_key"]),
+            "hash": bytes.fromhex(resp["hash"]),
+        }
+
+    def ratchet_keypair(self) -> dict:
+        """Generate an X25519 ratchet keypair. Returns {private_key, public_key}."""
+        resp = self.bridge.execute("wire_ratchet_keypair")
+        return {
+            "private_key": bytes.fromhex(resp["private_key"]),
+            "public_key": bytes.fromhex(resp["public_key"]),
+        }
+
+    def identity_encrypt(
+        self, public_key: bytes, plaintext: bytes, ratchet_pub: bytes | None = None
+    ) -> bytes:
+        """Encrypt for an identity's public key; optionally to a ratchet
+        public key (forward secrecy).
+        """
+        params: dict = {"public_key": public_key.hex(), "plaintext": plaintext.hex()}
+        if ratchet_pub is not None:
+            params["ratchet_pub"] = ratchet_pub.hex()
+        resp = self.bridge.execute("wire_identity_encrypt", **params)
+        return bytes.fromhex(resp["ciphertext"])
+
+    def identity_decrypt(
+        self,
+        private_key: bytes,
+        ciphertext: bytes,
+        ratchets: list | None = None,
+        enforce_ratchets: bool = False,
+    ) -> bytes | None:
+        """Decrypt for an identity's private key with ratchet enforcement.
+
+        `ratchets` is a list of ratchet PRIVATE keys (bytes). With
+        enforce_ratchets=True, RNS returns None for any ciphertext none of
+        those ratchets can decrypt (forward-secrecy rejection). Returns the
+        plaintext bytes, or None when decryption was rejected/failed.
+        """
+        params: dict = {
+            "private_key": private_key.hex(),
+            "ciphertext": ciphertext.hex(),
+            "enforce_ratchets": bool(enforce_ratchets),
+        }
+        if ratchets:
+            params["ratchets"] = [r.hex() for r in ratchets]
+        resp = self.bridge.execute("wire_identity_decrypt", **params)
+        if not resp.get("decrypted"):
+            return None
+        return bytes.fromhex(resp["plaintext"])
+
+    # --- IFAC issue-29 golden vector --------------------------------------
+
+    def ifac_compute(self, packet_data: bytes, ifac_size: int | None = None) -> dict:
+        """Compute the IFAC tag RNS would prepend, using this peer's live
+        RNS-derived ifac_identity/ifac_key. Returns {ifac_key: bytes,
+        ifac_size: int, signature: bytes, ifac: bytes}. The peer must have
+        been started with network_name + passphrase.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {"handle": self.handle, "packet_data": packet_data.hex()}
+        if ifac_size is not None:
+            params["ifac_size"] = int(ifac_size)
+        resp = self.bridge.execute("wire_ifac_compute", **params)
+        return {
+            "ifac_key": bytes.fromhex(resp["ifac_key"]),
+            "ifac_size": int(resp["ifac_size"]),
+            "signature": bytes.fromhex(resp["signature"]),
+            "ifac": bytes.fromhex(resp["ifac"]),
+        }
 
     def resource_poll(
         self, destination_hash: bytes, timeout_ms: int = 30000

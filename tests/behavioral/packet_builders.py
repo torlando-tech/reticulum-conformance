@@ -74,13 +74,26 @@ def build_random_hash(random_prefix: bytes, emission_ts: int) -> bytes:
     return random_prefix[:5] + ts_bytes
 
 
+def context_offset(raw: bytes) -> int:
+    """Byte offset of the single context field in a packed RNS packet.
+
+    HEADER_1: flags(1) + hops(1) + dest_hash(16) -> context at 18.
+    HEADER_2: flags(1) + hops(1) + transport_id(16) + dest_hash(16) -> 34.
+    Mirrors RNS/Packet.py pack/unpack field layout.
+    """
+    header_type = (raw[0] & 0b01000000) >> 6
+    if header_type == HEADER_2:
+        return 2 + 2 * TRUNCATED_HASH_BYTES
+    return 2 + TRUNCATED_HASH_BYTES
+
+
 def build_announce_from_destination(
     bridge,
     identity_private_key: bytes,
     app_name: str,
     aspects: list,
-    random_prefix: bytes = b"",   # unused: real Destination.announce generates its own random_hash
-    emission_ts: int = 0,         # unused: real Destination.announce stamps current time
+    random_prefix: bytes = b"",   # advisory only — see note below
+    emission_ts: int = 0,         # honored via announce_build (RNS stamps it)
     wire_hops: int = 0,
     context: int = CONTEXT_NONE,
     ratchet: Optional[bytes] = None,
@@ -90,14 +103,34 @@ def build_announce_from_destination(
 
     announce_build calls real RNS.Destination.announce(send=False) inside the
     bridge process — RNS produces the full wire bytes (flags, header,
-    signature, random_hash, ratchet field). We then patch the hops byte
-    in-place so transport-behavior tests can inject an announce that looks
-    like it has already crossed N hops.
+    signature, random_hash, ratchet field). We then patch two header bytes
+    in-place. Both are header-only fields that lie OUTSIDE the announce's
+    signed_data (RNS signs dest_hash+public_key+name_hash+random_hash+ratchet+
+    app_data — see Identity.validate_announce / Destination.announce:297), so
+    patching them does NOT invalidate the signature:
+
+      * hops    (raw[1]) — simulate an announce that already crossed N hops.
+      * context (raw[context_offset]) — set the packet context, e.g.
+        CONTEXT_PATH_RESPONSE (0x0B), so transport-behavior tests can inject a
+        genuine PATH_RESPONSE-contextual announce. RNS's own
+        Destination.announce only sets this when path_response=True; the bridge
+        does not expose that flag, so we set the header byte directly. Verified
+        against RNS 1.3.1: validate_announce still returns True afterwards.
 
     Returns (raw_bytes, destination_hash, identity_public_key).
 
-    The `random_prefix`, `emission_ts`, and `context` parameters are
-    retained for caller compatibility but ignored — RNS owns those.
+    Parameter notes:
+      * emission_ts IS honored: announce_build monkey-patches time.time for one
+        announce() call so RNS itself stamps emission_ts into the random_hash
+        and path-response timestamp. Lets callers build "fresh" vs "stale"
+        announces with controlled emission timebases in the same test.
+      * context IS honored (patched in-place as described above).
+      * random_prefix is ADVISORY ONLY. The 5 random bytes of the random_hash
+        are part of the announce's signed_data, so RNS — not this helper —
+        generates them inside the bridge. Two announce_build calls already
+        yield distinct random_blobs (~2**-40 collision), which is all the
+        path-replacement / replay tests require. Fully pinning these bytes
+        would need a `random_prefix` parameter on the bridge's announce_build.
     """
     extra = {}
     if emission_ts:
@@ -119,6 +152,10 @@ def build_announce_from_destination(
     # announce_build sets hops=0 (real Destination.announce starts at 0); patch
     # to the value this test wants to simulate.
     raw[1] = wire_hops & 0xFF
+    # Patch the context byte if a non-NONE context was requested. This is a
+    # header-only field outside signed_data, so the signature stays valid.
+    if context != CONTEXT_NONE:
+        raw[context_offset(raw)] = context & 0xFF
     destination_hash = bytes.fromhex(info["destination_hash"])
     public_key = bytes.fromhex(info["public_key"])
     return bytes(raw), destination_hash, public_key

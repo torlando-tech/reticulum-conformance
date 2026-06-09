@@ -502,13 +502,13 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <li><a href="#cat-8">8. Ratchet<span class="count">6</span></a></li>
 <li><a href="#cat-9">9. Compression<span class="count">4</span></a></li>
 <li><a href="#cat-10">10. Wire Interop<span class="count">49</span></a></li>
-<li><a href="#cat-11">11. Transport Behavior<span class="count">5</span></a></li>
+<li><a href="#cat-11">11. Transport Behavior<span class="count">6</span></a></li>
 </ol>
 </aside>
 <main>
 <header class="page">
 <h1>Conformance Test Cases</h1>
-<div class="stats">133 tests across 11 categories · click any row to view the test source, its fixtures, and the rest of the module · generated from <code>@conformance_case</code> decorators</div>
+<div class="stats">134 tests across 11 categories · click any row to view the test source, its fixtures, and the rest of the module · generated from <code>@conformance_case</code> decorators</div>
 </header>
 <div class="filter-bar">
 <input id="filter" type="search" autocomplete="off" placeholder="Filter tests by name, command, or description" aria-label="Filter tests">
@@ -16799,7 +16799,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 </div>
 </div>
 </details>
-<details class="category" id="cat-11" open><summary>11. Transport Behavior<span class="count">5 tests</span></summary>
+<details class="category" id="cat-11" open><summary>11. Transport Behavior<span class="count">6 tests</span></summary>
 <div class="file-section">
 <div class="file-label">File: <code>tests/behavioral/test_hop_increment.py</code> · 2 tests</div>
 <div class="tests-list">
@@ -17028,7 +17028,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 </div>
 </div>
 <div class="file-section">
-<div class="file-label">File: <code>tests/behavioral/test_path_replacement.py</code> · 1 test</div>
+<div class="file-label">File: <code>tests/behavioral/test_path_replacement.py</code> · 2 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
 <details class="test-detail" id="t-11-3" data-search="test_stale_path_response_does_not_overwrite_fresh_path start attach_mock_interface inject read_path_table announce_build a stale path_response announce (context byte 0x0b, novel random_blob, older emission timestamp, larger hop count) does not overwrite a fresh direct path in the transport path table: behavioral_read_path_table reports hops==1 and the retained random_blob&#x27;s emission timebase unchanged from the fresh announce after the stale inject. a positive control confirms a genuinely newer-emission announce does replace the entry"><summary><span class="col num">11.3</span><span class="col name"><code>test_stale_path_response_does_not_overwrite_fresh_path</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">attach_mock_interface</span><span class="cmd-chip">inject</span><span class="cmd-chip">read_path_table</span><span class="cmd-chip">announce_build</span></span><span class="col ver">A stale PATH_RESPONSE announce (context byte 0x0B, novel random_blob, older emission timestamp, larger hop count) does NOT overwrite a fresh direct path in the Transport PATH TABLE: behavioral_read_path_table reports hops==1 and the retained random_blob&#x27;s emission timebase unchanged from the fresh announce after the stale inject. A positive control confirms a genuinely newer-emission announce DOES replace the entry</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_path_replacement.py</code></span><a href="#t-11-3">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_stale_path_response_does_not_overwrite_fresh_path</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
@@ -17219,13 +17219,168 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="sd">    (bytes [5:10]); mirrors RNS `Transport.timebase_from_random_blob`.&quot;&quot;&quot;</span>
     <span class="k">return</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">blob_hex</span><span class="p">)[</span><span class="mi">5</span><span class="p">:</span><span class="mi">10</span><span class="p">],</span> <span class="s2">&quot;big&quot;</span><span class="p">)</span>
 </code></pre></details></div></details>
+<details class="test-detail" id="t-11-4" data-search="test_stale_same_hops_announce_does_not_overwrite_fresh_path start attach_mock_interface inject read_path_table announce_build isolates the emission-time gate in the same-hop branch (transport.py:1762-1769): a novel-random_blob announce with the same hop count as the held path but an older emission timestamp does not replace the entry — hop count is identical, so only the emission comparison can justify rejection. a newer-emission same-hop announce then does replace, proving the gate admits on emission recency rather than blanket-rejecting"><summary><span class="col num">11.4</span><span class="col name"><code>test_stale_same_hops_announce_does_not_overwrite_fresh_path</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">attach_mock_interface</span><span class="cmd-chip">inject</span><span class="cmd-chip">read_path_table</span><span class="cmd-chip">announce_build</span></span><span class="col ver">Isolates the emission-time gate in the SAME-hop branch (Transport.py:1762-1769): a novel-random_blob announce with the SAME hop count as the held path but an OLDER emission timestamp does NOT replace the entry — hop count is identical, so only the emission comparison can justify rejection. A newer-emission same-hop announce then DOES replace, proving the gate admits on emission recency rather than blanket-rejecting</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_path_replacement.py</code></span><a href="#t-11-4">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_stale_same_hops_announce_does_not_overwrite_fresh_path</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Companion to the more-hops case: isolates the emission-time gate where hop</span>
+<span class="sd">    count gives no cover.</span>
+
+<span class="sd">    The sibling test injects a *more*-hops stale announce, so a correct impl could</span>
+<span class="sd">    reject it on hop count alone — it does not prove the emission comparison runs.</span>
+<span class="sd">    Here every announce is wire_hops=0 (path hops=1), so the existing and incoming</span>
+<span class="sd">    hop counts are EQUAL: RNS&#39;s same-or-fewer-hops branch admits only when the</span>
+<span class="sd">    random_blob is novel AND `announce_emitted &gt; path_timebase`</span>
+<span class="sd">    (Transport.py:1769). An older-emission announce is novel but not newer, so it</span>
+<span class="sd">    must be rejected — and the ONLY thing that can reject it is the emission gate,</span>
+<span class="sd">    not hop count. An impl that checks only random_blob novelty (the reticulum-kt</span>
+<span class="sd">    drift) wrongly admits it and overwrites the fresh path&#39;s emission timebase.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">inst</span> <span class="o">=</span> <span class="n">behavioral</span><span class="o">.</span><span class="n">start</span><span class="p">(</span><span class="n">enable_transport</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">iface_a</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">attach_mock_interface</span><span class="p">(</span><span class="s2">&quot;a&quot;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">&quot;FULL&quot;</span><span class="p">)</span>
+        <span class="n">announcer_private</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_bytes</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span>
+
+        <span class="c1"># Fresh announce, hops=1, newest emission.</span>
+        <span class="n">FRESH_TS</span> <span class="o">=</span> <span class="mi">1_000_000_100</span>
+        <span class="n">fresh</span><span class="p">,</span> <span class="n">dest_hash</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">build_announce_from_destination</span><span class="p">(</span>
+            <span class="n">behavioral</span><span class="o">.</span><span class="n">bridge</span><span class="p">,</span>
+            <span class="n">identity_private_key</span><span class="o">=</span><span class="n">announcer_private</span><span class="p">,</span>
+            <span class="n">app_name</span><span class="o">=</span><span class="s2">&quot;testapp&quot;</span><span class="p">,</span>
+            <span class="n">aspects</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;pathrepl-eq&quot;</span><span class="p">],</span>
+            <span class="n">random_prefix</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;</span><span class="se">\xB1\xB1\xB1\xB1\xB1</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="n">emission_ts</span><span class="o">=</span><span class="n">FRESH_TS</span><span class="p">,</span>
+            <span class="n">wire_hops</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">inst</span><span class="o">.</span><span class="n">inject</span><span class="p">(</span><span class="n">iface_a</span><span class="p">,</span> <span class="n">fresh</span><span class="p">)</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.2</span><span class="p">)</span>
+        <span class="n">pt_fresh</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">read_path_table</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">pt_fresh</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">pt_fresh</span><span class="p">[</span><span class="s2">&quot;hops&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span>
+        <span class="k">assert</span> <span class="n">_blob_emission_ts</span><span class="p">(</span><span class="n">pt_fresh</span><span class="p">[</span><span class="s2">&quot;random_blobs&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span> <span class="o">==</span> <span class="n">FRESH_TS</span>
+
+        <span class="c1"># SAME-hop (wire_hops=0 -&gt; path hops=1, EQUAL to held), novel blob, OLDER</span>
+        <span class="c1"># emission. Hop count is identical, so a hop-count check can&#39;t reject it;</span>
+        <span class="c1"># only the emission gate can. Must be rejected.</span>
+        <span class="n">EQUAL_STALE_TS</span> <span class="o">=</span> <span class="mi">1_000_000_050</span>
+        <span class="n">equal_stale</span><span class="p">,</span> <span class="n">eq_dest</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">build_announce_from_destination</span><span class="p">(</span>
+            <span class="n">behavioral</span><span class="o">.</span><span class="n">bridge</span><span class="p">,</span>
+            <span class="n">identity_private_key</span><span class="o">=</span><span class="n">announcer_private</span><span class="p">,</span>
+            <span class="n">app_name</span><span class="o">=</span><span class="s2">&quot;testapp&quot;</span><span class="p">,</span>
+            <span class="n">aspects</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;pathrepl-eq&quot;</span><span class="p">],</span>
+            <span class="n">random_prefix</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;</span><span class="se">\xB0\xB0\xB0\xB0\xB0</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="n">emission_ts</span><span class="o">=</span><span class="n">EQUAL_STALE_TS</span><span class="p">,</span>
+            <span class="n">wire_hops</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">assert</span> <span class="n">eq_dest</span> <span class="o">==</span> <span class="n">dest_hash</span>
+        <span class="n">inst</span><span class="o">.</span><span class="n">inject</span><span class="p">(</span><span class="n">iface_a</span><span class="p">,</span> <span class="n">equal_stale</span><span class="p">)</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.2</span><span class="p">)</span>
+        <span class="n">pt_after</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">read_path_table</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">pt_after</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">pt_after</span><span class="p">[</span><span class="s2">&quot;hops&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span>
+        <span class="n">retained_ts</span> <span class="o">=</span> <span class="p">[</span><span class="n">_blob_emission_ts</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">pt_after</span><span class="p">[</span><span class="s2">&quot;random_blobs&quot;</span><span class="p">]]</span>
+        <span class="k">assert</span> <span class="nb">all</span><span class="p">(</span><span class="n">ts</span> <span class="o">==</span> <span class="n">FRESH_TS</span> <span class="k">for</span> <span class="n">ts</span> <span class="ow">in</span> <span class="n">retained_ts</span><span class="p">),</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;same-hop older-emission announce overwrote the fresh path&#39;s emission &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;timebase: </span><span class="si">{</span><span class="n">retained_ts</span><span class="si">}</span><span class="s2"> (emission gate not enforced on equal hops)&quot;</span>
+        <span class="p">)</span>
+        <span class="k">assert</span> <span class="n">EQUAL_STALE_TS</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">retained_ts</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">&quot;path table absorbed the older-emission same-hop announce&quot;</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Positive control: a NEWER-emission same-hop announce DOES replace —</span>
+        <span class="c1"># proving the gate admits on emission recency, not a blanket reject.</span>
+        <span class="n">NEWER_TS</span> <span class="o">=</span> <span class="mi">1_000_000_200</span>
+        <span class="n">newer</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">build_announce_from_destination</span><span class="p">(</span>
+            <span class="n">behavioral</span><span class="o">.</span><span class="n">bridge</span><span class="p">,</span>
+            <span class="n">identity_private_key</span><span class="o">=</span><span class="n">announcer_private</span><span class="p">,</span>
+            <span class="n">app_name</span><span class="o">=</span><span class="s2">&quot;testapp&quot;</span><span class="p">,</span>
+            <span class="n">aspects</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;pathrepl-eq&quot;</span><span class="p">],</span>
+            <span class="n">random_prefix</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;</span><span class="se">\xB2\xB2\xB2\xB2\xB2</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="n">emission_ts</span><span class="o">=</span><span class="n">NEWER_TS</span><span class="p">,</span>
+            <span class="n">wire_hops</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="n">inst</span><span class="o">.</span><span class="n">inject</span><span class="p">(</span><span class="n">iface_a</span><span class="p">,</span> <span class="n">newer</span><span class="p">)</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.2</span><span class="p">)</span>
+        <span class="n">pt_newer</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">read_path_table</span><span class="p">(</span><span class="n">dest_hash</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="n">pt_newer</span><span class="p">[</span><span class="s2">&quot;found&quot;</span><span class="p">]</span> <span class="ow">and</span> <span class="n">pt_newer</span><span class="p">[</span><span class="s2">&quot;hops&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span>
+        <span class="k">assert</span> <span class="n">NEWER_TS</span> <span class="ow">in</span> <span class="p">[</span><span class="n">_blob_emission_ts</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">pt_newer</span><span class="p">[</span><span class="s2">&quot;random_blobs&quot;</span><span class="p">]],</span> <span class="p">(</span>
+            <span class="s2">&quot;newer-emission same-hop announce was not admitted by the emission gate&quot;</span>
+        <span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">behavioral</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Fixture</span><code>behavioral</code><code>tests/behavioral/conftest.py</code></summary><pre class="code-block"><code class="hl"><span class="nd">@pytest</span><span class="o">.</span><span class="n">fixture</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">behavioral</span><span class="p">(</span><span class="n">behavioral_impl</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Helper bound to a FRESHLY-SPAWNED bridge process per test.&quot;&quot;&quot;</span>
+    <span class="n">cmd</span> <span class="o">=</span> <span class="n">resolve_command</span><span class="p">(</span><span class="n">behavioral_impl</span><span class="p">)</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="p">{</span><span class="s2">&quot;PYTHON_RNS_PATH&quot;</span><span class="p">:</span> <span class="n">resolve_rns_path</span><span class="p">()}</span>
+        <span class="k">if</span> <span class="n">behavioral_impl</span> <span class="o">==</span> <span class="s2">&quot;reference&quot;</span>
+        <span class="k">else</span> <span class="p">{}</span>
+    <span class="p">)</span>
+    <span class="n">client</span> <span class="o">=</span> <span class="n">BridgeClient</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">)</span>
+    <span class="n">harness</span> <span class="o">=</span> <span class="n">_BehavioralHarness</span><span class="p">(</span><span class="n">client</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">harness</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># Run harness.cleanup() first to stop any remaining instances on</span>
+        <span class="c1"># the bridge side before we close the pipe. Tests typically call</span>
+        <span class="c1"># cleanup themselves in a finally, but doing it here too makes</span>
+        <span class="c1"># sure a test that raises before reaching its finally still</span>
+        <span class="c1"># tears down cleanly.</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">harness</span><span class="o">.</span><span class="n">cleanup</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+            <span class="k">pass</span>
+        <span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+</code></pre></details><details class="ctx"><summary><span class="ctx-label">Module context</span><code>tests/behavioral/test_path_replacement.py</code></summary><pre class="code-block"><code class="hl"><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Behavioral test: path-table replacement rules.</span>
+
+<span class="sd">Python `Transport.py:1762-1823` admits an announce into the PATH TABLE under</span>
+<span class="sd">strict rules:</span>
+<span class="sd">  * a same-or-fewer-hop announce is admitted only if its random_blob is novel</span>
+<span class="sd">    AND its emission timestamp is strictly newer than the timebase of the path</span>
+<span class="sd">    we already hold; while</span>
+<span class="sd">  * a MORE-hops announce is admitted only if the existing path has expired or</span>
+<span class="sd">    the new announce was emitted more recently (still requiring a novel blob).</span>
+
+<span class="sd">A stale PATH_RESPONSE — re-emitted from a cache, so it carries a *novel*</span>
+<span class="sd">random_blob but an *older* emission timestamp and *more* hops — fails every</span>
+<span class="sd">branch and must be rejected.</span>
+
+<span class="sd">Reticulum-kt&#39;s initial port checked only random_blob novelty, which let exactly</span>
+<span class="sd">such a stale PATH_RESPONSE overwrite a fresh direct path. This test catches that</span>
+<span class="sd">drift by reading the PATH TABLE directly (`behavioral_read_path_table`).</span>
+
+<span class="sd">Why not observe the announce_table retransmit (as an earlier version did)?</span>
+<span class="sd">Because a PATH_RESPONSE-context announce is *never* scheduled for retransmit</span>
+<span class="sd">(Transport.py:1884 gates the announce_table insert on `context != PATH_RESPONSE`),</span>
+<span class="sd">so the retransmit observable could never reveal a corrupted path table — it</span>
+<span class="sd">passed even if cross-impl path replacement was fully broken (re-audit N-H1/N-H2).</span>
+<span class="sd">Reading the path table is the only observable that actually verifies the rule.</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">conformance</span><span class="w"> </span><span class="kn">import</span> <span class="n">conformance_case</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tests.behavioral.packet_builders</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">CONTEXT_PATH_RESPONSE</span><span class="p">,</span>
+    <span class="n">build_announce_from_destination</span><span class="p">,</span>
+    <span class="n">context_offset</span><span class="p">,</span>
+<span class="p">)</span>
+
+
+<span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Transport Behavior&quot;</span>
+<span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">19</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_blob_emission_ts</span><span class="p">(</span><span class="n">blob_hex</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Decode the 5-byte big-endian emission timebase from a random_hash hex</span>
+<span class="sd">    (bytes [5:10]); mirrors RNS `Transport.timebase_from_random_blob`.&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">blob_hex</span><span class="p">)[</span><span class="mi">5</span><span class="p">:</span><span class="mi">10</span><span class="p">],</span> <span class="s2">&quot;big&quot;</span><span class="p">)</span>
+</code></pre></details></div></details>
 </div>
 </div>
 <div class="file-section">
 <div class="file-label">File: <code>tests/behavioral/test_replay_dedup.py</code> · 2 tests</div>
 <div class="tests-list">
 <div class="row header"><span class="col num">#</span><span class="col name">Test</span><span class="col cmds">Commands</span><span class="col ver">What it verifies</span></div>
-<details class="test-detail" id="t-11-4" data-search="test_duplicate_data_packet_is_dropped_on_replay start packet_build packet_filter a byte-identical non-announce single-destination data packet run through the transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and dropped the second time (replay/loop drop); a fresh data packet with a different hash is still accepted afterward (positive control)"><summary><span class="col num">11.4</span><span class="col name"><code>test_duplicate_data_packet_is_dropped_on_replay</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">packet_build</span><span class="cmd-chip">packet_filter</span></span><span class="col ver">A byte-identical non-announce SINGLE-destination DATA packet run through the Transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and DROPPED the second time (replay/loop drop); a fresh DATA packet with a different hash is still accepted afterward (positive control)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_replay_dedup.py</code></span><a href="#t-11-4">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_duplicate_data_packet_is_dropped_on_replay</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
+<details class="test-detail" id="t-11-5" data-search="test_duplicate_data_packet_is_dropped_on_replay start packet_build packet_filter a byte-identical non-announce single-destination data packet run through the transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and dropped the second time (replay/loop drop); a fresh data packet with a different hash is still accepted afterward (positive control)"><summary><span class="col num">11.5</span><span class="col name"><code>test_duplicate_data_packet_is_dropped_on_replay</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">packet_build</span><span class="cmd-chip">packet_filter</span></span><span class="col ver">A byte-identical non-announce SINGLE-destination DATA packet run through the Transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and DROPPED the second time (replay/loop drop); a fresh DATA packet with a different hash is still accepted afterward (positive control)</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_replay_dedup.py</code></span><a href="#t-11-5">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_duplicate_data_packet_is_dropped_on_replay</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;First sighting of a SINGLE DATA packet is accepted and its hash</span>
 <span class="sd">    remembered; the identical packet seen again is dropped by the hashlist</span>
 <span class="sd">    (Transport.py:1374 -&gt; 1383). A different, fresh DATA packet is still</span>
@@ -17337,7 +17492,7 @@ span.linenos.special { color: #000000; background-color: #ffffc0; padding-left: 
 <span class="n">__category_title__</span> <span class="o">=</span> <span class="s2">&quot;Transport Behavior&quot;</span>
 <span class="n">__category_order__</span> <span class="o">=</span> <span class="mi">19</span>
 </code></pre></details></div></details>
-<details class="test-detail" id="t-11-5" data-search="test_duplicate_single_announce_is_not_deduplicated start announce_build packet_filter a byte-identical single-destination announce packet run through the transport packet-hashlist filter twice is accepted both times — packet_filter deliberately does not hashlist-deduplicate single announces (transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules"><summary><span class="col num">11.5</span><span class="col name"><code>test_duplicate_single_announce_is_not_deduplicated</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">announce_build</span><span class="cmd-chip">packet_filter</span></span><span class="col ver">A byte-identical SINGLE-destination ANNOUNCE packet run through the Transport packet-hashlist filter twice is accepted BOTH times — packet_filter deliberately does NOT hashlist-deduplicate SINGLE announces (Transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_replay_dedup.py</code></span><a href="#t-11-5">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_duplicate_single_announce_is_not_deduplicated</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
+<details class="test-detail" id="t-11-6" data-search="test_duplicate_single_announce_is_not_deduplicated start announce_build packet_filter a byte-identical single-destination announce packet run through the transport packet-hashlist filter twice is accepted both times — packet_filter deliberately does not hashlist-deduplicate single announces (transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules"><summary><span class="col num">11.6</span><span class="col name"><code>test_duplicate_single_announce_is_not_deduplicated</code></span><span class="col cmds"><span class="cmd-chip">start</span><span class="cmd-chip">announce_build</span><span class="cmd-chip">packet_filter</span></span><span class="col ver">A byte-identical SINGLE-destination ANNOUNCE packet run through the Transport packet-hashlist filter twice is accepted BOTH times — packet_filter deliberately does NOT hashlist-deduplicate SINGLE announces (Transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules</span></summary><div class="code-wrap"><div class="code-meta"><span><code>tests/behavioral/test_replay_dedup.py</code></span><a href="#t-11-6">¶ permalink</a></div><details class="ctx" open><summary><span class="ctx-label">Test method</span></summary><pre class="code-block"><code class="hl"><span class="k">def</span><span class="w"> </span><span class="nf">test_duplicate_single_announce_is_not_deduplicated</span><span class="p">(</span><span class="n">behavioral</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The hashlist carve-out: a replayed SINGLE announce stays accepted, so the</span>
 <span class="sd">    path-replacement rules (not the hashlist) govern re-heard announces. This is</span>
 <span class="sd">    the discriminating counterpart to the DATA-drop test — it pins that the</span>

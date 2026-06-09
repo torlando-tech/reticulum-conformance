@@ -176,3 +176,101 @@ def test_stale_path_response_does_not_overwrite_fresh_path(behavioral):
         )
     finally:
         behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "inject", "read_path_table",
+              "announce_build"],
+    verifies=(
+        "Isolates the emission-time gate in the SAME-hop branch "
+        "(Transport.py:1762-1769): a novel-random_blob announce with the SAME hop "
+        "count as the held path but an OLDER emission timestamp does NOT replace "
+        "the entry — hop count is identical, so only the emission comparison can "
+        "justify rejection. A newer-emission same-hop announce then DOES replace, "
+        "proving the gate admits on emission recency rather than blanket-rejecting"
+    ),
+)
+def test_stale_same_hops_announce_does_not_overwrite_fresh_path(behavioral):
+    """Companion to the more-hops case: isolates the emission-time gate where hop
+    count gives no cover.
+
+    The sibling test injects a *more*-hops stale announce, so a correct impl could
+    reject it on hop count alone — it does not prove the emission comparison runs.
+    Here every announce is wire_hops=0 (path hops=1), so the existing and incoming
+    hop counts are EQUAL: RNS's same-or-fewer-hops branch admits only when the
+    random_blob is novel AND `announce_emitted > path_timebase`
+    (Transport.py:1769). An older-emission announce is novel but not newer, so it
+    must be rejected — and the ONLY thing that can reject it is the emission gate,
+    not hop count. An impl that checks only random_blob novelty (the reticulum-kt
+    drift) wrongly admits it and overwrites the fresh path's emission timebase.
+    """
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        announcer_private = secrets.token_bytes(64)
+
+        # Fresh announce, hops=1, newest emission.
+        FRESH_TS = 1_000_000_100
+        fresh, dest_hash, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=announcer_private,
+            app_name="testapp",
+            aspects=["pathrepl-eq"],
+            random_prefix=b"\xB1\xB1\xB1\xB1\xB1",
+            emission_ts=FRESH_TS,
+            wire_hops=0,
+        )
+        inst.inject(iface_a, fresh)
+        time.sleep(0.2)
+        pt_fresh = inst.read_path_table(dest_hash)
+        assert pt_fresh["found"] and pt_fresh["hops"] == 1
+        assert _blob_emission_ts(pt_fresh["random_blobs"][0]) == FRESH_TS
+
+        # SAME-hop (wire_hops=0 -> path hops=1, EQUAL to held), novel blob, OLDER
+        # emission. Hop count is identical, so a hop-count check can't reject it;
+        # only the emission gate can. Must be rejected.
+        EQUAL_STALE_TS = 1_000_000_050
+        equal_stale, eq_dest, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=announcer_private,
+            app_name="testapp",
+            aspects=["pathrepl-eq"],
+            random_prefix=b"\xB0\xB0\xB0\xB0\xB0",
+            emission_ts=EQUAL_STALE_TS,
+            wire_hops=0,
+        )
+        assert eq_dest == dest_hash
+        inst.inject(iface_a, equal_stale)
+        time.sleep(0.2)
+        pt_after = inst.read_path_table(dest_hash)
+        assert pt_after["found"] and pt_after["hops"] == 1
+        retained_ts = [_blob_emission_ts(b) for b in pt_after["random_blobs"]]
+        assert all(ts == FRESH_TS for ts in retained_ts), (
+            f"same-hop older-emission announce overwrote the fresh path's emission "
+            f"timebase: {retained_ts} (emission gate not enforced on equal hops)"
+        )
+        assert EQUAL_STALE_TS not in retained_ts, (
+            "path table absorbed the older-emission same-hop announce"
+        )
+
+        # Positive control: a NEWER-emission same-hop announce DOES replace —
+        # proving the gate admits on emission recency, not a blanket reject.
+        NEWER_TS = 1_000_000_200
+        newer, _, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=announcer_private,
+            app_name="testapp",
+            aspects=["pathrepl-eq"],
+            random_prefix=b"\xB2\xB2\xB2\xB2\xB2",
+            emission_ts=NEWER_TS,
+            wire_hops=0,
+        )
+        inst.inject(iface_a, newer)
+        time.sleep(0.2)
+        pt_newer = inst.read_path_table(dest_hash)
+        assert pt_newer["found"] and pt_newer["hops"] == 1
+        assert NEWER_TS in [_blob_emission_ts(b) for b in pt_newer["random_blobs"]], (
+            "newer-emission same-hop announce was not admitted by the emission gate"
+        )
+    finally:
+        behavioral.cleanup()

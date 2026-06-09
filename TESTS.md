@@ -280,7 +280,7 @@ HDLC and KISS are byte-stuffing protocols for framing variable-length data on a 
 | 10.48 | `test_multi_segment_transfer_reassembles_byte_exact` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `poll_path`, `resource_send`, `resource_poll` | A >1 MiB Resource (2 segments) sent over a Link reassembles byte-exact at the receiver — the multi-segment send/append/proof loop (Resource.py:299/708/788) round-trips the entire payload, not just the first segment |
 | 10.49 | `test_small_mdu_resource_exceeds_hashmap_advertisement_limit` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `poll_path`, `resource_create` | On a Link with a forced small per-part SDU a modest payload chunks into more than 74 parts (HASHMAP_MAX_LEN) — the HMU regime where the hashmap spans multiple advertisements — and the packed hashmap stays exactly num_parts x 4 bytes, while the same payload at the normal MDU stays under the threshold |
 
-## 11. Transport Behavior (5 tests)
+## 11. Transport Behavior (6 tests)
 
 ### `tests/behavioral/test_hop_increment.py` (2 tests)
 
@@ -289,16 +289,17 @@ HDLC and KISS are byte-stuffing protocols for framing variable-length data on a 
 | 11.1 | `test_hop_increment_on_receive` | `start`, `attach_mock_interface`, `inject`, `drain_tx`, `announce_build` | An announce received with wire_hops=N is re-emitted on another interface with hops=N+1 (the per-hop +1 increment rule) |
 | 11.2 | `test_hop_increment_when_transport_disabled` | `start`, `attach_mock_interface`, `inject`, `drain_tx`, `read_path_table`, `announce_build` | With enable_transport=False and no local clients, a received announce is still PROCESSED (its destination is learned into the path table at hops=1) but is NOT re-emitted on any interface — the transport gate suppresses retransmit, not announce intake |
 
-### `tests/behavioral/test_path_replacement.py` (1 test)
+### `tests/behavioral/test_path_replacement.py` (2 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
 | 11.3 | `test_stale_path_response_does_not_overwrite_fresh_path` | `start`, `attach_mock_interface`, `inject`, `read_path_table`, `announce_build` | A stale PATH_RESPONSE announce (context byte 0x0B, novel random_blob, older emission timestamp, larger hop count) does NOT overwrite a fresh direct path in the Transport PATH TABLE: behavioral_read_path_table reports hops==1 and the retained random_blob's emission timebase unchanged from the fresh announce after the stale inject. A positive control confirms a genuinely newer-emission announce DOES replace the entry |
+| 11.4 | `test_stale_same_hops_announce_does_not_overwrite_fresh_path` | `start`, `attach_mock_interface`, `inject`, `read_path_table`, `announce_build` | Isolates the emission-time gate in the SAME-hop branch (Transport.py:1762-1769): a novel-random_blob announce with the SAME hop count as the held path but an OLDER emission timestamp does NOT replace the entry — hop count is identical, so only the emission comparison can justify rejection. A newer-emission same-hop announce then DOES replace, proving the gate admits on emission recency rather than blanket-rejecting |
 
 ### `tests/behavioral/test_replay_dedup.py` (2 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 11.4 | `test_duplicate_data_packet_is_dropped_on_replay` | `start`, `packet_build`, `packet_filter` | A byte-identical non-announce SINGLE-destination DATA packet run through the Transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and DROPPED the second time (replay/loop drop); a fresh DATA packet with a different hash is still accepted afterward (positive control) |
-| 11.5 | `test_duplicate_single_announce_is_not_deduplicated` | `start`, `announce_build`, `packet_filter` | A byte-identical SINGLE-destination ANNOUNCE packet run through the Transport packet-hashlist filter twice is accepted BOTH times — packet_filter deliberately does NOT hashlist-deduplicate SINGLE announces (Transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules |
+| 11.5 | `test_duplicate_data_packet_is_dropped_on_replay` | `start`, `packet_build`, `packet_filter` | A byte-identical non-announce SINGLE-destination DATA packet run through the Transport packet-hashlist filter twice is accepted the first time (and its hash remembered) and DROPPED the second time (replay/loop drop); a fresh DATA packet with a different hash is still accepted afterward (positive control) |
+| 11.6 | `test_duplicate_single_announce_is_not_deduplicated` | `start`, `announce_build`, `packet_filter` | A byte-identical SINGLE-destination ANNOUNCE packet run through the Transport packet-hashlist filter twice is accepted BOTH times — packet_filter deliberately does NOT hashlist-deduplicate SINGLE announces (Transport.py:1376-1378); announce replay protection is handled separately by random_blob/path rules |
 

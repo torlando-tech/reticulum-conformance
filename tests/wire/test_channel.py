@@ -24,14 +24,16 @@ window / sequence state read straight off the `RNS.Channel` object. Because the
 injection bypasses the wire, every assertion here runs identically under
 `--reference-only` (reference plays both link peers).
 
-NOT covered here (no harness command exists to drive them — see the suite's
-unresolved gaps): TX-side window growth/shrink, which only fire on channel
-*send* ack / retransmit timeout (Channel._packet_tx_op / _packet_timeout) and
-need a channel-send command on the wire link; and SystemMessage /
-MSGTYPE>=0xf000 registration rejection (Channel._register_message_type), which
-needs a command to register a caller-chosen MSGTYPE and observe the
-ChannelException. `test_channel_initial_window` asserts the *initial* window
-constants (the static half of the window contract) that ARE observable.
+This module owns the RX-side reassembly contract: reorder, duplicate drop,
+16-bit wraparound, and the true-stale sequence drop (the four
+`channel_inject`-driven behaviours). `test_channel_initial_window` additionally
+asserts the *initial* window constants (the static half of the window
+contract). The TX-side flow-control behaviours that fire on channel *send* —
+window growth on ack, window/window_max shrink + 5-try teardown on loss
+(Channel._packet_tx_op / _packet_timeout), and the MSGTYPE>=0xf000 registration
+rejection (Channel._register_message_type) — live in the sibling
+`test_channel_flow.py`, which drives the real `channel_send` command (the honest
+replacement for the dead cmd_rns_channel_send).
 """
 
 from conformance import conformance_case
@@ -261,4 +263,70 @@ def test_channel_initial_window(wire_peers):
     # The transmit-sequence counter starts at 0 on a fresh channel.
     assert w["next_sequence"] == 0, (
         f"next_sequence={w['next_sequence']}, expected 0 on a fresh channel"
+    )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "channel_inject", "channel_received", "channel_window",
+    ],
+    verifies="RNS Channel unconditionally drops a truly-stale received sequence in the normal (non-wrapped) window region: after delivering [0,1,2] (next_rx_sequence=3, far below the 0xFFFF modulus so the receive window does not wrap), injecting already-delivered sequences 0 and 1 (each < next_rx_sequence) delivers nothing and leaves next_rx_sequence=3 with an empty rx ring, while the still-expected sequence 3 injected afterward IS delivered and advances next_rx_sequence to 4 — discriminating the stale-drop else-branch (Channel.py:431-439, where envelope.sequence < next_rx_sequence and the window does not wrap) from both ring-dedup and the wraparound forward-window hold the other tests cover",
+)
+def test_channel_true_stale_sequence_dropped(wire_peers):
+    server, client, server_dest, link_id = _open_channel_link(wire_peers)
+
+    # Establish a normal (non-wrapped) receive position: deliver 0,1,2 in order
+    # so next_rx_sequence advances to 3 and the ring drains. Distinct payloads
+    # keep the setup self-checking.
+    client.channel_inject(
+        link_id, [{"sequence": s, "data": bytes([s])} for s in range(3)]
+    )
+    drained = client.channel_received(link_id)
+    assert drained == [b"\x00", b"\x01", b"\x02"], (
+        f"setup did not deliver [0,1,2] in order: {[d.hex() for d in drained]!r}"
+    )
+    w = client.channel_window(link_id)
+    assert w["next_rx_sequence"] == 3 and w["rx_ring"] == 0, (
+        f"setup left next_rx_sequence={w['next_rx_sequence']}, rx_ring={w['rx_ring']}; "
+        f"expected 3 / 0 before the stale injection"
+    )
+
+    # Inject already-delivered sequences below next_rx_sequence. With
+    # next_rx_sequence=3, the forward window (next_rx + WINDOW_MAX) does NOT wrap
+    # the modulus, so RNS takes the unconditional stale-drop else-branch: these
+    # are dropped before reaching the ring (never delivered, never buffered).
+    client.channel_inject(
+        link_id,
+        [
+            {"sequence": 0, "data": b"stale-zero"},
+            {"sequence": 1, "data": b"stale-one"},
+        ],
+    )
+    stale_delivered = client.channel_received(link_id)
+    assert stale_delivered == [], (
+        f"truly-stale sequences were delivered: "
+        f"{[d.hex() for d in stale_delivered]!r}"
+    )
+    w = client.channel_window(link_id)
+    assert w["next_rx_sequence"] == 3, (
+        f"stale injection advanced next_rx_sequence to {w['next_rx_sequence']}, "
+        f"expected it to stay 3"
+    )
+    assert w["rx_ring"] == 0, (
+        f"stale injection buffered into rx_ring={w['rx_ring']} instead of dropping"
+    )
+
+    # Positive control: the channel is NOT dead — the still-expected next
+    # sequence (3) is accepted and delivered, advancing next_rx_sequence to 4.
+    client.channel_inject(link_id, [{"sequence": 3, "data": b"live-three"}])
+    live = client.channel_received(link_id)
+    assert live == [b"live-three"], (
+        f"the live next-sequence was not delivered after the stale drop: "
+        f"{[d.hex() for d in live]!r}"
+    )
+    w = client.channel_window(link_id)
+    assert w["next_rx_sequence"] == 4, (
+        f"live delivery did not advance next_rx_sequence to 4: "
+        f"got {w['next_rx_sequence']}"
     )

@@ -263,3 +263,103 @@ def test_small_mdu_resource_exceeds_hashmap_advertisement_limit(wire_peers):
         f"at most {_HASHMAP_MAX_LEN}; if this already exceeds the threshold "
         f"the forced-SDU case is not isolating the HMU regime."
     )
+
+
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "listen", "link_open", "poll_path", "resource_create"],
+    verifies="A payload of exactly MAX_EFFICIENT_SIZE (1 MiB - 1) stays a single unsplit segment (total_segments==1, split=False), while one byte more splits into 2 — pinning the inclusive `<=` boundary in `total_size <= MAX_EFFICIENT_SIZE` (Resource.py:285), the exact equality case the existing over-threshold test does not touch",
+)
+def test_exact_max_efficient_size_boundary_stays_single_segment(wire_peers):
+    """Construction observable: the segmentation boundary is inclusive.
+
+    RNS keeps a transfer single-segment iff total_size <= MAX_EFFICIENT_SIZE
+    (Resource.py:285) and only splits once it is strictly greater
+    (Resource.py:299). The existing over-threshold test covers MAX+1 -> 2 and a
+    small payload -> 1; this pins the exact equality point itself: a payload of
+    exactly MAX_EFFICIENT_SIZE bytes (with no metadata, so total_size ==
+    len(payload)) must report a single unsplit segment, and exactly one byte
+    more must report two. An off-by-one in the comparison (`<` instead of `<=`)
+    would split the equal case and is caught only here.
+    """
+    server, client, dest_hash, link_id = _establish_link(wire_peers)
+
+    at_boundary = secrets.token_bytes(_MAX_EFFICIENT_SIZE)
+    exact = client.resource_create(link_id, at_boundary, include_parts=False)
+    assert exact["total_segments"] == 1 and exact["split"] is False, (
+        f"{client.role_label} reported total_segments={exact['total_segments']}"
+        f" split={exact['split']} for a payload of exactly "
+        f"{_MAX_EFFICIENT_SIZE} bytes (== MAX_EFFICIENT_SIZE) — the boundary is "
+        f"inclusive, so this must stay a single unsplit segment (Resource.py:285)."
+    )
+
+    over_boundary = secrets.token_bytes(_MAX_EFFICIENT_SIZE + 1)
+    over = client.resource_create(link_id, over_boundary, include_parts=False)
+    assert over["total_segments"] == 2 and over["split"] is True, (
+        f"{client.role_label} reported total_segments={over['total_segments']} "
+        f"split={over['split']} for a payload one byte over MAX_EFFICIENT_SIZE "
+        f"— the very next byte past the inclusive boundary must split into 2 "
+        f"segments (Resource.py:299)."
+    )
+
+
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "listen", "link_open", "poll_path", "resource_create", "resource_send", "resource_poll"],
+    verifies="A >2 MiB payload constructs as total_segments==3 with the first segment's original_hash == its own hash (chaining seed, Resource.py:446) and, when sent, reassembles byte-exact at the receiver — proving all three segments chain through the shared original_hash into one stream (Resource.py:299/:708/:769/:788)",
+)
+def test_three_segment_transfer_reassembles_byte_exact(wire_peers):
+    """Transfer observable: a 3-segment payload chains and reassembles whole.
+
+    A payload over 2 x MAX_EFFICIENT_SIZE splits into 3 segments, each sent and
+    proven in turn and appended on the receiver into one stream keyed by the
+    shared original_hash (Resource.py:769/:199). The construction half pins
+    total_segments==3 and that the first segment seeds original_hash with its
+    own hash (Resource.py:446 — for segment 1, original_hash == hash); the
+    transfer half pins that all three segments arrive and reassemble byte-exact
+    (a dropped or mis-ordered segment yields a short/mismatched payload). The
+    2-segment test only transitively touches chaining; the third segment and
+    the explicit original_hash seed are unpinned without this.
+    """
+    server, client, dest_hash, link_id = _establish_link(wire_peers)
+
+    # 2 x MAX_EFFICIENT_SIZE + 128 KiB -> total_size in (2*MAX, 3*MAX] -> 3 segments.
+    payload = secrets.token_bytes(2 * _MAX_EFFICIENT_SIZE + 128 * 1024)
+
+    # Construction: total_segments==3, segment 1 seeds original_hash with hash.
+    built = client.resource_create(link_id, payload, include_parts=False)
+    assert built["total_segments"] == 3, (
+        f"{client.role_label} reported total_segments={built['total_segments']} "
+        f"for a {len(payload)}-byte payload — expected 3 (Resource.py:299)."
+    )
+    assert built["segment_index"] == 1 and built["split"] is True, (
+        f"{client.role_label} reported segment_index={built['segment_index']} "
+        f"split={built['split']} for the first segment of a 3-segment payload."
+    )
+    assert built["original_hash"] == built["hash"], (
+        f"{client.role_label} first-segment original_hash "
+        f"({built['original_hash']}) != its own hash ({built['hash']}) — RNS "
+        f"seeds the chain's original_hash with the first segment's hash "
+        f"(Resource.py:446); later segments inherit it (Resource.py:772)."
+    )
+
+    # Transfer: all three segments reassemble byte-exact.
+    send_resp = client.resource_send(
+        link_id, payload, timeout_ms=_RESOURCE_TIMEOUT_MS
+    )
+    assert send_resp["success"], (
+        f"{client.role_label} 3-segment resource send of {len(payload)} bytes "
+        f"did not complete: {send_resp!r}. Failure here points at segment "
+        f"sequencing or inter-segment proof handling across three segments."
+    )
+    assert send_resp["total_segments"] == 3, (
+        f"{client.role_label} sent a transfer reporting "
+        f"total_segments={send_resp['total_segments']}, expected 3."
+    )
+
+    received = server.resource_poll(dest_hash, timeout_ms=_RESOURCE_TIMEOUT_MS)
+    assert received == [payload], (
+        f"{server.role_label} did not reassemble the {len(payload)}-byte "
+        f"3-segment resource from {client.role_label}. Got {len(received)} "
+        f"resource(s) with sizes {[len(r) for r in received]} — a size other "
+        f"than {len(payload)} means a segment was lost, mis-ordered, or the "
+        f"original_hash chaining failed to append all three."
+    )

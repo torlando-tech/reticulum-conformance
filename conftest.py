@@ -27,6 +27,7 @@ BRIDGE_COMMANDS = {
     "reference": "python3 {root}/reference/bridge_server.py",
     "swift": "{root}/../reticulum-swift-lib/.build/release/ConformanceBridge",
     "kotlin": "java -jar {root}/../reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar",
+    "microreticulum": "{root}/impls/microreticulum/build/microReticulumBridge",
 }
 
 # Per-impl env var names. When set, override BRIDGE_COMMANDS[impl].
@@ -34,6 +35,7 @@ PER_IMPL_CMD_ENV = {
     "reference": "CONFORMANCE_REFERENCE_BRIDGE_CMD",
     "swift": "CONFORMANCE_SWIFT_BRIDGE_CMD",
     "kotlin": "CONFORMANCE_KOTLIN_BRIDGE_CMD",
+    "microreticulum": "CONFORMANCE_MICRORETICULUM_BRIDGE_CMD",
 }
 
 # Root directory of the conformance suite
@@ -100,17 +102,19 @@ def get_impl_list(config):
         return [impl]
     if config.getoption("--reference-only"):
         return []
-    # Default: test all registered implementations except reference
+    # Default: test every registered implementation (except reference) whose
+    # bridge binary/JAR is actually present on disk. The existence gate applies
+    # uniformly to all non-reference impls (swift, kotlin, microreticulum, ...):
+    # a registered-but-unbuilt impl must NOT be parametrized in, or the suite
+    # fails at subprocess spawn instead of cleanly skipping. The last
+    # whitespace-split token of the resolved command is the executable/JAR path
+    # (this also handles the `java -jar X.jar` form).
     impls = []
     for name in BRIDGE_COMMANDS:
         if name == "reference":
             continue
         cmd = resolve_command(name)
-        # Check if the bridge executable/JAR exists
-        if name in ("swift", "kotlin"):
-            if os.path.exists(cmd.split()[-1]):
-                impls.append(name)
-        else:
+        if os.path.exists(cmd.split()[-1]):
             impls.append(name)
     return impls
 
@@ -164,10 +168,25 @@ def random_hex(n):
     return os.urandom(n).hex()
 
 
-def assert_hex_equal(actual, expected, msg=""):
-    """Assert two hex strings are equal (case-insensitive)."""
+def assert_hex_equal(actual, expected, msg="", allow_empty=False):
+    """Assert two hex strings are equal (case-insensitive).
+
+    By default this REFUSES the both-empty / both-None case: two absent
+    optional fields (e.g. a missing ``transport_id`` on a HEADER_1 packet)
+    would otherwise each coalesce to ``""`` and compare equal, so the
+    assertion would vacuously pass while asserting nothing (audit finding L6).
+    Pass ``allow_empty=True`` only when an empty value on both sides is the
+    intended, meaningful assertion.
+    """
     actual_lower = actual.lower() if actual else ""
     expected_lower = expected.lower() if expected else ""
+    if not allow_empty:
+        assert actual_lower or expected_lower, (
+            f"{msg}: refusing to compare two empty/None hex values "
+            f"(actual={actual!r}, expected={expected!r}); both sides are "
+            f"absent so this comparison would vacuously pass. Pass "
+            f"allow_empty=True if an empty value is the intended assertion."
+        )
     assert actual_lower == expected_lower, (
         f"{msg}: expected {expected_lower}, got {actual_lower}"
     )

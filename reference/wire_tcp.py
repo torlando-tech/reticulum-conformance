@@ -834,12 +834,23 @@ def cmd_wire_announce(params):
     Each announce uses a newly-generated Identity (separate from the
     Transport identity). That's the common pattern in production apps
     and avoids conflating the announcer with the interface operator.
+
+    enable_ratchets (bool, default False): enable per-destination ratchets
+    (Destination.enable_ratchets, Destination.py:466-489) BEFORE announcing,
+    so the announce carries the latest ratchet public key (context flag set,
+    Destination.py:284-287/:310-311) and the destination grows a real ratchet
+    store. This is the "A enables ratchets + announces" precondition for the
+    destination-level ratchet gaps (latest_ratchet_id / rotation-interval /
+    retained-cap / file-roundtrip). A unique ratchet file is created under the
+    instance config dir; the destination object (with its live ratchet state)
+    is reachable by hash via the wire_*_ratchet* commands below.
     """
     RNS = _get_rns()
     handle = params["handle"]
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
     app_data_hex = params.get("app_data") or ""
+    enable_ratchets = bool(params.get("enable_ratchets", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -855,16 +866,29 @@ def cmd_wire_announce(params):
         *aspects,
     )
 
+    ratchets_enabled = False
+    if enable_ratchets:
+        ratchets_path = os.path.join(
+            inst.get("config_dir") or tempfile.gettempdir(),
+            f"ratchets_{destination.hash.hex()}_{secrets.token_hex(4)}",
+        )
+        ratchets_enabled = bool(destination.enable_ratchets(ratchets_path))
+
     app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
     destination.announce(app_data=app_data)
     # Keep a reference so the destination/identity aren't GC'd before the
     # TX loop picks up the announce packet.
     inst["destinations"].append((identity, destination))
 
-    return {
+    response = {
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
     }
+    if enable_ratchets:
+        response["ratchets_enabled"] = ratchets_enabled
+        response["current_ratchet_id"] = _current_ratchet_id(destination)
+        response["ratchet_count"] = len(destination.ratchets) if destination.ratchets is not None else 0
+    return response
 
 
 def cmd_wire_poll_path(params):
@@ -902,18 +926,26 @@ def cmd_wire_identity_recall(params):
     Delegates to real RNS.Identity.recall — the same static method apps
     (Columba's NomadNet browser, Sideband's conversation lookup, LXMF's
     LXMessage source/destination resolution) call after observing an
-    announce. Returns the recalled identity's public_key (and hash) when
-    found, or {found: False} when the destination hash is unknown to this
-    instance (no announce received).
+    announce. Returns the recalled identity's public_key, hash, and the
+    last-heard app_data (Identity.py:138/:149/:161-174) when found, or
+    {found: False} when the hash is unknown to this instance (no announce
+    received) — which is also the recall_app_data(unknown) -> None case.
+
+    from_identity_hash (bool, default False): when True, `destination_hash`
+    is interpreted as an IDENTITY hash and RNS.Identity.recall searches
+    known_destinations by identity hash instead (Identity.py:129-141). The
+    recalled identity's app_data is surfaced in both modes.
 
     Optionally polls Transport.has_path first, so the test can express
     "wait until the announce has been received, then recall." Without the
-    poll the caller would have to sleep on raw timing.
+    poll the caller would have to sleep on raw timing. The path poll is
+    skipped for from_identity_hash (has_path keys on destination hashes).
     """
     RNS = _get_rns()
     handle = params["handle"]
     target_hash = bytes.fromhex(params["destination_hash"])
     timeout_ms = int(params.get("timeout_ms", 0))
+    from_identity_hash = bool(params.get("from_identity_hash", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -923,7 +955,7 @@ def cmd_wire_identity_recall(params):
     deadline = time.time() + (timeout_ms / 1000.0)
     identity = None
     while True:
-        identity = RNS.Identity.recall(target_hash)
+        identity = RNS.Identity.recall(target_hash, from_identity_hash=from_identity_hash)
         if identity is not None:
             break
         if time.time() >= deadline:
@@ -931,11 +963,16 @@ def cmd_wire_identity_recall(params):
         time.sleep(0.05)
 
     if identity is None:
-        return {"found": False}
+        return {"found": False, "app_data": None}
+    # identity.app_data is the last-heard app_data RNS.Identity.recall copies
+    # off the known_destinations entry (Identity.py:138/:149/:156); it equals
+    # RNS.Identity.recall_app_data(destination_hash) for the dest-hash path.
+    app_data = getattr(identity, "app_data", None)
     return {
         "found": True,
         "public_key": identity.get_public_key().hex(),
         "hash": identity.hash.hex(),
+        "app_data": app_data.hex() if isinstance(app_data, (bytes, bytearray)) else None,
     }
 
 
@@ -1852,11 +1889,13 @@ def cmd_wire_register_request_handler(params):
     machinery — we just plug in a generator that returns the test-supplied
     response and records the invocation for later assertion.
 
-    Optional auth policy: pass `allow` as "all" (default) or "list" plus
-    `allowed_identity_hashes` (list of hex strings). RNS rejects requests
-    from un-listed identities before the generator runs — the invocation
-    log will not record those, which is exactly what the ALLOW_LIST
-    negative-control test asserts.
+    Optional auth policy: pass `allow` as "all" (default), "list" plus
+    `allowed_identity_hashes` (list of hex strings), or "none". RNS rejects
+    requests from un-listed identities (ALLOW_LIST) or every request
+    (ALLOW_NONE) before the generator runs (Link.py:868-873) — the invocation
+    log will not record those, which is exactly what the ALLOW_LIST /
+    ALLOW_NONE negative-control tests assert (the requester's RequestReceipt
+    never reaches READY).
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -1884,8 +1923,11 @@ def cmd_wire_register_request_handler(params):
     elif allow_param == "list":
         allow = RNS.Destination.ALLOW_LIST
         allowed_list = [bytes.fromhex(h) for h in allowed_list_hex]
+    elif allow_param == "none":
+        allow = RNS.Destination.ALLOW_NONE
+        allowed_list = None
     else:
-        raise ValueError(f"unsupported allow: {allow_param!r} (use 'all' or 'list')")
+        raise ValueError(f"unsupported allow: {allow_param!r} (use 'all', 'list' or 'none')")
 
     key = (handle, dest_hash, path)
     _request_handler_responses[key] = response
@@ -3708,6 +3750,689 @@ def cmd_wire_ifac_compute(params):
     }
 
 
+# ---------------------------------------------------------------------------
+# Destination-level ratchets (latest_ratchet_id / rotation-interval gating /
+# retained-cap / file persistence / Identity ratchet expiry)
+#
+# All drive the REAL RNS.Destination / RNS.Identity ratchet machinery on a
+# ratchet-enabled SINGLE destination (created via wire_announce
+# enable_ratchets=True). Timestamps are manipulated deterministically — no
+# real sleeps — to make rotation-interval and expiry gating observable.
+# ---------------------------------------------------------------------------
+
+def _ratchet_id_hex(RNS, private_bytes):
+    """ratchet_id (Identity.py:410-411) of a ratchet PRIVATE key, as hex."""
+    pub = RNS.Identity._ratchet_public_bytes(private_bytes)
+    return RNS.Identity._get_ratchet_id(pub).hex()
+
+
+def _current_ratchet_id(destination):
+    """Hex ratchet_id of the newest (index 0) ratchet, or None."""
+    from bridge_server import _get_full_rns
+    RNS = _get_full_rns()
+    if not getattr(destination, "ratchets", None):
+        return None
+    return _ratchet_id_hex(RNS, destination.ratchets[0])
+
+
+def _previous_ratchet_id(destination):
+    """Hex ratchet_id of the second-newest (index 1) ratchet, or None."""
+    from bridge_server import _get_full_rns
+    RNS = _get_full_rns()
+    rs = getattr(destination, "ratchets", None)
+    if not rs or len(rs) < 2:
+        return None
+    return _ratchet_id_hex(RNS, rs[1])
+
+
+def _ratchet_dest_or_raise(inst, dest_hash, handle):
+    """Locate a ratchet-ENABLED SINGLE destination by hash, or raise.
+
+    The destination must have been created with wire_announce
+    enable_ratchets=True (so destination.ratchets is a list, not None).
+    """
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on "
+            f"handle {handle}; call wire_announce(enable_ratchets=True) first."
+        )
+    if getattr(destination, "ratchets", None) is None:
+        raise ValueError(
+            f"Destination {dest_hash.hex()} does not have ratchets enabled; "
+            f"call wire_announce(enable_ratchets=True)."
+        )
+    return destination
+
+
+def _ratchet_snapshot(destination):
+    """Read-only snapshot of a ratchet-enabled destination's ratchet state."""
+    rs = getattr(destination, "ratchets", None)
+    latest = getattr(destination, "latest_ratchet_id", None)
+    return {
+        "ratchet_count": len(rs) if rs is not None else 0,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "previous_ratchet_id": _previous_ratchet_id(destination),
+        "ratchet_interval": int(destination.ratchet_interval),
+        "retained_ratchets": int(destination.retained_ratchets),
+        "latest_ratchet_id": latest.hex() if isinstance(latest, (bytes, bytearray)) else None,
+        "latest_ratchet_time": destination.latest_ratchet_time,
+    }
+
+
+def cmd_wire_read_ratchets(params):
+    """Read the current ratchet state of a ratchet-enabled destination.
+
+    Returns {ratchet_count, current_ratchet_id, previous_ratchet_id,
+    ratchet_interval, retained_ratchets, latest_ratchet_id,
+    latest_ratchet_time}. The current/previous ids + count are the
+    observables for the rotation-interval gating test (Destination.py:227-241).
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    return _ratchet_snapshot(destination)
+
+
+def cmd_wire_set_ratchet_interval(params):
+    """Set a destination's minimum ratchet-rotation interval in seconds
+    (real RNS.Destination.set_ratchet_interval, Destination.py:519-531).
+
+    Returns {ok, ratchet_interval}. `ok` is False for a non-positive / non-int
+    value (RNS rejects it and leaves the interval unchanged).
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    seconds = params["seconds"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    # Pass int (RNS requires isinstance int); a float arg is coerced so the
+    # command is forgiving, but a non-positive value is forwarded as-is so the
+    # rejection (returns False) stays observable.
+    arg = seconds if not isinstance(seconds, bool) and isinstance(seconds, int) else int(seconds)
+    ok = bool(destination.set_ratchet_interval(arg))
+    return {"ok": ok, "ratchet_interval": int(destination.ratchet_interval)}
+
+
+def cmd_wire_rotate_ratchet(params):
+    """Trigger a ratchet rotation and observe the rotation-INTERVAL gate
+    (Destination.py:227-241) WITHOUT a real wait.
+
+    rotate_ratchets() only inserts a new ratchet when
+    now > latest_ratchet_time + ratchet_interval. Pass
+    last_rotation_ago_s to deterministically backdate latest_ratchet_time
+    (so the gate either opens or stays shut): a value < ratchet_interval
+    leaves the count unchanged (gated); a value > ratchet_interval inserts a
+    new newest ratchet (the prior current becomes previous).
+
+    Returns {rotated, before_count, after_count, before_current_id,
+    current_ratchet_id, previous_ratchet_id, ratchet_interval,
+    latest_ratchet_time}. `rotated` is after_count > before_count.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    last_rotation_ago_s = params.get("last_rotation_ago_s")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    if last_rotation_ago_s is not None:
+        destination.latest_ratchet_time = time.time() - float(last_rotation_ago_s)
+
+    before_count = len(destination.ratchets)
+    before_current = _current_ratchet_id(destination)
+    destination.rotate_ratchets()
+    after_count = len(destination.ratchets)
+    return {
+        "rotated": after_count > before_count,
+        "before_count": before_count,
+        "after_count": after_count,
+        "before_current_id": before_current,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "previous_ratchet_id": _previous_ratchet_id(destination),
+        "ratchet_interval": int(destination.ratchet_interval),
+        "latest_ratchet_time": destination.latest_ratchet_time,
+    }
+
+
+def cmd_wire_set_retained_ratchets(params):
+    """Set the retained-ratchets cap and observe RATCHET_COUNT truncation
+    (real RNS.Destination.set_retained_ratchets, Destination.py:504-517).
+
+    set_retained_ratchets(n) sets retained_ratchets and runs _clean_ratchets
+    (Destination.py:205-208), which truncates the list to Destination.
+    RATCHET_COUNT (512) when len exceeds the retained cap. To make the cap
+    observable cheaply, pass pad_to=N to first inflate the ratchets list with
+    N real freshly-generated ratchets (RNS.Identity._generate_ratchet) before
+    applying the cap.
+
+    Returns {ok, retained_ratchets, ratchet_count, ratchet_count_cap}.
+    `ok` is False for a non-positive / non-int n (RNS rejects it).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    n = params["n"]
+    pad_to = params.get("pad_to")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    if pad_to is not None:
+        pad_to = int(pad_to)
+        while len(destination.ratchets) < pad_to:
+            destination.ratchets.append(RNS.Identity._generate_ratchet())
+
+    arg = n if not isinstance(n, bool) and isinstance(n, int) else int(n)
+    ok = bool(destination.set_retained_ratchets(arg))
+    return {
+        "ok": ok,
+        "retained_ratchets": int(destination.retained_ratchets),
+        "ratchet_count": len(destination.ratchets),
+        "ratchet_count_cap": int(RNS.Destination.RATCHET_COUNT),
+    }
+
+
+def cmd_wire_ratchet_file_roundtrip(params):
+    """Persist + reload a destination's ratchet store and confirm the signed
+    on-disk store round-trips (Destination.py:210-225 _persist_ratchets /
+    :426-464 _reload_ratchets).
+
+    Drives a fresh Destination._persist_ratchets (which writes the signed
+    on-disk blob), clears the in-memory ratchet list, then reloads via
+    Destination._reload_ratchets. _reload_ratchets validates the embedded
+    signature against the destination identity and only repopulates
+    destination.ratchets when it verifies (raising otherwise, :432-437/:450-458).
+    A successful reload that reproduces the ratchet list byte-exact therefore
+    proves the persisted store carried a valid signature over the well-formed
+    format -- the bridge does NOT re-implement or hand-parse the on-disk format;
+    the validation is RNS's own.
+
+    Returns {ratchets_path_set, reload_ok, ratchet_count_before,
+    ratchet_count_after, roundtrip_match, ratchet_ids}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    if not destination.ratchets_path:
+        raise ValueError(
+            f"Destination {dest_hash.hex()} has no ratchets_path; ratchets must "
+            f"be enabled with a file path (wire_announce enable_ratchets=True)."
+        )
+
+    def _ratchet_ids(ratchets):
+        return [_ratchet_id_hex(RNS, r) for r in ratchets]
+
+    before_ratchets = list(destination.ratchets)
+    ratchet_count_before = len(before_ratchets)
+    ids_before = _ratchet_ids(before_ratchets)
+    ratchets_path = destination.ratchets_path
+
+    # Force a fresh signed write to disk.
+    destination._persist_ratchets()
+
+    # Reload from disk into a clean in-memory list. _reload_ratchets validates
+    # the embedded signature against the destination identity and only sets
+    # destination.ratchets when it verifies; reload_ok therefore reflects that
+    # the persisted signature was valid and the format well-formed (an invalid
+    # signature or malformed blob makes RNS raise here).
+    destination.ratchets = None
+    reload_ok = True
+    try:
+        destination._reload_ratchets(ratchets_path)
+    except Exception:
+        reload_ok = False
+    after_ratchets = list(destination.ratchets) if destination.ratchets is not None else []
+    ratchet_count_after = len(after_ratchets)
+    ids_after = _ratchet_ids(after_ratchets)
+
+    return {
+        "ratchets_path_set": True,
+        "reload_ok": reload_ok,
+        "ratchet_count_before": ratchet_count_before,
+        "ratchet_count_after": ratchet_count_after,
+        "roundtrip_match": ids_before == ids_after and ratchet_count_before == ratchet_count_after,
+        "ratchet_ids": ids_after,
+    }
+
+
+def cmd_wire_destination_latest_ratchet_id(params):
+    """Drive a real Destination.encrypt + Destination.decrypt round-trip on a
+    ratchet-enabled SINGLE destination and expose latest_ratchet_id
+    (Destination.py:595-643).
+
+    encrypt() selects the current ratchet via RNS.Identity.get_ratchet and
+    sets destination.latest_ratchet_id to that ratchet's id (Destination.py:
+    596-599). decrypt() re-derives it via ratchet_id_receiver=self
+    (Identity.py:889-890). Both should equal the current ratchet id — the
+    discriminating observable that the SINGLE auto-ratchet path actually
+    tracked a ratchet (not None) for an app-level message.
+
+    Returns {decrypted, plaintext, latest_ratchet_id, encrypt_ratchet_id,
+    current_ratchet_id, match, ratchet_count}.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    probe = bytes.fromhex(params.get("data", "")) or b"ratchet-probe"
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    ciphertext = destination.encrypt(probe)
+    enc_id = getattr(destination, "latest_ratchet_id", None)
+    plaintext = destination.decrypt(ciphertext)
+    dec_id = getattr(destination, "latest_ratchet_id", None)
+    decrypted = plaintext == probe
+    return {
+        "decrypted": bool(decrypted),
+        "plaintext": plaintext.hex() if isinstance(plaintext, (bytes, bytearray)) else None,
+        "latest_ratchet_id": dec_id.hex() if isinstance(dec_id, (bytes, bytearray)) else None,
+        "encrypt_ratchet_id": enc_id.hex() if isinstance(enc_id, (bytes, bytearray)) else None,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "match": bool(
+            isinstance(enc_id, (bytes, bytearray))
+            and isinstance(dec_id, (bytes, bytearray))
+            and enc_id == dec_id
+        ),
+        "ratchet_count": len(destination.ratchets) if destination.ratchets is not None else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single-packet PROOF emission (implicit vs explicit), PLAIN no-op crypto,
+# request-handler deregister, known-public-key-mismatch rejection, and the
+# two deferred Link edges (forged LINKCLOSE, identify on a PENDING link).
+# ---------------------------------------------------------------------------
+
+def cmd_wire_send_packet_with_proof_request(params):
+    """Send a single SINGLE-destination DATA packet (tracked PacketReceipt)
+    and capture the PROOF the receiver returns (Destination.py:359-368,
+    Identity.py:959-970, Transport.py:2155-2165).
+
+    When the receiver's destination has proof_strategy PROVE_ALL/PROVE_APP it
+    emits a PROOF; RNS validates it against the originating receipt using the
+    receiver's public key (Packet.py:498-537), setting receipt.proved and
+    stashing receipt.proof_packet. This command waits for that, then surfaces
+    the proof bytes and whether RNS used an IMPLICIT (signature only,
+    IMPL_LENGTH) or EXPLICIT (packet_hash+signature, EXPL_LENGTH) proof per
+    RNS.Reticulum.should_use_implicit_proof().
+
+    Returns {sent, receipt_id, hops, delivered, proved, implicit_proof_config,
+    proof_data, proof_len, proof_is_implicit, proof_is_explicit,
+    impl_length, expl_length}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data", ""))
+    timeout_ms = int(params.get("timeout_ms", 10000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    packet = RNS.Packet(out_destination, payload, create_receipt=True)
+    receipt = packet.send()
+    if receipt is False:
+        return {"sent": False, "receipt_id": None, "hops": None, "delivered": False}
+
+    hops = int(RNS.Transport.hops_to(destination_hash))
+    inst["destinations"].append((identity, out_destination))
+
+    DELIVERED = RNS.PacketReceipt.DELIVERED
+    FAILED = RNS.PacketReceipt.FAILED
+    CULLED = RNS.PacketReceipt.CULLED
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        st = receipt.get_status()
+        if st in (DELIVERED, FAILED, CULLED):
+            break
+        time.sleep(0.05)
+
+    receipt_id = secrets.token_hex(8)
+    inst.setdefault("receipts", {})[receipt_id] = receipt
+
+    proof_packet = getattr(receipt, "proof_packet", None)
+    proof_data = getattr(proof_packet, "data", None) if proof_packet is not None else None
+    proof_len = len(proof_data) if isinstance(proof_data, (bytes, bytearray)) else None
+    impl_len = int(RNS.PacketReceipt.IMPL_LENGTH)
+    expl_len = int(RNS.PacketReceipt.EXPL_LENGTH)
+    return {
+        "sent": True,
+        "receipt_id": receipt_id,
+        "hops": hops,
+        "delivered": receipt.get_status() == DELIVERED,
+        "proved": bool(getattr(receipt, "proved", False)),
+        "implicit_proof_config": bool(RNS.Reticulum.should_use_implicit_proof()),
+        "proof_data": proof_data.hex() if isinstance(proof_data, (bytes, bytearray)) else None,
+        "proof_len": proof_len,
+        "proof_is_implicit": proof_len == impl_len if proof_len is not None else None,
+        "proof_is_explicit": proof_len == expl_len if proof_len is not None else None,
+        "impl_length": impl_len,
+        "expl_length": expl_len,
+    }
+
+
+def cmd_wire_deregister_request_handler(params):
+    """Deregister a request handler by path (real RNS.Destination.
+    deregister_request_handler, Destination.py:389-401).
+
+    Returns {deregistered} — True if a handler for the path existed and was
+    removed, False otherwise. After this, a request to the same path is no
+    longer answered (the requester's RequestReceipt never reaches READY),
+    which is the discriminating control versus a still-registered handler.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    path = params["path"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on handle {handle}."
+        )
+    deregistered = bool(destination.deregister_request_handler(path))
+    # Drop the local response mapping so a later re-register starts clean; the
+    # invocation log is left intact so prior-call assertions still work.
+    _request_handler_responses.pop((handle, dest_hash, path), None)
+    return {"deregistered": deregistered}
+
+
+def _plain_destination(RNS, inst, app_name, aspects):
+    """Get-or-create a cached PLAIN IN destination on this instance.
+
+    A PLAIN destination holds no keys; encrypt/decrypt are identity no-ops
+    (Destination.py:592-593/:618-619). Cached per (app_name, aspects) so
+    repeated calls don't churn Transport.destinations.
+    """
+    key = (app_name, tuple(aspects))
+    cache = inst.setdefault("plain_dests", {})
+    dest = cache.get(key)
+    if dest is None:
+        dest = RNS.Destination(
+            None, RNS.Destination.IN, RNS.Destination.PLAIN, app_name, *aspects,
+        )
+        cache[key] = dest
+        inst["destinations"].append((None, dest))
+    return dest
+
+
+def cmd_wire_plain_encrypt(params):
+    """Encrypt via a PLAIN destination — a no-op passthrough that returns the
+    plaintext unchanged (Destination.py:592-593). Returns {ciphertext,
+    passthrough} where passthrough is ciphertext == plaintext.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    dest = _plain_destination(RNS, inst, app_name, aspects)
+    ciphertext = dest.encrypt(plaintext)
+    return {
+        "ciphertext": ciphertext.hex(),
+        "passthrough": ciphertext == plaintext,
+    }
+
+
+def cmd_wire_plain_decrypt(params):
+    """Decrypt via a PLAIN destination — a no-op passthrough that returns the
+    ciphertext unchanged (Destination.py:618-619). Returns {plaintext,
+    passthrough} where passthrough is plaintext == ciphertext.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    ciphertext = bytes.fromhex(params.get("ciphertext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    dest = _plain_destination(RNS, inst, app_name, aspects)
+    plaintext = dest.decrypt(ciphertext)
+    return {
+        "plaintext": plaintext.hex(),
+        "passthrough": plaintext == ciphertext,
+    }
+
+
+def cmd_wire_known_key_validate(params):
+    """Validate a real signed announce against a planted known public key for
+    the same destination hash, exercising the known-key-mismatch rejection
+    (Identity.py:583-589).
+
+    Builds a genuine SINGLE destination + signed announce, then seeds
+    Identity.known_destinations[dest_hash] with a chosen public key before
+    calling RNS.Identity.validate_announce:
+      plant='mismatch' -> a DIFFERENT key is stored: the announce's valid key
+        != stored key, so validate_announce REJECTS (returns False).
+      plant='match'    -> the announce's own key is stored: accepted (True).
+      plant='none'     -> no prior entry: accepted (True).
+    The same announce flips accept/reject solely on the stored key — that
+    divergence is the property.
+
+    Returns {validated, destination_hash, public_key, planted_public_key, plant}.
+    """
+    RNS = _get_rns()
+    from RNS.vendor import umsgpack  # noqa: F401  (parity with RNS internals)
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", []) or []
+    plant = str(params.get("plant", "mismatch")).lower()
+    if plant not in ("mismatch", "match", "none"):
+        raise ValueError(f"plant must be 'mismatch', 'match' or 'none' (got {plant!r})")
+    app_data_hex = params.get("app_data") or ""
+    app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    real_pub = identity.get_public_key()
+    dest_hash = destination.hash
+
+    # Build a genuine signed announce and re-parse it as a received packet.
+    announce_packet = destination.announce(app_data=app_data, send=False)
+    announce_packet.pack()
+    rx = RNS.Packet(None, announce_packet.raw)
+    if not rx.unpack():
+        raise RuntimeError("could not unpack crafted announce packet")
+
+    planted = None
+    if plant == "match":
+        planted = real_pub
+    elif plant == "mismatch":
+        planted = RNS.Identity().get_public_key()  # a different, valid key
+
+    Identity = RNS.Identity
+    with Identity.known_destinations_lock:
+        Identity.known_destinations.pop(dest_hash, None)
+        if planted is not None:
+            # known_destinations entry layout: [packet_hash, received, public_key, app_data]
+            Identity.known_destinations[dest_hash] = [rx.get_hash(), time.time(), planted, app_data]
+
+    validated = bool(Identity.validate_announce(rx))
+    # Keep refs alive until validation finished.
+    inst["destinations"].append((identity, destination))
+    return {
+        "validated": validated,
+        "destination_hash": dest_hash.hex(),
+        "public_key": real_pub.hex(),
+        "planted_public_key": planted.hex() if planted is not None else None,
+        "plant": plant,
+    }
+
+
+def cmd_wire_send_forged_link_close(params):
+    """Inject a LINKCLOSE carrying a forged (wrong) link_id over an established
+    link and report whether it tore the link down (Link.py:710-722).
+
+    teardown_packet only closes the link when the decrypted payload equals the
+    link's own link_id. A forged id (forged_id != link_id) must be ignored —
+    the link stays ACTIVE. Passing the real link_id as forged_id is the
+    positive control (the link DOES close). The crafted packet is built and
+    encrypted to the real link, then fed through link.receive on the link's
+    own attached interface (so the unexpected-interface guard, Link.py:975,
+    does not pre-empt the teardown check).
+
+    Returns {torn_down, status_before, status_after, status_name_after,
+    forged_id, real_link_id}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    forged_id = bytes.fromhex(params["forged_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    status_before = getattr(link, "status", None)
+    # LINKCLOSE payloads ARE encrypted to the link (Packet.py:215-216), unlike
+    # KEEPALIVE; build + pack so link.decrypt(packet.data) yields forged_id.
+    out_packet = RNS.Packet(link, forged_id, context=RNS.Packet.LINKCLOSE)
+    out_packet.pack()
+    rx = RNS.Packet(None, out_packet.raw)
+    if not rx.unpack():
+        raise RuntimeError("could not unpack crafted LINKCLOSE packet")
+    rx.receiving_interface = link.attached_interface
+    link.receive(rx)
+
+    status_after = getattr(link, "status", None)
+    return {
+        "torn_down": status_after == RNS.Link.CLOSED,
+        "status_before": int(status_before) if status_before is not None else None,
+        "status_after": int(status_after) if status_after is not None else None,
+        "status_name_after": _LINK_STATUS_NAMES.get(status_after),
+        "forged_id": forged_id.hex(),
+        "real_link_id": link.link_id.hex(),
+    }
+
+
+def cmd_wire_link_identify_pending(params):
+    """Call RNS.Link.identify on a PENDING (pre-ACTIVE) link and assert it is a
+    no-op that does not crash (Link.py:459-475/:468).
+
+    identify only acts when self.initiator and self.status == Link.ACTIVE; on
+    a PENDING link it must silently do nothing (no LINKIDENTIFY packet emitted,
+    remote_identity unchanged). This builds an initiator Link to the recalled
+    destination, forces it to PENDING deterministically (so timing can't race
+    it to ACTIVE), wraps Packet.send to detect any LINKIDENTIFY emission, and
+    calls identify. The link is torn down afterward.
+
+    Returns {crashed, identify_packet_sent, status, status_name, initiator}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    private_key = bytes.fromhex(params["private_key"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    ident = RNS.Identity.from_bytes(private_key)
+    if ident is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+
+    link = RNS.Link(out_destination)
+    # Force PENDING so identify's ACTIVE-only guard is deterministically hit,
+    # regardless of any concurrent handshake progress.
+    link.status = RNS.Link.PENDING
+
+    captured = []
+    orig_send = RNS.Packet.send
+
+    def capturing_send(pkt_self, _orig=orig_send):
+        try:
+            if (getattr(pkt_self, "context", None) == RNS.Packet.LINKIDENTIFY
+                    and getattr(pkt_self, "destination", None) is link):
+                captured.append(True)
+        except Exception:
+            pass
+        return _orig(pkt_self)
+
+    crashed = False
+    RNS.Packet.send = capturing_send
+    try:
+        link.identify(ident)
+    except Exception:
+        crashed = True
+    finally:
+        RNS.Packet.send = orig_send
+
+    status_after = getattr(link, "status", None)
+    try:
+        link.teardown()
+    except Exception:
+        pass
+
+    return {
+        "crashed": crashed,
+        "identify_packet_sent": bool(captured),
+        "status": int(status_after) if status_after is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status_after),
+        "initiator": bool(getattr(link, "initiator", False)),
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -3726,7 +4451,9 @@ WIRE_COMMANDS = {
     "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
     "wire_identity_recall": cmd_wire_identity_recall,
     "wire_register_request_handler": cmd_wire_register_request_handler,
+    "wire_deregister_request_handler": cmd_wire_deregister_request_handler,
     "wire_link_identify": cmd_wire_link_identify,
+    "wire_link_identify_pending": cmd_wire_link_identify_pending,
     "wire_link_request": cmd_wire_link_request,
     "wire_link_request_large": cmd_wire_link_request_large,
     "wire_get_request_log": cmd_wire_get_request_log,
@@ -3773,6 +4500,23 @@ WIRE_COMMANDS = {
     "wire_ratchet_keypair": cmd_wire_ratchet_keypair,
     "wire_identity_encrypt": cmd_wire_identity_encrypt,
     "wire_identity_decrypt": cmd_wire_identity_decrypt,
+    # Destination-level ratchets (latest_ratchet_id / rotation-interval /
+    # retained-cap / file persistence)
+    "wire_read_ratchets": cmd_wire_read_ratchets,
+    "wire_set_ratchet_interval": cmd_wire_set_ratchet_interval,
+    "wire_rotate_ratchet": cmd_wire_rotate_ratchet,
+    "wire_set_retained_ratchets": cmd_wire_set_retained_ratchets,
+    "wire_ratchet_file_roundtrip": cmd_wire_ratchet_file_roundtrip,
+    "wire_destination_latest_ratchet_id": cmd_wire_destination_latest_ratchet_id,
+    # Single-packet PROOF emission (implicit vs explicit)
+    "wire_send_packet_with_proof_request": cmd_wire_send_packet_with_proof_request,
+    # PLAIN destination no-op encrypt/decrypt
+    "wire_plain_encrypt": cmd_wire_plain_encrypt,
+    "wire_plain_decrypt": cmd_wire_plain_decrypt,
+    # Known-public-key-mismatch rejection
+    "wire_known_key_validate": cmd_wire_known_key_validate,
+    # Deferred Link edges (forged LINKCLOSE / identify on PENDING link)
+    "wire_send_forged_link_close": cmd_wire_send_forged_link_close,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

@@ -428,22 +428,34 @@ class _WirePeer:
         response: bytes,
         allow: str = "all",
         allowed_identity_hashes: list | None = None,
+        strategy: str | None = None,
     ) -> None:
         """Register a fixed-response request handler on a listening
         destination — the bridge plugs in a generator that returns the
         given bytes when a request for `path` arrives.
 
-        `allow="list"` plus `allowed_identity_hashes=[<16-byte hash>, ...]`
-        gates the handler on the requester's identified Identity, mirroring
-        the LXMF lxmd SYNC_REQUEST_PATH authentication model.
+        `allow` (the request policy / strategy, Destination.register_request_handler,
+        Destination.py:370-401):
+          - "all"  -> RNS.Destination.ALLOW_ALL  (default).
+          - "list" -> RNS.Destination.ALLOW_LIST, gated on the requester's
+            identified Identity (`allowed_identity_hashes=[<16-byte hash>, ...]`),
+            mirroring the LXMF lxmd SYNC_REQUEST_PATH authentication model.
+          - "none" -> RNS.Destination.ALLOW_NONE: every request is refused, so a
+            Link.request for `path` gets no response (status FAILED). Register a
+            second ALLOW_ALL path as the positive control.
+
+        `strategy` is an explicit alias for `allow` (the contract names this
+        policy the request "strategy"); when given it overrides `allow`. Both
+        map to the wire command's `allow` parameter.
         """
         assert self.handle, "start_* must be called first"
+        effective_allow = strategy if strategy is not None else allow
         params = {
             "handle": self.handle,
             "destination_hash": destination_hash.hex(),
             "path": path,
             "response": response.hex(),
-            "allow": allow,
+            "allow": effective_allow,
         }
         if allowed_identity_hashes:
             params["allowed_identity_hashes"] = [
@@ -533,27 +545,50 @@ class _WirePeer:
         return list(resp.get("entries", []))
 
     def identity_recall(
-        self, destination_hash: bytes, timeout_ms: int = 5000,
+        self,
+        destination_hash: bytes,
+        timeout_ms: int = 5000,
+        from_identity_hash: bool = False,
     ) -> dict | None:
         """Look up the Identity associated with a destination hash.
 
-        Returns a dict {public_key, hash} when this peer has received
+        Returns a dict {public_key, hash, app_data} when this peer has received
         an announce for the destination, or None when unknown. Optional
         timeout polls Transport state — without it, the call returns
         immediately based on the current known_destinations table.
+
+        app_data (bytes | None): the last app_data heard for this destination
+        (RNS.Identity.recall_app_data, Identity.py:161-174). It is byte-exact
+        the app_data the announcer passed to announce(app_data=...); None when
+        the announce carried no app_data, and the whole call returns None for an
+        unknown hash (the negative control for recall_app_data).
+
+        from_identity_hash (bool, default False): when True, `destination_hash`
+        is interpreted as an IDENTITY hash and the lookup matches on the
+        truncated identity hash instead of the destination hash
+        (RNS.Identity.recall(..., from_identity_hash=True), Identity.py:129-141).
         """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_identity_recall",
-            handle=self.handle,
-            destination_hash=destination_hash.hex(),
-            timeout_ms=timeout_ms,
-        )
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "timeout_ms": timeout_ms,
+        }
+        if from_identity_hash:
+            params["from_identity_hash"] = True
+        resp = self.bridge.execute("wire_identity_recall", **params)
         if not resp.get("found"):
             return None
+        # app_data is hex when present; "" decodes to b"" (announce carried an
+        # empty app_data), absent/None stays None (no app_data heard).
+        app_data_hex = resp.get("app_data")
+        app_data = (
+            bytes.fromhex(app_data_hex) if app_data_hex is not None else None
+        )
         return {
             "public_key": bytes.fromhex(resp["public_key"]),
             "hash": bytes.fromhex(resp["hash"]),
+            "app_data": app_data,
         }
 
     def listen(
@@ -561,6 +596,7 @@ class _WirePeer:
         app_name: str,
         aspects: list,
         resource_strategy: str | None = None,
+        enable_ratchets: bool = False,
     ) -> bytes:
         """Register an IN destination that accepts incoming Links.
 
@@ -568,6 +604,14 @@ class _WirePeer:
         public_key are recorded on the peer (see `listening_identity`) so
         recall tests can assert the recalled key is byte-identical to the
         announced one (N-M3), not merely the right length.
+
+        enable_ratchets (bool, default False): register the destination with
+        ratchets enabled (Destination.enable_ratchets) so the destination-level
+        ratchet observables — destination_latest_ratchet_id, rotate_ratchet,
+        set_ratchet_interval, set_retained_ratchets, ratchet_file_roundtrip,
+        get_ratchet — operate on a ratchet-bearing destination
+        (CONFORMANCE_GAPS.md §4c). Depends on the [wire-cmds] wire_listen
+        handler honoring an `enable_ratchets` param; older bridges ignore it.
 
         resource_strategy ('all'|'none'|'app', default None -> bridge default
         of 'all'): how an inbound Link accepts incoming Resources
@@ -591,6 +635,8 @@ class _WirePeer:
         }
         if resource_strategy is not None:
             params["resource_strategy"] = str(resource_strategy)
+        if enable_ratchets:
+            params["enable_ratchets"] = True
         resp = self.bridge.execute("wire_listen", **params)
         dest_hash = bytes.fromhex(resp["destination_hash"])
         self.listen_identities[dest_hash] = {
@@ -1305,6 +1351,342 @@ class _WirePeer:
             return None
         return bytes.fromhex(resp["plaintext"])
 
+    # --- Request-handler deregistration (ALLOW_NONE control) --------------
+
+    def deregister_request_handler(self, destination_hash: bytes, path: str) -> bool:
+        """Remove a previously-registered request handler
+        (Destination.deregister_request_handler, Destination.py:389-401).
+
+        Returns True if a handler for `path` was present and removed, False if
+        there was none. The discriminating sequence: register_request_handler +
+        a SUCCESSFUL link_request for `path` (positive control), then
+        deregister_request_handler -> a subsequent link_request for the same
+        path gets no response.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_deregister_request_handler",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            path=path,
+        )
+        return bool(resp.get("deregistered"))
+
+    # --- Destination-level ratchets (real Destination.encrypt/decrypt) ----
+
+    def destination_latest_ratchet_id(self, destination_hash: bytes) -> bytes | None:
+        """Return a listening destination's latest_ratchet_id, or None.
+
+        Destination.encrypt/decrypt set latest_ratchet_id to the id of the
+        ratchet actually used (Destination.py:595-599/:621-643); it is None
+        until a ratcheted encrypt/decrypt has happened on the destination. The
+        destination must have been registered with ratchets enabled
+        (listen(enable_ratchets=True)) and must have processed a real encrypted
+        packet (e.g. an inbound link DATA / send_packet_with_proof_request).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_destination_latest_ratchet_id",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        rid = resp.get("ratchet_id")
+        return bytes.fromhex(rid) if rid else None
+
+    def set_ratchet_interval(
+        self,
+        destination_hash: bytes,
+        seconds: int,
+        last_rotation_age_s: float | None = None,
+    ) -> dict:
+        """Set a ratchet-enabled destination's rotation interval, optionally
+        back-dating its last-rotation timestamp (Destination.py:227-241).
+
+        Destination.rotate_ratchets only generates a new ratchet once
+        now > latest_ratchet_time + ratchet_interval. To make INTERVAL gating
+        observable WITHOUT a real wait, pass last_rotation_age_s to age
+        latest_ratchet_time that many seconds into the past:
+          last_rotation_age_s > seconds -> the next rotate_ratchet is eligible,
+          last_rotation_age_s < seconds -> it is gated (the negative control).
+        Returns the read-back state dict (ratchet_interval, latest_ratchet_time,
+        and whatever else the [wire-cmds] handler surfaces).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "seconds": int(seconds),
+        }
+        if last_rotation_age_s is not None:
+            params["last_rotation_age_s"] = float(last_rotation_age_s)
+        return self.bridge.execute("wire_set_ratchet_interval", **params)
+
+    def rotate_ratchet(self, destination_hash: bytes) -> dict:
+        """Attempt a ratchet rotation (Destination.rotate_ratchets,
+        Destination.py:227-241) and report the resulting ratchet state.
+
+        Returns {rotated, ratchet_id, previous_ratchet_id, ratchet_count}:
+          rotated             -> True iff a NEW ratchet was generated (the
+            interval gate was open); False iff the interval gated it.
+          ratchet_id          -> current (newest) ratchet id (bytes) or None.
+          previous_ratchet_id -> the id that was newest before this call (bytes)
+            or None — lets a rotation test assert the current id changed.
+          ratchet_count       -> len(destination.ratchets) after the attempt
+            (read it to assert the retained-ratchets cap, see
+            set_retained_ratchets).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_rotate_ratchet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+        def _id(key):
+            v = resp.get(key)
+            return bytes.fromhex(v) if v else None
+
+        count = resp.get("ratchet_count")
+        return {
+            "rotated": bool(resp.get("rotated", False)),
+            "ratchet_id": _id("ratchet_id"),
+            "previous_ratchet_id": _id("previous_ratchet_id"),
+            "ratchet_count": int(count) if count is not None else None,
+        }
+
+    def set_retained_ratchets(self, destination_hash: bytes, count: int) -> dict:
+        """Set how many past ratchets a destination retains, and read the count
+        back (Destination.set_retained_ratchets / RATCHET_COUNT cap,
+        Destination.py:504-517).
+
+        set_retained_ratchets(n) trims destination.ratchets to at most n entries
+        via _clean_ratchets. Returns {set, retained_ratchets, ratchet_count} so
+        a test can rotate more than n times and assert ratchet_count never
+        exceeds the cap.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_set_retained_ratchets",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            count=int(count),
+        )
+        retained = resp.get("retained_ratchets")
+        rc = resp.get("ratchet_count")
+        return {
+            "set": bool(resp.get("set", resp.get("ok", True))),
+            "retained_ratchets": int(retained) if retained is not None else None,
+            "ratchet_count": int(rc) if rc is not None else None,
+        }
+
+    def ratchet_file_roundtrip(self, destination_hash: bytes) -> dict:
+        """Persist + reload a destination's ratchet store via RNS's own
+        persist/reload (Destination._persist_ratchets/_reload_ratchets,
+        Destination.py:210-225/:426-464).
+
+        The handler drives Destination._persist_ratchets (signed on-disk write),
+        clears the in-memory list, then reloads via Destination._reload_ratchets
+        -- which validates the embedded signature and only repopulates the
+        ratchet list when it verifies (raising otherwise). Returns
+        {ratchets_path_set, reload_ok, ratchet_count_before, ratchet_count_after,
+        roundtrip_match, ratchet_ids}; reload_ok True (with roundtrip_match True)
+        means RNS accepted the just-persisted signed store and reproduced the
+        ratchet list byte-exact. The bridge does not re-parse the on-disk format.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_ratchet_file_roundtrip",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+    def get_ratchet(
+        self, destination_hash: bytes, age_received_s: float | None = None
+    ) -> bytes | None:
+        """Read Identity.get_ratchet(destination_hash); optionally age the
+        stored ratchet past RATCHET_EXPIRY first (Identity.py:499-522).
+
+        Identity.get_ratchet returns None for a stored ratchet whose `received`
+        timestamp is older than Identity.RATCHET_EXPIRY. Pass age_received_s to
+        back-date the persisted ratchet's `received` field that many seconds
+        into the past (deterministic, no real sleep):
+          age_received_s > RATCHET_EXPIRY -> returns None (expired),
+          a small / None age              -> returns the ratchet bytes (the
+            positive control).
+        Returns the ratchet key bytes, or None when expired/absent.
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+        }
+        if age_received_s is not None:
+            params["age_received_s"] = float(age_received_s)
+        resp = self.bridge.execute("wire_get_ratchet", **params)
+        r = resp.get("ratchet")
+        return bytes.fromhex(r) if r else None
+
+    # --- PROOF emission for a single (non-link) packet --------------------
+
+    def send_packet_with_proof_request(
+        self,
+        destination_hash: bytes,
+        data: bytes = b"",
+        app_name: str = "conformance",
+        aspects: list | None = None,
+        timeout_ms: int = 5000,
+    ) -> dict:
+        """Send a single SINGLE-destination DATA packet that requests a PROOF
+        and capture the returning proof (Destination.py:359-368,
+        Identity.py:959-970).
+
+        Per its proof strategy the receiver returns a PROOF; this captures it
+        and reports whether it validates against the receiver's public key and
+        whether it is the implicit or explicit form
+        (Destination.should_use_implicit_proof, Destination.py:359-368). Returns
+        {sent, proof (bytes|None), validates (bool), implicit (bool), delivered
+        (bool), receipt_id}. The destination identity must already be known via
+        a received announce.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_send_packet_with_proof_request",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            data=data.hex(),
+            app_name=app_name,
+            aspects=list(aspects if aspects is not None else ("wire",)),
+            timeout_ms=int(timeout_ms),
+        )
+        proof_hex = resp.get("proof")
+        return {
+            "sent": bool(resp.get("sent", False)),
+            "proof": bytes.fromhex(proof_hex) if proof_hex else None,
+            "validates": bool(resp.get("validates", False)),
+            "implicit": bool(resp.get("implicit", False)),
+            "delivered": bool(resp.get("delivered", False)),
+            "receipt_id": resp.get("receipt_id"),
+        }
+
+    # --- PLAIN destination no-op encrypt / decrypt ------------------------
+
+    def plain_encrypt(
+        self,
+        plaintext: bytes,
+        app_name: str = "conformance",
+        aspects: list | None = None,
+    ) -> bytes:
+        """PLAIN-destination encrypt: a no-op passthrough (Destination.py:592-593).
+
+        Destination.encrypt on a PLAIN-type destination returns the plaintext
+        unchanged. Returns the ciphertext bytes, which a conforming impl makes
+        byte-identical to the plaintext (pair with plain_decrypt; the property
+        is encrypt(pt) == pt and decrypt(ct) == ct, not merely a round-trip).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_plain_encrypt",
+            handle=self.handle,
+            plaintext=plaintext.hex(),
+            app_name=app_name,
+            aspects=list(aspects if aspects is not None else ("plain",)),
+        )
+        return bytes.fromhex(resp["ciphertext"])
+
+    def plain_decrypt(
+        self,
+        ciphertext: bytes,
+        app_name: str = "conformance",
+        aspects: list | None = None,
+    ) -> bytes:
+        """PLAIN-destination decrypt: a no-op passthrough (Destination.py:618-619).
+
+        Destination.decrypt on a PLAIN-type destination returns the ciphertext
+        unchanged. Returns the plaintext bytes, byte-identical to the input.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_plain_decrypt",
+            handle=self.handle,
+            ciphertext=ciphertext.hex(),
+            app_name=app_name,
+            aspects=list(aspects if aspects is not None else ("plain",)),
+        )
+        return bytes.fromhex(resp["plaintext"])
+
+    # --- Known-public-key mismatch rejection ------------------------------
+
+    def validate_with_known_key(
+        self,
+        known_public_key: bytes | None = None,
+        announce_public_key: bytes | None = None,
+    ) -> dict:
+        """Validate an announce whose public key differs from the one already
+        known for its destination hash, and report the verdict
+        (Identity.validate_announce known-key guard, Identity.py:583-589).
+
+        validate_announce rejects an otherwise-valid announce when the
+        destination hash is already bound to a DIFFERENT public key (the
+        anti-path-hijack / hash-collision guard). The [wire-cmds] handler
+        remembers a known public key for a destination hash, then validates an
+        announce carrying a different public key for the SAME hash. With both
+        args omitted the handler self-generates the two identities plus a
+        same-key positive control. Returns {matching_accepted, mismatched_accepted}:
+        a conforming impl yields matching_accepted=True (same-key re-announce
+        accepted) and mismatched_accepted=False (different key for a known hash
+        rejected).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {"handle": self.handle}
+        if known_public_key is not None:
+            params["known_public_key"] = known_public_key.hex()
+        if announce_public_key is not None:
+            params["announce_public_key"] = announce_public_key.hex()
+        return self.bridge.execute("wire_validate_with_known_key", **params)
+
+    # --- Link teardown forgery / identify-before-ACTIVE (deferred edges) --
+
+    def send_forged_link_close(self, link_id: bytes, forged_id: bytes) -> dict:
+        """Inject a LINKCLOSE over an established link whose embedded link_id is
+        WRONG, and report whether the link survived (Link.teardown_packet,
+        Link.py:710-722).
+
+        Link.teardown_packet only closes the link when the decrypted payload
+        equals the link's own link_id; a LINKCLOSE carrying `forged_id` (a
+        different 16-byte link id) must be ignored. `link_id` is the real
+        established link being attacked; `forged_id` is the bogus id embedded in
+        the forged close. Returns {sent, torn_down, status, status_name}: a
+        conforming impl reports torn_down=False (link still ACTIVE) for a
+        mismatched id. The positive control is a genuine link_teardown, which
+        DOES close the link.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_forged_link_close",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            forged_id=forged_id.hex(),
+        )
+
+    def link_identify_pending(self, link_id: bytes, private_key: bytes) -> dict:
+        """Call Link.identify on a PENDING (pre-ACTIVE) link; assert it no-ops
+        without crashing (Link.identify guard, Link.py:459-475/:468).
+
+        Link.identify only acts when initiator and status == ACTIVE; on a
+        PENDING link it must be a silent no-op — no LINKIDENTIFY packet emitted,
+        no exception. Returns {identified, status, status_name, sent}: a
+        conforming impl reports identified=False / sent=False with the link
+        still PENDING and no error. Contrast with link_identify on an ACTIVE
+        link, which DOES emit the identification.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_identify_pending",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            private_key=private_key.hex(),
+        )
+
     # --- IFAC issue-29 golden vector --------------------------------------
 
     def ifac_compute(self, packet_data: bytes, ifac_size: int | None = None) -> dict:
@@ -1519,6 +1901,9 @@ def wire_link_setup(wire_peers):
         the audit calls for is `resource_strategy='app'`.
       proof_strategy ('all'|'app'|'none'|None): set the listening destination's
         packet-proof strategy before the link opens (for send_link_data tests).
+      enable_ratchets (bool): register the listening destination with ratchets
+        enabled (the destination-level ratchet gaps, CONFORMANCE_GAPS.md §4c).
+        See the wire_ratcheted_link fixture, which defaults this True.
       link_timeout_ms / path_timeout_ms / settle_sec: timing knobs.
 
     Teardown is handled by the underlying wire_peers finalizer.
@@ -1532,6 +1917,7 @@ def wire_link_setup(wire_peers):
         fixed_mtu: int | None = None,
         resource_strategy: str | None = None,
         proof_strategy: str | None = None,
+        enable_ratchets: bool = False,
         link_timeout_ms: int = 15000,
         path_timeout_ms: int = 10000,
         settle_sec: float = 1.0,
@@ -1550,7 +1936,10 @@ def wire_link_setup(wire_peers):
         if settle_sec:
             time.sleep(settle_sec)
         dest_hash = server.listen(
-            app_name=app_name, aspects=aspects, resource_strategy=resource_strategy
+            app_name=app_name,
+            aspects=aspects,
+            resource_strategy=resource_strategy,
+            enable_ratchets=enable_ratchets,
         )
         if proof_strategy is not None:
             server.set_proof_strategy(dest_hash, proof_strategy)
@@ -1565,6 +1954,64 @@ def wire_link_setup(wire_peers):
             timeout_ms=link_timeout_ms,
         )
         return server, client, dest_hash, link_id
+
+    return _setup
+
+
+@pytest.fixture
+def wire_ratcheted_link(wire_link_setup):
+    """Factory: a server/client TCP link whose SERVER destination has ratchets
+    enabled, for the destination-level ratchet gaps (CONFORMANCE_GAPS.md §4c).
+
+    Yields setup(**opts) -> (server, client, dest_hash, link_id) — identical to
+    wire_link_setup but with enable_ratchets defaulted True on the listening
+    destination, so destination_latest_ratchet_id / rotate_ratchet /
+    set_ratchet_interval / set_retained_ratchets / get_ratchet /
+    ratchet_file_roundtrip all operate on the (ratchet-bearing) `dest_hash`.
+
+    Note: latest_ratchet_id is None until the server destination performs a
+    real Destination.encrypt/decrypt. After the link is up, drive one by sending
+    the server an encrypted packet — e.g. client.send_packet_with_proof_request(
+    dest_hash, ...) or a link DATA the server decrypts — THEN read
+    server.destination_latest_ratchet_id(dest_hash).
+
+    Teardown is handled by the underlying wire_peers finalizer.
+    """
+
+    def _setup(**opts):
+        opts.setdefault("enable_ratchets", True)
+        return wire_link_setup(**opts)
+
+    return _setup
+
+
+@pytest.fixture
+def wire_allow_none_link(wire_link_setup):
+    """Factory: a server/client TCP link with an ALLOW_NONE request handler
+    registered, plus a positive-control ALLOW_ALL handler (Destination.py:
+    370-401).
+
+    Yields setup(**opts) -> (server, client, dest_hash, link_id, none_path,
+    all_path, response). The server registers two handlers on `dest_hash`:
+      none_path ('deny')  -> allow="none" (ALLOW_NONE): a Link.request must get
+        no response (status FAILED) — the negative control.
+      all_path  ('allow') -> allow="all": a Link.request returns `response` —
+        the positive control proving the link itself works.
+    A test asserts the deny path fails while the allow path succeeds, and (with
+    deregister_request_handler) that removing the allow handler then fails it
+    too. opts are forwarded to wire_link_setup (e.g. settle_sec, timeouts).
+
+    Teardown is handled by the underlying wire_peers finalizer.
+    """
+
+    def _setup(**opts):
+        server, client, dest_hash, link_id = wire_link_setup(**opts)
+        response = b"allow-none-control"
+        none_path = "deny"
+        all_path = "allow"
+        server.register_request_handler(dest_hash, none_path, response, allow="none")
+        server.register_request_handler(dest_hash, all_path, response, allow="all")
+        return server, client, dest_hash, link_id, none_path, all_path, response
 
     return _setup
 

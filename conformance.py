@@ -21,7 +21,20 @@ class ConformanceCase:
 
     Attributes:
         commands: bridge protocol verbs the test exercises (e.g. ("sha256",)).
-                  Rendered in the "Commands Used" column of TESTS.md.
+                  Rendered in the "Commands Used" column of TESTS.md, so the
+                  list must be COMPLETE: it must be a superset of every bridge
+                  command the test actually drives, INCLUDING setup/teardown
+                  plumbing reached through fixtures' wrapper methods or helper
+                  functions (e.g. a test that calls a `_setup_topology()`
+                  helper which does `peer.poll_path(...)` must list
+                  ``poll_path``). The drift guard
+                  (tools/check_conformance_decorated.py) statically verifies
+                  this superset relation and fails CI on any omission (N-M6).
+
+                  Naming convention: declare the bare command alias without
+                  the ``wire_`` / ``behavioral_`` namespace prefix — i.e. the
+                  same name the fixture wrapper method uses
+                  (``poll_path``, not ``wire_poll_path``).
         verifies: a single English sentence describing what the test asserts,
                   rendered in the "What It Verifies" column.
     """
@@ -32,6 +45,11 @@ class ConformanceCase:
 
 def conformance_case(*, commands, verifies):
     """Attach conformance metadata to a test function.
+
+    `commands` must be a SUPERSET of the bridge commands the test actually
+    invokes (see ConformanceCase.commands); the drift guard enforces this.
+    This decorator only validates shape at import time — the superset relation
+    is checked statically by tools/check_conformance_decorated.py.
 
     Example:
         @conformance_case(

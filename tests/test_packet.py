@@ -9,8 +9,13 @@ another impl can parse, which is exactly what these tests exercise.
 HEADER_2 (transport-relayed) DATA packets cannot be packed standalone (RNS
 only produces them inside Transport while relaying); their wire format is
 covered by the live multi-hop tests in tests/wire/test_link_multihop.py.
+HEADER_2 ANNOUNCE packets, however, ARE buildable standalone (RNS.Packet.pack
+assembles a HEADER_2 header for announces) and are exercised directly here.
 """
 
+import pytest
+
+from bridge_client import BridgeError
 from conftest import random_hex, assert_hex_equal
 from conformance import conformance_case
 
@@ -27,13 +32,25 @@ _DTYPE_PLAIN = 2
 _PTYPE_DATA = 0
 _PTYPE_ANNOUNCE = 1
 
+# Header types — the RNS.Packet constants (HEADER_1 == 0, HEADER_2 == 1), which
+# are also what RNS.Packet.unpack reports back in the `header_type` field.
+_HEADER_1 = 0
+_HEADER_2 = 1
+
+# RNS.Reticulum.MTU (bytes) — the per-packet wire-size ceiling Packet.pack
+# enforces. Asserted in the oversize-rejection test below.
+_MTU = 500
+
 
 @conformance_case(
     commands=["packet_build", "packet_unpack"],
-    verifies="RNS packet wire-format cross-impl interop on a PLAIN destination: a packet built by either impl unpacks on the other to byte-identical hops/destination_hash/context/data, and the flags byte itself agrees — PLAIN carries the payload in the clear so the full wire bytes round-trip exactly",
+    verifies="RNS packet wire-format cross-impl interop on a PLAIN destination: a packet built by either impl unpacks on the other to byte-identical hops/destination_hash/context/data, the flags byte equals its first-principles value (PLAIN<<2 | DATA), and the other impl decodes that byte into the same five header fields the builder intended — PLAIN carries the payload in the clear so the full wire bytes round-trip exactly",
 )
 def test_packet_plain_wire_format_roundtrip(sut, reference):
     payload = random_hex(32)
+    # First-principles flags byte for a HEADER_1 / BROADCAST / PLAIN / DATA
+    # packet with context_flag=0: only the destination_type bits are set.
+    expected_flags = (_DTYPE_PLAIN << 2) | _PTYPE_DATA
     for builder, unpacker, label in (
         (reference, sut, "ref->sut"),
         (sut, reference, "sut->ref"),
@@ -45,10 +62,25 @@ def test_packet_plain_wire_format_roundtrip(sut, reference):
         )
         parsed = unpacker.execute("packet_unpack", raw=built["raw"])
         assert parsed["unpacked"] is True, f"{label}: unpack rejected"
-        assert parsed["flags"] == built["flags"], f"{label}: flags mismatch"
+        # L7: the prior `parsed["flags"] == built["flags"]` compared raw[0] to
+        # itself (both impls just read byte 0 of the IDENTICAL wire bytes), so
+        # it asserted nothing. Pin the builder's flags byte to its known value,
+        # then assert the OTHER impl decodes raw[0] into the same five header
+        # fields the builder did — the real cross-impl flag-decode interop check.
+        assert built["flags"] == expected_flags, (
+            f"{label}: builder flags 0x{built['flags']:02x} != "
+            f"0x{expected_flags:02x}"
+        )
+        for field, want in (
+            ("header_type", _HEADER_1), ("context_flag", 0),
+            ("transport_type", 0), ("destination_type", _DTYPE_PLAIN),
+            ("packet_type", _PTYPE_DATA),
+        ):
+            assert parsed[field] == built[field] == want, (
+                f"{label}: flag field {field} diverged "
+                f"(parsed={parsed[field]} built={built[field]} want={want})"
+            )
         assert parsed["hops"] == built["hops"] == 3, f"{label}: hops mismatch"
-        assert parsed["destination_type"] == _DTYPE_PLAIN, f"{label}: dest_type"
-        assert parsed["packet_type"] == _PTYPE_DATA, f"{label}: packet_type"
         assert_hex_equal(parsed["destination_hash"], built["destination_hash"])
         assert_hex_equal(parsed["data"], payload)  # PLAIN: data round-trips clear
 
@@ -155,18 +187,144 @@ def test_packet_flags_byte_by_kind(sut, reference):
 
 @conformance_case(
     commands=["packet_build", "packet_hash"],
-    verifies="RNS packet hash (the transport-dedup key, computed over the hashable part with hops byte and HEADER_2 transport_id masked out) is byte-identical when both impls hash the same raw packet — the same call site impls hit for hashlist insertion",
+    verifies="RNS packet hash (the transport-dedup / hashlist key): in BOTH build directions, the other impl computing packet_hash on the builder's raw bytes reproduces the hash the builder itself reported, and the hash is invariant to the hops byte (mutating raw[1] does not change it) — confirming the hops byte is masked out of the hashable part, as RNS does so a packet keeps one hashlist identity as it propagates",
 )
 def test_packet_hash_matches_across_impls(sut, reference):
-    ref_built = reference.execute(
+    for builder, hasher, label in (
+        (reference, sut, "ref->sut"),
+        (sut, reference, "sut->ref"),
+    ):
+        built = builder.execute(
+            "packet_build",
+            dest_type="plain", packet_type=_PTYPE_DATA,
+            context=0, context_flag=0, hops=7, data=random_hex(24),
+        )
+        # L8: the prior second assert compared the reference's own build-time
+        # hash to its own packet_hash (both reference, both via unpack ->
+        # get_hash on the same bytes), so it always passed and never touched
+        # the SUT. The discriminating check is cross-impl: the OTHER impl
+        # hashing the builder's wire bytes must reproduce the hash the builder
+        # reported. (Both `built["hash"]` and packet_hash come from a real
+        # unpack -> get_hash; there is no separate pack-time hash to compare.)
+        cross = hasher.execute("packet_hash", raw=built["raw"])
+        assert_hex_equal(
+            cross["hash"], built["hash"],
+            f"{label}: cross-impl packet_hash != builder-reported hash",
+        )
+        # The hops byte (raw[1]) is excluded from the hashable part. Bump it and
+        # the hash must not move; an impl that hashed the hops byte would lose
+        # dedup identity on every relay and diverge here.
+        raw = bytes.fromhex(built["raw"])
+        bumped = (raw[:1] + bytes([(raw[1] + 1) & 0xFF]) + raw[2:]).hex()
+        bumped_h = hasher.execute("packet_hash", raw=bumped)
+        assert_hex_equal(
+            bumped_h["hash"], built["hash"],
+            f"{label}: packet hash changed when the hops byte was mutated",
+        )
+
+
+@conformance_case(
+    commands=["packet_build", "packet_unpack", "packet_hash"],
+    verifies="RNS HEADER_2 (transport-relayed) ANNOUNCE wire format: the 16-byte transport_id placed between the hops byte and the destination_hash round-trips through the other impl's unpack byte-for-byte, and the transport_id is masked OUT of the packet hash — hashing the HEADER_1-equivalent bytes (transport_id stripped at raw[2:18], header_type bit cleared) yields the identical hash, exactly as RNS.Packet.get_hashable_part skips raw[2:18] for HEADER_2 so a relayed announce keeps the originator's hashlist identity",
+)
+def test_packet_header2_transport_id_roundtrip_and_hash_masking(sut, reference):
+    transport_id = random_hex(16)  # TRUNCATED_HASHLENGTH // 8 == 16 bytes
+    payload = random_hex(40)
+    for builder, unpacker, label in (
+        (reference, sut, "ref->sut"),
+        (sut, reference, "sut->ref"),
+    ):
+        built = builder.execute(
+            "packet_build",
+            dest_type="single", packet_type=_PTYPE_ANNOUNCE,
+            context=0, context_flag=0, hops=4, data=payload,
+            header_type=2, transport_id=transport_id,
+        )
+        # The transport_id rides in the header; the other impl must recover it
+        # byte-for-byte, and decode the header as a HEADER_2 SINGLE announce.
+        parsed = unpacker.execute("packet_unpack", raw=built["raw"])
+        assert parsed["unpacked"] is True, f"{label}: HEADER_2 unpack rejected"
+        assert parsed["header_type"] == _HEADER_2, f"{label}: not HEADER_2"
+        assert parsed["destination_type"] == _DTYPE_SINGLE, f"{label}: dest_type"
+        assert parsed["packet_type"] == _PTYPE_ANNOUNCE, f"{label}: packet_type"
+        assert_hex_equal(
+            parsed["transport_id"], transport_id,
+            f"{label}: transport_id did not round-trip",
+        )
+        assert_hex_equal(parsed["destination_hash"], built["destination_hash"])
+
+        # transport_id is masked out of the hash. Derive the HEADER_1-equivalent
+        # wire bytes from the SAME packet: clear the header_type bit (0x40) and
+        # drop the 16-byte transport_id at raw[2:18]. RNS get_hashable_part is
+        # (raw[0] & 0x0f) + raw[18:] for HEADER_2 and (raw[0] & 0x0f) + raw[2:]
+        # for HEADER_1 — identical bytes here — so the two hashes must agree.
+        raw = bytes.fromhex(built["raw"])
+        assert_hex_equal(
+            raw[2:18].hex(), transport_id,
+            f"{label}: transport_id not at the HEADER_2 wire offset raw[2:18]",
+        )
+        h1_equiv = (bytes([raw[0] & ~0x40]) + raw[1:2] + raw[18:]).hex()
+        h2_hash = unpacker.execute("packet_hash", raw=built["raw"])
+        h1_hash = unpacker.execute("packet_hash", raw=h1_equiv)
+        assert_hex_equal(
+            h1_hash["hash"], h2_hash["hash"],
+            f"{label}: HEADER_2 hash != HEADER_1-equivalent — transport_id "
+            f"leaked into the hashable part",
+        )
+        # And the builder's own reported hash matches the hasher's computation.
+        assert_hex_equal(
+            h2_hash["hash"], built["hash"],
+            f"{label}: cross-impl HEADER_2 hash != builder-reported hash",
+        )
+
+
+@conformance_case(
+    commands=["packet_build"],
+    verifies="RNS enforces the per-packet MTU (RNS.Reticulum.MTU == 500 bytes) at pack time: building a packet whose payload pushes the wire size past the MTU is rejected (Packet.pack raises), while a payload that comfortably fits is accepted (positive control) — so an impl that silently emits oversize packets fails",
+)
+def test_packet_build_rejects_oversize_mtu(sut):
+    # Positive control: a small payload packs to wire bytes well under the MTU.
+    fits = sut.execute(
         "packet_build",
         dest_type="plain", packet_type=_PTYPE_DATA,
-        context=0, context_flag=0, hops=7, data=random_hex(24),
+        context=0, context_flag=0, hops=0, data=random_hex(64),
     )
-    ref_h = reference.execute("packet_hash", raw=ref_built["raw"])
-    res_h = sut.execute("packet_hash", raw=ref_built["raw"])
-    assert_hex_equal(res_h["hash"], ref_h["hash"])
-    # The hash RNS computed at pack-time (via Packet.update_hash inside pack)
-    # must match the hash a receiver gets from unpack — the field name
-    # "hash" on the built result is exactly that.
-    assert_hex_equal(ref_built["hash"], ref_h["hash"])
+    assert len(bytes.fromhex(fits["raw"])) <= _MTU, "positive control over MTU"
+
+    # Negative: a 600-byte payload (raw ~619B) exceeds the 500B MTU and must be
+    # rejected at pack time, not silently truncated or emitted oversize.
+    with pytest.raises(BridgeError):
+        sut.execute(
+            "packet_build",
+            dest_type="plain", packet_type=_PTYPE_DATA,
+            context=0, context_flag=0, hops=0, data=random_hex(600),
+        )
+
+
+@conformance_case(
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS rejects malformed/truncated packets: feeding raw bytes shorter than the minimum HEADER_1 header (flags+hops+16B destination_hash+context = 19 bytes), including empty input, to packet_unpack returns unpacked=False rather than fabricating header fields, while a well-formed packet unpacks (positive control)",
+)
+def test_packet_unpack_rejects_truncated(sut, reference):
+    # Positive control: a real packet unpacks cleanly.
+    built = reference.execute(
+        "packet_build",
+        dest_type="plain", packet_type=_PTYPE_DATA,
+        context=0, context_flag=0, hops=0, data=random_hex(16),
+    )
+    good = sut.execute("packet_unpack", raw=built["raw"])
+    assert good["unpacked"] is True, "positive control: valid packet must unpack"
+
+    # Negative: inputs shorter than the 19-byte HEADER_1 minimum must be
+    # rejected, not parsed into bogus fields.
+    raw = bytes.fromhex(built["raw"])
+    for bad, why in (
+        (b"", "empty"),
+        (raw[:1], "flags byte only"),
+        (raw[:10], "truncated mid destination_hash"),
+        (raw[:18], "one byte short of the full header"),
+    ):
+        rejected = sut.execute("packet_unpack", raw=bad.hex())
+        assert rejected["unpacked"] is False, (
+            f"truncated input ({why}) must be rejected, got {rejected}"
+        )

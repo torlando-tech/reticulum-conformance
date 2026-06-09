@@ -44,12 +44,16 @@ def test_identity_to_file_from_file_round_trip(sut, reference):
 
 
 @conformance_case(
-    commands=["identity_to_file", "identity_from_file"],
-    verifies="Cross-impl on-disk format: an identity written by either impl can be loaded by the other with byte-identical public_key + hash. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path.",
+    commands=["identity_from_private_key", "identity_to_file", "identity_from_file"],
+    verifies="Cross-impl on-disk format: an identity written by either impl can be loaded by the other, and BOTH reload paths recover the byte-identical public_key + hash of the identity derived directly from the same 64-byte private key. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path.",
 )
 def test_identity_file_format_cross_impl(sut, reference):
     """Reference writes -> SUT reads, and SUT writes -> reference reads."""
     priv = random_hex(64)
+    # Ground truth: the identity derived directly from the private key. Both
+    # cross-loaded reloads must match this, so a shared symmetric byte-layout
+    # bug (both impls agreeing on the WRONG keys) is still caught.
+    expected = reference.execute("identity_from_private_key", private_key=priv)
 
     written_by_ref = reference.execute("identity_to_file", private_key=priv)
     loaded_by_sut = sut.execute("identity_from_file", path=written_by_ref["path"])
@@ -65,10 +69,12 @@ def test_identity_file_format_cross_impl(sut, reference):
         f"{written_by_sut['path']!r}"
     )
 
-    # Both reload paths must surface the same public key + hash (they were
-    # derived from the same 64-byte private key, so deterministic).
-    assert_hex_equal(loaded_by_sut["public_key"], loaded_by_ref["public_key"])
-    assert_hex_equal(loaded_by_sut["hash"], loaded_by_ref["hash"])
+    # Both reload paths must surface the public key + hash of the identity the
+    # private key actually derives — not merely agree with each other.
+    assert_hex_equal(loaded_by_sut["public_key"], expected["public_key"])
+    assert_hex_equal(loaded_by_sut["hash"], expected["hash"])
+    assert_hex_equal(loaded_by_ref["public_key"], expected["public_key"])
+    assert_hex_equal(loaded_by_ref["hash"], expected["hash"])
 
 
 @conformance_case(

@@ -516,3 +516,89 @@ class TestRoamingToBoundary:
         dest_hash = announced["destination_hash"]
 
         _assert_no_propagation(session.peer_c, dest_hash)
+
+
+# ─── POINT_TO_POINT outgoing: forwards like FULL (no next-hop check) ──────
+#
+# POINT_TO_POINT egress falls through the AP/ROAMING/BOUNDARY mode ladder
+# into the same `else` branch as FULL/GATEWAY (Python RNS 1.3.1
+# Transport.py:1191-1195 has no P2P case, so MODE_POINT_TO_POINT reaches the
+# else at :1244-1261). That branch performs NO next-hop interface mode check,
+# so a P2P outgoing interface forwards an announce regardless of the source
+# interface's mode — unlike ROAMING/BOUNDARY, which gate on the next hop.
+
+class TestFullToP2P:
+    """POINT_TO_POINT outgoing, FULL source: announce forwarded.
+
+    Positive control for P2P egress: a SUT that blocks P2P broadcasts (or
+    omits MODE_POINT_TO_POINT from its egress table so it falls into a
+    deny-by-default case) fails this.
+    """
+
+    @pytest.fixture
+    def session(self, rns_path, target_cmd, local_peer_cmd):
+        s = ThreeNodeSession(
+            rns_path=rns_path,
+            target_cmd=target_cmd,
+            pipe_peer_cmd=local_peer_cmd,
+        )
+        s.start(b_mode_a="full", b_mode_c="p2p", a_action="announce", c_action="listen")
+        yield s
+        s.stop()
+
+    def test_announce_forwarded_full_to_p2p(self, session):
+        """FULL source → POINT_TO_POINT outgoing: announce IS forwarded."""
+        a_ready = session.peer_a.wait_for_ready(timeout=20)
+        assert a_ready is not None
+        c_ready = session.peer_c.wait_for_ready(timeout=20)
+        assert c_ready is not None
+
+        if session.target_cmd is not None:
+            session.wait_for_b_ready(timeout=20)
+
+        announced = session.peer_a.wait_for_announced(timeout=15)
+        assert announced is not None
+        dest_hash = announced["destination_hash"]
+
+        _assert_propagated(session.peer_c, announced)
+
+
+class TestRoamingToP2P:
+    """POINT_TO_POINT outgoing, ROAMING source: announce forwarded.
+
+    The discriminating case. Under a ROAMING *outgoing* interface a
+    ROAMING-sourced announce is BLOCKED by the next-hop mode check (see
+    TestRoamingToRoaming). POINT_TO_POINT does NO next-hop check (else
+    branch, Transport.py:1244-1261), so the identical roaming-sourced
+    announce MUST forward. A SUT that mistakenly treats P2P like ROAMING
+    fails here while still passing TestFullToP2P.
+    """
+
+    @pytest.fixture
+    def session(self, rns_path, target_cmd, local_peer_cmd):
+        s = ThreeNodeSession(
+            rns_path=rns_path,
+            target_cmd=target_cmd,
+            pipe_peer_cmd=local_peer_cmd,
+        )
+        s.start(b_mode_a="roaming", b_mode_c="p2p", a_action="announce", c_action="listen")
+        yield s
+        s.stop()
+
+    def test_announce_forwarded_roaming_to_p2p(self, session):
+        """ROAMING source → POINT_TO_POINT outgoing: announce IS forwarded
+        (P2P egress performs no next-hop check, so the roaming-source block
+        that fires for a ROAMING outgoing interface does NOT apply)."""
+        a_ready = session.peer_a.wait_for_ready(timeout=20)
+        assert a_ready is not None
+        c_ready = session.peer_c.wait_for_ready(timeout=20)
+        assert c_ready is not None
+
+        if session.target_cmd is not None:
+            session.wait_for_b_ready(timeout=20)
+
+        announced = session.peer_a.wait_for_announced(timeout=15)
+        assert announced is not None
+        dest_hash = announced["destination_hash"]
+
+        _assert_propagated(session.peer_c, announced)

@@ -484,6 +484,15 @@ _EXPIRY_EXPECTATIONS = [
     ("full", _PATHFINDER_E_MS, "PATHFINDER_E (7d)"),
     ("access_point", _AP_PATH_TIME_MS, "AP_PATH_TIME (1d)"),
     ("roaming", _ROAMING_PATH_TIME_MS, "ROAMING_PATH_TIME (6h)"),
+    # BOUNDARY and GATEWAY have no dedicated expiry constant: only
+    # MODE_ACCESS_POINT and MODE_ROAMING are special-cased at
+    # Transport.py:1873-1876, so every other mode (including BOUNDARY and
+    # GATEWAY) lands in the else branch :1877-1878 and gets PATHFINDER_E.
+    # These two pin that else-branch fall-through, which the prior list
+    # (full/ap/roaming only) left unasserted — an impl that wrongly gave
+    # BOUNDARY or GATEWAY a shorter expiry would pass the old matrix.
+    ("boundary", _PATHFINDER_E_MS, "PATHFINDER_E via BOUNDARY (7d)"),
+    ("gateway", _PATHFINDER_E_MS, "PATHFINDER_E via GATEWAY (7d)"),
 ]
 
 # L14: RNS stamps the path entry from a SINGLE `now = time.time()`
@@ -502,7 +511,7 @@ _EXPIRY_JITTER_MS = 2
 
 @conformance_case(
     commands=["start_tcp_server", "start_tcp_client", "announce", "read_path_entry"],
-    verifies="Stored path-entry expiry equals timestamp + the per-mode constant (PATHFINDER_E for FULL, AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING) within jitter",
+    verifies="Stored path-entry expiry equals timestamp + the per-mode constant (AP_PATH_TIME for ACCESS_POINT, ROAMING_PATH_TIME for ROAMING, and PATHFINDER_E for every other mode incl. FULL, BOUNDARY and GATEWAY) within jitter",
 )
 @pytest.mark.parametrize(
     "mode,expected_delta_ms,label", _EXPIRY_EXPECTATIONS,
@@ -574,3 +583,127 @@ def test_mode_specific_path_expiry_assignment(
         f"on Python) or the interface mode wasn't applied correctly "
         f"to the receiving interface."
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Local-origin announce carve-out (BOUNDARY / ROAMING) + AP control
+# ---------------------------------------------------------------------------
+
+
+# (mode_string, expect_server_learns, label)
+#
+# The local-origin carve-out lets a node broadcast an announce for one of its
+# OWN destinations out a BOUNDARY- or ROAMING-mode interface even though the
+# next-hop block (which fires for relayed announces of remote destinations on
+# those modes) would otherwise apply. The carve-out is the
+# `destination_hash in Transport.destinations_map` branch at
+# Transport.py:1200-1205 (ROAMING) and :1225-1230 (BOUNDARY). ACCESS_POINT has
+# NO such carve-out — :1193-1195 blocks unconditionally, even own announces —
+# making it the contrast control.
+_CARVE_OUT_MODES = [
+    ("boundary", True, "BOUNDARY local-origin carve-out fires"),
+    ("roaming", True, "ROAMING local-origin carve-out fires"),
+    ("access_point", False, "AP has NO local-origin carve-out (control)"),
+]
+
+# How long to watch for the server to learn the path. The positive cases land
+# well within _SETTLE_SEC (same budget the mode-expiry test relies on); a 3.0s
+# poll ceiling clears that with headroom while bounding the AP negative's wait
+# so a merely-slow announce cannot masquerade as "blocked".
+_CARVEOUT_OBSERVE_SEC = 3.0
+
+
+def _poll_path_entry(peer, dest_hash, timeout_sec):
+    """Poll `peer.read_path_entry(dest_hash)` until present or timeout.
+
+    Returns the entry dict as soon as it appears (positive cases exit early),
+    or None after watching the full window (negative case waits it out).
+    """
+    deadline = time.time() + timeout_sec
+    entry = None
+    while time.time() < deadline:
+        entry = peer.read_path_entry(dest_hash)
+        if entry is not None:
+            return entry
+        time.sleep(0.1)
+    return entry
+
+
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "read_path_entry"],
+    verifies="A node announcing its OWN destination out a BOUNDARY or ROAMING interface reaches the peer (local-origin carve-out fires despite the next-hop block); out an ACCESS_POINT interface it does NOT (AP has no carve-out)",
+)
+@pytest.mark.parametrize(
+    "client_mode,expect_learned,label", _CARVE_OUT_MODES,
+    ids=[label for _m, _e, label in _CARVE_OUT_MODES],
+)
+def test_local_origin_announce_carveout(
+    wire_peers, client_mode, expect_learned, label
+):
+    """A (TCPClient, mode=client_mode) announces its OWN destination; B
+    (TCPServer, default FULL) is the observer.
+
+    The egress gate runs on A's single interface (mode=client_mode) for A's
+    locally-originated announce (Python RNS 1.3.1 Transport.py:1191-1261):
+
+      * BOUNDARY / ROAMING: the announce's destination IS in A's
+        `destinations_map`, so the carve-out (:1200-1205 / :1225-1230) lets it
+        out despite those modes' next-hop block. An impl that omits the
+        carve-out would run the next-hop check, find no path to A's own
+        (local) destination, and drop the announce — so B never learns it.
+      * ACCESS_POINT: :1193-1195 blocks ALL announce broadcasts with no
+        local-origin exception, so B never learns A's destination.
+
+    Observable: B's path_table entry for A's destination. The BOUNDARY and
+    ROAMING cases are the positive control (proves the announce mechanism +
+    carve-out work); the AP case is the negative that pins "AP has no
+    carve-out" — without it, an impl that blanket-allowed local-origin
+    announces on every mode would pass the positive cases yet be wrong.
+    """
+    server, client = wire_peers
+
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="",
+        passphrase="",
+        target_host="127.0.0.1",
+        target_port=port,
+        mode=client_mode,
+    )
+    # Let the TCP link establish so the announce, if egress allows it, is
+    # actually written to the wire rather than queued behind connect.
+    time.sleep(_SETTLE_SEC)
+
+    dest_hash = client.announce(
+        app_name="pathdiscovery", aspects=["carveout", client_mode]
+    )
+
+    entry = _poll_path_entry(server, dest_hash, _CARVEOUT_OBSERVE_SEC)
+
+    if expect_learned:
+        assert entry is not None, (
+            f"B ({server.role_label}) did NOT learn A's "
+            f"({client.role_label}) own destination {dest_hash.hex()} "
+            f"announced out a {client_mode}-mode interface within "
+            f"{_CARVEOUT_OBSERVE_SEC}s ({label}). The local-origin carve-out "
+            f"(Transport.py:1200-1205 ROAMING / :1225-1230 BOUNDARY) should "
+            f"have let A broadcast its own announce; an impl that runs the "
+            f"next-hop block instead drops it (no path to a purely-local "
+            f"destination)."
+        )
+        # The carve-out emits a fresh local announce (hops==0 at A); B is one
+        # wire hop away, so it stores hops==1. Pinning this rules out B having
+        # learned the destination through some unrelated path.
+        assert entry["hops"] == 1, (
+            f"B learned A's destination but at hops={entry['hops']}, "
+            f"expected 1 (A is exactly one TCP hop from B)."
+        )
+    else:
+        assert entry is None, (
+            f"B ({server.role_label}) learned A's ({client.role_label}) own "
+            f"destination {dest_hash.hex()} announced out an "
+            f"ACCESS_POINT-mode interface ({label}); AP must block ALL "
+            f"announce broadcasts (Transport.py:1193-1195) with no "
+            f"local-origin carve-out, so the announce should never have "
+            f"left A. Entry: {entry}."
+        )

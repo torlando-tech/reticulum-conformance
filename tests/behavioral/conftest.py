@@ -351,12 +351,83 @@ class Instance:
         resp = self.bridge.execute("behavioral_request_path", **kwargs)
         return bytes.fromhex(resp["tag"])
 
-    def blackhole_identity(self, identity_hash):
+    def blackhole_identity(self, identity_hash, until=None, reason=None):
         """Blackhole an identity via real Transport.blackhole_identity
         (Transport.py:3406). Subsequent announces from it are invalidated in
-        Identity.validate_announce (Identity.py:567). See
-        behavioral_blackhole_identity."""
+        Identity.validate_announce (Identity.py:567). Optional until/reason are
+        recorded into the entry. See behavioral_blackhole_identity."""
+        kwargs = {"handle": self.handle, "identity_hash": identity_hash.hex()}
+        if until is not None:
+            kwargs["until"] = until
+        if reason is not None:
+            kwargs["reason"] = reason
+        return self.bridge.execute("behavioral_blackhole_identity", **kwargs)
+
+    def unblackhole_identity(self, identity_hash):
+        """Lift a blackhole via real Transport.unblackhole_identity
+        (Transport.py:3431). See behavioral_unblackhole_identity."""
         return self.bridge.execute(
-            "behavioral_blackhole_identity",
+            "behavioral_unblackhole_identity",
             handle=self.handle, identity_hash=identity_hash.hex(),
+        )
+
+    def read_blackhole_table(self):
+        """Read RNS.Transport.blackholed_identities as
+        {count, entries:[{identity_hash, source, until, reason}]}. See
+        behavioral_read_blackhole_table."""
+        return self.bridge.execute(
+            "behavioral_read_blackhole_table", handle=self.handle,
+        )
+
+    def blackhole_list_handler(self):
+        """Invoke the real Transport.blackhole_list_handler (the /list
+        response_generator) and return {is_blackhole_table, count, entries}.
+        See behavioral_blackhole_list_handler."""
+        return self.bridge.execute(
+            "behavioral_blackhole_list_handler", handle=self.handle,
+        )
+
+    def blackhole_reload(self):
+        """Run real Transport.reload_blackhole(); returns {count}. See
+        behavioral_blackhole_reload."""
+        return self.bridge.execute(
+            "behavioral_blackhole_reload", handle=self.handle,
+        )
+
+    def blackhole_clear(self):
+        """Empty the in-memory Transport.blackholed_identities table (not the
+        on-disk storage). See behavioral_blackhole_clear."""
+        return self.bridge.execute(
+            "behavioral_blackhole_clear", handle=self.handle,
+        )
+
+    def blackhole_storage_files(self):
+        """List <configdir>/storage/blackhole files as {dir, files:[{name,
+        size}]}. See behavioral_blackhole_storage_files."""
+        return self.bridge.execute(
+            "behavioral_blackhole_storage_files", handle=self.handle,
+        )
+
+    def blackhole_clear_storage(self):
+        """Delete all blackhole storage files; returns {removed}. See
+        behavioral_blackhole_clear_storage."""
+        return self.bridge.execute(
+            "behavioral_blackhole_clear_storage", handle=self.handle,
+        )
+
+    def blackhole_rename_storage(self, src, dst):
+        """Rename a blackhole storage file (directory entry only). See
+        behavioral_blackhole_rename_storage."""
+        return self.bridge.execute(
+            "behavioral_blackhole_rename_storage",
+            handle=self.handle, src=src, dst=dst,
+        )
+
+    def blackhole_set_sources(self, sources):
+        """Replace RNS's trusted blackhole-source list with `sources` (iterable
+        of identity-hash bytes); returns {count}. See
+        behavioral_blackhole_set_sources."""
+        return self.bridge.execute(
+            "behavioral_blackhole_set_sources",
+            handle=self.handle, sources=[s.hex() for s in sources],
         )

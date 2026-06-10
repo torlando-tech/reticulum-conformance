@@ -1416,8 +1416,39 @@ def cmd_behavioral_blackhole_identity(params):
     announce from that identity creates no path entry. Delegates to the real
     staticmethod; _reset_transport_state clears the table between handles.
 
-    params: handle, identity_hash (hex)
+    Optional `until` (unix timestamp float) and `reason` (str) are passed
+    straight through to Transport.blackhole_identity so the recorded entry
+    carries them, exactly as `rnpath -B --duration/--reason` would
+    (rnpath.py:214-215). This lets a test assert the {source, until, reason}
+    entry schema the /list handler and rnpath consumer rely on.
+
+    params: handle, identity_hash (hex), until (optional float), reason (optional str)
     returns: {blackholed}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    identity_hash = bytes.fromhex(params["identity_hash"])
+    until = params.get("until")
+    reason = params.get("reason")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    result = RNS.Transport.blackhole_identity(identity_hash, until=until, reason=reason)
+    return {"blackholed": bool(result)}
+
+
+def cmd_behavioral_unblackhole_identity(params):
+    """Lift a blackhole via real Transport.unblackhole_identity (Transport.py:3431).
+
+    Delegates to the real staticmethod, which pops the identity from
+    Transport.blackholed_identities and re-persists the local list. Returns
+    {lifted} (True if it was present, False/None otherwise).
+
+    params: handle, identity_hash (hex)
+    returns: {lifted}
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -1428,8 +1459,240 @@ def cmd_behavioral_blackhole_identity(params):
     if inst is None:
         raise ValueError(f"Unknown handle: {handle}")
 
-    result = RNS.Transport.blackhole_identity(identity_hash)
-    return {"blackholed": bool(result)}
+    result = RNS.Transport.unblackhole_identity(identity_hash)
+    return {"lifted": bool(result)}
+
+
+def _serialize_blackhole_entry(identity_hash, entry):
+    """Decompose one Transport.blackholed_identities item into a JSON-safe dict.
+
+    Reads the real RNS entry fields straight off the dict RNS populated
+    (entry["source"]/["until"]/["reason"]); no protocol bytes are constructed.
+    """
+    source = entry.get("source")
+    return {
+        "identity_hash": identity_hash.hex(),
+        "source": source.hex() if isinstance(source, (bytes, bytearray)) else None,
+        "until": entry.get("until"),
+        "reason": entry.get("reason"),
+    }
+
+
+def cmd_behavioral_read_blackhole_table(params):
+    """Read RNS.Transport.blackholed_identities as a JSON-safe list.
+
+    Surfaces the live blackhole table (the exact dict the /list request handler
+    returns and that Transport.reload_blackhole / persist_blackhole maintain) so
+    a test can assert the per-entry schema {source, until, reason} and the keys.
+    Reads RNS state only — nothing is reconstructed.
+
+    params: handle
+    returns: {count, entries: [{identity_hash, source, until, reason}, ...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    table = RNS.Transport.blackholed_identities
+    entries = [_serialize_blackhole_entry(h, table[h]) for h in table.copy()]
+    return {"count": len(entries), "entries": entries}
+
+
+def cmd_behavioral_blackhole_list_handler(params):
+    """Invoke the REAL Transport.blackhole_list_handler — the response_generator
+    registered on the rnstransport.info.blackhole '/list' request destination
+    (Transport.py:262, :3514) — and report its result.
+
+    This is the exact callable a remote `rnpath -L` fetch reaches over a Link
+    (Discovery.BlackholeUpdater). Driving it directly (with the handler's real
+    6-arg request signature) exercises the publish path without needing a live
+    wire link. The handler returns Transport.blackholed_identities verbatim, so
+    we report whether the returned object IS that dict plus its serialized
+    entries for schema assertions.
+
+    params: handle
+    returns: {is_blackhole_table, count, entries: [...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    result = RNS.Transport.blackhole_list_handler(
+        "/list", None, None, None, None, None
+    )
+    is_table = result is RNS.Transport.blackholed_identities
+    entries = []
+    if isinstance(result, dict):
+        entries = [_serialize_blackhole_entry(h, result[h]) for h in dict(result)]
+    return {"is_blackhole_table": is_table, "count": len(entries), "entries": entries}
+
+
+def cmd_behavioral_blackhole_reload(params):
+    """Run the real Transport.reload_blackhole() (Transport.py:3453).
+
+    reload_blackhole rescans <configdir>/storage/blackhole/*, loading each
+    trusted source file (filename 'local' => own identity; otherwise a
+    hex source-identity hash that must be in Reticulum.blackhole_sources()),
+    skipping expired (until < now) entries and never overwriting a locally
+    sourced entry, then calls remove_blackholed_paths(). Pure delegation.
+
+    params: handle
+    returns: {count}  (size of Transport.blackholed_identities afterward)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS.Transport.reload_blackhole()
+    return {"count": len(RNS.Transport.blackholed_identities)}
+
+
+def cmd_behavioral_blackhole_clear(params):
+    """Empty the in-memory Transport.blackholed_identities table (NOT the
+    on-disk storage). Lets a test prove that reload_blackhole repopulates it
+    purely from the persisted source files. Mirrors what
+    _reset_transport_state does between handles; exposed so a single test can
+    clear-then-reload deterministically.
+
+    params: handle
+    returns: {cleared}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS.Transport.blackholed_identities.clear()
+    return {"cleared": True}
+
+
+def cmd_behavioral_blackhole_storage_files(params):
+    """List the files RNS keeps under <configdir>/storage/blackhole.
+
+    Reads RNS.Reticulum.blackholepath (the real persistence directory) and
+    returns each filename + size so a test can assert the persistence file
+    naming contract: the local list is 'local', and every fetched/remote source
+    list is named by the hex of its source identity hash
+    (Transport.reload_blackhole filename handling, Transport.py:3457-3465;
+    persist_blackhole writes 'local', Transport.py:3531). Directory listing
+    only — no file contents are decoded here.
+
+    params: handle
+    returns: {dir, files: [{name, size}, ...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    files = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            files.append({"name": name, "size": os.path.getsize(full)})
+    return {"dir": path, "files": files}
+
+
+def cmd_behavioral_blackhole_clear_storage(params):
+    """Delete every file under <configdir>/storage/blackhole so a test starts
+    from a clean persistence directory (the dir is process-wide and survives
+    _reset_transport_state, which only clears the in-memory table).
+
+    params: handle
+    returns: {removed}  (number of files unlinked)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    removed = 0
+    for name in os.listdir(path):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            os.remove(full)
+            removed += 1
+    return {"removed": removed}
+
+
+def cmd_behavioral_blackhole_rename_storage(params):
+    """Rename a file inside <configdir>/storage/blackhole.
+
+    The bytes are NEVER touched — only the directory entry is renamed via
+    os.rename. This lets a test repurpose the RNS-written 'local' list (whose
+    umsgpack payload RNS itself produced via persist_blackhole) as a *remote*
+    source file named by a source-identity hex, so reload_blackhole's
+    remote-source path (hex-name validation, trusted-source gating, local
+    precedence) can be exercised without a live fetch link and without the
+    harness ever serializing a blackhole list itself.
+
+    params: handle, src (filename), dst (filename)
+    returns: {renamed}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    src = params["src"]
+    dst = params["dst"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    os.rename(os.path.join(path, src), os.path.join(path, dst))
+    return {"renamed": True}
+
+
+def cmd_behavioral_blackhole_set_sources(params):
+    """Replace RNS's trusted blackhole-source list (the identity hashes a node
+    is configured to accept remote blackhole lists from, normally parsed from
+    the `blackhole_sources` config option, Reticulum.py:575-582).
+
+    Mutates the real list returned by RNS.Reticulum.blackhole_sources() in
+    place so reload_blackhole's trusted-source gate (Transport.py:3463 —
+    `if source not in Reticulum.blackhole_sources(): skip`) sees the test's
+    chosen sources. Reads/writes RNS state only.
+
+    params: handle, sources (list of hex identity hashes)
+    returns: {count}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    sources = [bytes.fromhex(s) for s in params.get("sources", [])]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    trusted = RNS.Reticulum.blackhole_sources()
+    trusted.clear()
+    trusted.extend(sources)
+    return {"count": len(trusted)}
 
 
 BEHAVIORAL_COMMANDS = {
@@ -1439,6 +1702,15 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_mark_path_unresponsive": cmd_behavioral_mark_path_unresponsive,
     "behavioral_request_path": cmd_behavioral_request_path,
     "behavioral_blackhole_identity": cmd_behavioral_blackhole_identity,
+    "behavioral_unblackhole_identity": cmd_behavioral_unblackhole_identity,
+    "behavioral_read_blackhole_table": cmd_behavioral_read_blackhole_table,
+    "behavioral_blackhole_list_handler": cmd_behavioral_blackhole_list_handler,
+    "behavioral_blackhole_reload": cmd_behavioral_blackhole_reload,
+    "behavioral_blackhole_clear": cmd_behavioral_blackhole_clear,
+    "behavioral_blackhole_storage_files": cmd_behavioral_blackhole_storage_files,
+    "behavioral_blackhole_clear_storage": cmd_behavioral_blackhole_clear_storage,
+    "behavioral_blackhole_rename_storage": cmd_behavioral_blackhole_rename_storage,
+    "behavioral_blackhole_set_sources": cmd_behavioral_blackhole_set_sources,
     "behavioral_start": cmd_behavioral_start,
     "behavioral_stop": cmd_behavioral_stop,
     "behavioral_attach_mock_interface": cmd_behavioral_attach_mock_interface,

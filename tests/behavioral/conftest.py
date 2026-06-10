@@ -302,3 +302,61 @@ class Instance:
         return self.bridge.execute(
             "behavioral_detach_interface", handle=self.handle, iface_id=iface_id,
         )
+
+    def register_destination(self, app_name, aspects, identity_seed):
+        """Register a real local IN/SINGLE destination from a 64-byte Identity
+        private key, so its hash enters Transport.destinations_map (the local-
+        destination announce carve-out, Transport.py:1707-1712). Returns the
+        destination hash as bytes. See behavioral_register_destination."""
+        resp = self.bridge.execute(
+            "behavioral_register_destination",
+            handle=self.handle, app_name=app_name, aspects=list(aspects),
+            identity_seed=identity_seed.hex(),
+        )
+        return bytes.fromhex(resp["destination_hash"])
+
+    def read_announce_rate(self, dest):
+        """Read Transport.announce_rate_table[dest] (bytes) as {found, last,
+        rate_violations, blocked_until, timestamps[]} or {'found': False}. See
+        behavioral_read_announce_rate."""
+        return self.bridge.execute(
+            "behavioral_read_announce_rate", handle=self.handle, dest=dest.hex(),
+        )
+
+    def set_path_expires(self, dest, expires):
+        """Set path_table[dest][IDX_PT_EXPIRES] (epoch seconds). Rewind into the
+        past to make `now >= path_expires` for the larger-hop expired-path
+        replacement branch (Transport.py:1789). See behavioral_set_path_expires."""
+        return self.bridge.execute(
+            "behavioral_set_path_expires",
+            handle=self.handle, dest=dest.hex(), expires=expires,
+        )
+
+    def mark_path_unresponsive(self, dest):
+        """Mark path_table[dest] unresponsive via real
+        Transport.mark_path_unresponsive (Transport.py:2719). Returns the
+        command result {'marked': bool}. See behavioral_mark_path_unresponsive."""
+        return self.bridge.execute(
+            "behavioral_mark_path_unresponsive", handle=self.handle, dest=dest.hex(),
+        )
+
+    def request_path(self, iface_id, dest, tag=None):
+        """Drive real Transport.request_path(dest, on_interface=iface, tag=tag);
+        the emitted path-request packet is drainable via drain_tx(iface_id).
+        Returns the request tag actually used (bytes). See
+        behavioral_request_path."""
+        kwargs = {"handle": self.handle, "iface_id": iface_id, "dest": dest.hex()}
+        if tag is not None:
+            kwargs["tag"] = tag.hex()
+        resp = self.bridge.execute("behavioral_request_path", **kwargs)
+        return bytes.fromhex(resp["tag"])
+
+    def blackhole_identity(self, identity_hash):
+        """Blackhole an identity via real Transport.blackhole_identity
+        (Transport.py:3406). Subsequent announces from it are invalidated in
+        Identity.validate_announce (Identity.py:567). See
+        behavioral_blackhole_identity."""
+        return self.bridge.execute(
+            "behavioral_blackhole_identity",
+            handle=self.handle, identity_hash=identity_hash.hex(),
+        )

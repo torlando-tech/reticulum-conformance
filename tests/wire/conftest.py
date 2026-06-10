@@ -655,6 +655,8 @@ class _WirePeer:
         aspects: list,
         resource_strategy: str | None = None,
         enable_ratchets: bool = False,
+        open_channel: bool = True,
+        buffer_stream_ids: list | None = None,
     ) -> bytes:
         """Register an IN destination that accepts incoming Links.
 
@@ -696,6 +698,14 @@ class _WirePeer:
             params["resource_strategy"] = str(resource_strategy)
         if enable_ratchets:
             params["enable_ratchets"] = True
+        # open_channel=False makes the inbound link accept WITHOUT a channel, so
+        # an inbound CHANNEL packet is dropped unproven (no-channel-no-proof).
+        if not open_channel:
+            params["open_channel"] = False
+        # buffer_stream_ids registers extra receiver-relative RawChannelReaders
+        # for the multi-reader stream-id filtering test.
+        if buffer_stream_ids:
+            params["buffer_stream_ids"] = [int(s) for s in buffer_stream_ids]
         resp = self.bridge.execute("wire_listen", **params)
         dest_hash = bytes.fromhex(resp["destination_hash"])
         self.listen_identities[dest_hash] = {
@@ -1296,6 +1306,10 @@ class _WirePeer:
         link_id: bytes,
         data: bytes,
         bomb: bool = False,
+        bomb_decompressed_len: int | None = None,
+        stream_id: int | None = None,
+        eof_with_data: bool = False,
+        use_close: bool = False,
         timeout_ms: int = 30000,
     ) -> dict:
         """Stream bytes over a link via RNS.Buffer (RawChannelWriter).
@@ -1315,17 +1329,26 @@ class _WirePeer:
         Returns {written, eof} (bytes written + whether EOF was flushed).
         """
         assert self.handle, "start_* must be called first"
-        return self.bridge.execute(
-            "wire_buffer_stream",
-            handle=self.handle,
-            link_id=link_id.hex(),
-            data=data.hex(),
-            bomb=bool(bomb),
-            timeout_ms=int(timeout_ms),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "link_id": link_id.hex(),
+            "data": data.hex(),
+            "bomb": bool(bomb),
+            "eof_with_data": bool(eof_with_data),
+            "use_close": bool(use_close),
+            "timeout_ms": int(timeout_ms),
+        }
+        if bomb_decompressed_len is not None:
+            params["bomb_decompressed_len"] = int(bomb_decompressed_len)
+        if stream_id is not None:
+            params["stream_id"] = int(stream_id)
+        return self.bridge.execute("wire_buffer_stream", **params)
 
     def buffer_received(
-        self, destination_hash: bytes, timeout_ms: int = 30000
+        self,
+        destination_hash: bytes,
+        timeout_ms: int = 30000,
+        stream_id: int | None = None,
     ) -> dict:
         """Drain what a listener's RawChannelReader reassembled from a stream.
 
@@ -1338,18 +1361,58 @@ class _WirePeer:
           error   -> the abort reason string when aborted, else None.
         """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_buffer_received",
-            handle=self.handle,
-            destination_hash=destination_hash.hex(),
-            timeout_ms=int(timeout_ms),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "timeout_ms": int(timeout_ms),
+        }
+        if stream_id is not None:
+            params["stream_id"] = int(stream_id)
+        resp = self.bridge.execute("wire_buffer_received", **params)
         return {
             "data": bytes.fromhex(resp["data"]) if resp.get("data") else b"",
             "eof": bool(resp.get("eof", False)),
             "aborted": bool(resp.get("aborted", False)),
             "error": resp.get("error"),
         }
+
+    def channel_emit_capture(
+        self, link_id: bytes, data: bytes = b"", timeout_ms: int = 15000
+    ) -> dict:
+        """Send a real Channel message and capture the emitted Packet's context.
+
+        Returns {context, packet_type, packet_hash, delivered, channel_context,
+        data_context} — context is the context byte of the Packet the Channel
+        outlet transmitted (must equal channel_context == RNS.Packet.CHANNEL).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_emit_capture",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+
+    def listener_proof_log(self, destination_hash: bytes) -> dict:
+        """Return the receiver-side proof log {contexts, channel_proofs,
+        channel_context} for a listening destination."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_listener_proof_log",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+    def listener_channel_rx(self, destination_hash: bytes) -> dict:
+        """Return the receiver-side Channel rx state {next_rx_sequence,
+        next_sequence, rx_ring} for a listening destination."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_listener_channel_rx",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
 
     # --- GROUP destination symmetric crypto -------------------------------
 
@@ -2582,6 +2645,8 @@ def wire_link_setup(wire_peers):
         resource_strategy: str | None = None,
         proof_strategy: str | None = None,
         enable_ratchets: bool = False,
+        open_channel: bool = True,
+        buffer_stream_ids: list | None = None,
         link_timeout_ms: int = 15000,
         path_timeout_ms: int = 10000,
         settle_sec: float = 1.0,
@@ -2604,6 +2669,8 @@ def wire_link_setup(wire_peers):
             aspects=aspects,
             resource_strategy=resource_strategy,
             enable_ratchets=enable_ratchets,
+            open_channel=open_channel,
+            buffer_stream_ids=buffer_stream_ids,
         )
         if proof_strategy is not None:
             server.set_proof_strategy(dest_hash, proof_strategy)

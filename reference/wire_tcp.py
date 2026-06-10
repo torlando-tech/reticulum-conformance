@@ -1101,6 +1101,15 @@ def cmd_wire_listen(params):
             f"resource_strategy must be 'all', 'none' or 'app' (got {resource_strategy!r})"
         )
     enable_ratchets = bool(params.get("enable_ratchets", False))
+    # open_channel (default True): whether on_link_established calls
+    # link.get_channel() on the inbound link. False reproduces a peer with NO
+    # local channel, so an inbound CHANNEL-context packet is dropped WITHOUT a
+    # proof (Link.py:1166-1167) — observable via the proof log below.
+    open_channel = bool(params.get("open_channel", True))
+    # buffer_stream_ids (default None): extra receiver-relative stream ids to
+    # register RawChannelReaders for, in addition to the default stream. Drives
+    # the multi-reader stream-id filtering gap.
+    extra_stream_ids = [int(s) for s in (params.get("buffer_stream_ids") or [])]
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -1133,8 +1142,12 @@ def cmd_wire_listen(params):
     inbound_links = []        # RNS.Link objects accepted on this destination
     incoming_resources = []   # receiver-side Resource observation records
     channel_received = []     # decoded Channel message payloads (bytes)
+    proof_log = []            # context byte of every inbound packet the receiver
+                              # PROVED (link.prove_packet) — CHANNEL==0x0E entries
+                              # appear only when a channel is open (Link.py:1166-1173)
     buffer_state = {          # Buffer (RawChannelReader) stream reassembly state
-        "reader": None,
+        "reader": None,       # default-stream reader (back-compat)
+        "readers": {},        # {stream_id: RawChannelReader}
         "aborted": False,
         "error": None,
     }
@@ -1221,6 +1234,26 @@ def cmd_wire_listen(params):
         with recv_lock:
             inbound_links.append(link)
 
+        # Receiver-proves log: wrap the inbound Link's prove_packet so every
+        # proof the receiver emits records the proved packet's context byte.
+        # A CHANNEL packet (context 0x0E) is proved ONLY when a channel is open
+        # (Link.py:1172 packet.prove()); with no channel the receiver logs and
+        # drops it WITHOUT proving (Link.py:1166-1167), so no 0x0E entry appears.
+        try:
+            _orig_prove = link.prove_packet
+
+            def logging_prove(packet, _orig=_orig_prove):
+                try:
+                    with recv_lock:
+                        proof_log.append(int(getattr(packet, "context", -1)))
+                except Exception:
+                    pass
+                return _orig(packet)
+
+            link.prove_packet = logging_prove
+        except Exception:
+            pass
+
         def on_packet(message, packet):
             with recv_lock:
                 recv_buffer.append(bytes(message))
@@ -1240,7 +1273,11 @@ def cmd_wire_listen(params):
         # Channel: opening it (get_channel) makes the receiver PROVE inbound
         # CHANNEL packets (Link.py:1166-1169) — without this the sender's
         # receipts never deliver. Register the recording message type + handler
-        # so wire_channel_received can observe delivered messages.
+        # so wire_channel_received can observe delivered messages. When
+        # open_channel is False the receiver has NO channel, so an inbound
+        # CHANNEL packet is dropped unproven (the no-channel-no-proof gate).
+        if not open_channel:
+            return
         try:
             channel = link.get_channel()
             msgclass = _get_channel_message_class()
@@ -1263,8 +1300,12 @@ def cmd_wire_listen(params):
             channel.add_message_handler(on_channel_message)
 
             # Buffer (RawChannelReader): reassemble a StreamDataMessage stream
-            # and detect the MAX_CHUNK_LEN decompression-bomb abort.
+            # and detect the MAX_CHUNK_LEN decompression-bomb abort. Register
+            # the default-stream reader plus any extra receiver-relative stream
+            # ids the test requested (multi-reader stream-id filtering).
             _ensure_buffer_reader(channel, buffer_state, recv_lock)
+            for sid in extra_stream_ids:
+                _ensure_buffer_reader(channel, buffer_state, recv_lock, stream_id=sid)
         except Exception:
             pass
 
@@ -1281,9 +1322,11 @@ def cmd_wire_listen(params):
         "inbound_links": inbound_links,
         "incoming_resources": incoming_resources,
         "channel_received": channel_received,
+        "proof_log": proof_log,
         "buffer_state": buffer_state,
         "recv_lock": recv_lock,
         "resource_strategy": resource_strategy,
+        "open_channel": open_channel,
     }
     # Keep strong reference so it isn't garbage collected.
     inst["destinations"].append((identity, destination))
@@ -1328,15 +1371,25 @@ def _make_detecting_stream_message_class(buffer_state):
     return _DetectingStreamDataMessage
 
 
-def _ensure_buffer_reader(channel, buffer_state, recv_lock):
-    """Create a RawChannelReader on `channel` (idempotent) and swap in the
-    bomb-detecting StreamDataMessage factory. Stores the reader on buffer_state.
+def _ensure_buffer_reader(channel, buffer_state, recv_lock, stream_id=None):
+    """Create a RawChannelReader on `channel` (idempotent per stream_id) and swap
+    in the bomb-detecting StreamDataMessage factory. Stores each reader on
+    buffer_state["readers"][stream_id]; the default stream's reader is also kept
+    under buffer_state["reader"] for backward compatibility.
+
+    A second reader at a DISTINCT stream_id pins receiver-relative stream
+    addressing (Buffer.py RawChannelReader._handle_message:152 only buffers a
+    StreamDataMessage whose stream_id matches; a non-matching reader returns
+    False and lets the message propagate to the next handler).
     """
-    if buffer_state.get("reader") is not None:
-        return buffer_state["reader"]
+    if stream_id is None:
+        stream_id = _WIRE_BUFFER_STREAM_ID
+    readers = buffer_state.setdefault("readers", {})
+    if stream_id in readers:
+        return readers[stream_id]
     from RNS.Buffer import RawChannelReader, StreamDataMessage
 
-    reader = RawChannelReader(_WIRE_BUFFER_STREAM_ID, channel)
+    reader = RawChannelReader(stream_id, channel)
     # RawChannelReader.__init__ registered the plain StreamDataMessage; replace
     # the factory with the detecting subclass so over-bound chunks are recorded.
     try:
@@ -1345,7 +1398,9 @@ def _ensure_buffer_reader(channel, buffer_state, recv_lock):
         )
     except Exception:
         pass
-    buffer_state["reader"] = reader
+    readers[stream_id] = reader
+    if stream_id == _WIRE_BUFFER_STREAM_ID:
+        buffer_state["reader"] = reader
     return reader
 
 
@@ -3833,12 +3888,36 @@ def cmd_wire_buffer_stream(params):
     payload spanning several chunks + a partial final chunk exercises multi-chunk
     reassembly + EOF; read it back with wire_buffer_received on the receiver.
 
-    bomb (default False): instead of `data`, send a single crafted chunk whose
-    compressed body decompresses past MAX_CHUNK_LEN (Buffer.py:95-97). The
-    receiver's reader must abort with IOError (observable via
-    wire_buffer_received -> aborted=True), not silently truncate.
+    stream_id (default _WIRE_BUFFER_STREAM_ID): the RECEIVER-relative stream id
+    the writer targets — drive a non-default id to exercise multi-reader
+    stream-id filtering (Buffer.py:152).
 
-    Returns {written, eof}.
+    bomb (default False): instead of `data`, send a single crafted chunk whose
+    compressed body decompresses to `bomb_decompressed_len` bytes (default
+    MAX_CHUNK_LEN*4). The receiver's StreamDataMessage.unpack accepts a chunk
+    that inflates to exactly MAX_CHUNK_LEN (16384) but aborts with IOError when
+    it would exceed it (Buffer.py:95-97) — observable via wire_buffer_received
+    aborted / the receiver channel's _next_rx_sequence (wire_listener_channel_rx).
+    The crafted chunk is a real bz2.compress of bytes(N) wrapped in a real
+    StreamDataMessage and sent through the real channel; no wire bytes are
+    assembled here.
+
+    Per-message manifest: this command always returns `manifest`, the list of
+    {bytes, compressed, eof, sequence} for every StreamDataMessage the writer
+    emitted (captured by reading each sent message's own attributes + the real
+    Envelope sequence returned by Channel.send), and `write_returns`, the
+    per-write() processed-length the RawChannelWriter reported. These pin the
+    MAX_DATA_LEN chunk cap, the compression decision, and the per-write return
+    semantics (Buffer.py RawChannelWriter.write).
+
+    EOF mode (default: empty trailing eof message): set `eof_with_data` to flag
+    EOF on the FINAL data-bearing message (data + eof together), or `use_close`
+    to terminate via RawChannelWriter.close() (which drains the tx ring before
+    flushing the empty eof, Buffer.py close path). `tx_ring_after` reports the
+    channel tx-ring depth once delivery settles.
+
+    Returns {written, eof, manifest, write_returns, max_data_len, max_chunk_len,
+    compression_tries, tx_ring_after, bomb?, sequence?}.
     """
     RNS = _get_rns()
     import bz2
@@ -3848,6 +3927,10 @@ def cmd_wire_buffer_stream(params):
     link_id = bytes.fromhex(params["link_id"])
     data = bytes.fromhex(params.get("data", ""))
     bomb = bool(params.get("bomb", False))
+    bomb_len = params.get("bomb_decompressed_len")
+    stream_id = int(params.get("stream_id", _WIRE_BUFFER_STREAM_ID))
+    eof_with_data = bool(params.get("eof_with_data", False))
+    use_close = bool(params.get("use_close", False))
     timeout_ms = int(params.get("timeout_ms", 30000))
 
     with _instances_lock:
@@ -3866,40 +3949,122 @@ def cmd_wire_buffer_stream(params):
             time.sleep(0.02)
         return channel.is_ready_to_send()
 
-    if bomb:
-        # Craft a compressed StreamDataMessage whose decompressed payload exceeds
-        # MAX_CHUNK_LEN; the receiver's StreamDataMessage.unpack trips the bound.
-        oversize = RawChannelWriter.MAX_CHUNK_LEN * 4  # 64 KiB > 16 KiB bound
-        compressed = bz2.compress(bytes(oversize))
-        if len(compressed) >= StreamDataMessage.MAX_DATA_LEN:
-            raise RuntimeError("crafted bomb chunk does not fit a single message")
-        message = StreamDataMessage(_WIRE_BUFFER_STREAM_ID, compressed, eof=False, compressed=True)
-        if not _wait_ready():
-            return {"written": 0, "eof": False, "ready": False}
-        channel.send(message)
-        return {"written": 0, "eof": False, "bomb": True}
+    # Capture every StreamDataMessage the channel actually transmits by reading
+    # the message's own attributes plus the real Envelope sequence Channel.send
+    # returns — the manifest is observation, never reconstruction.
+    manifest = []
+    orig_send = channel.send
 
-    writer = RawChannelWriter(_WIRE_BUFFER_STREAM_ID, channel)
-    remaining = data
-    total = 0
-    while remaining and time.time() < deadline:
-        if not channel.is_ready_to_send():
-            time.sleep(0.02)
-            continue
-        n = writer.write(remaining)
-        if n and n > 0:
-            remaining = remaining[n:]
-            total += n
-        else:
-            time.sleep(0.02)
-    # Flush EOF (empty write with eof flag) once the ring drains.
-    _wait_ready()
-    writer._eof = True
+    def capturing_send(message, _orig=orig_send):
+        env = _orig(message)
+        try:
+            if isinstance(message, StreamDataMessage):
+                manifest.append({
+                    "bytes": len(message.data or b""),
+                    "compressed": bool(message.compressed),
+                    "eof": bool(message.eof),
+                    "sequence": int(getattr(env, "sequence", -1)),
+                })
+        except Exception:
+            pass
+        return env
+
+    channel.send = capturing_send
     try:
-        writer.write(b"")
-    except Exception:
-        pass
-    return {"written": total, "eof": True}
+        if bomb:
+            # A real bz2 compression of bytes(N) wrapped in a real
+            # StreamDataMessage. N == MAX_CHUNK_LEN inflates to exactly the bound
+            # and is accepted; N > MAX_CHUNK_LEN aborts the receiver's unpack.
+            oversize = (
+                int(bomb_len) if bomb_len is not None
+                else RawChannelWriter.MAX_CHUNK_LEN * 4
+            )
+            compressed = bz2.compress(bytes(oversize))
+            if len(compressed) >= StreamDataMessage.MAX_DATA_LEN:
+                raise RuntimeError("crafted bomb chunk does not fit a single message")
+            # eof=True so an ACCEPTED chunk concludes the receiver stream cleanly;
+            # an aborted chunk never reaches the eof handling (unpack raises first).
+            message = StreamDataMessage(stream_id, compressed, eof=True, compressed=True)
+            if not _wait_ready():
+                return {"written": 0, "eof": False, "ready": False, "manifest": manifest}
+            env = channel.send(message)
+            return {
+                "written": 0,
+                "eof": True,
+                "bomb": True,
+                "decompressed_len": oversize,
+                "sequence": int(getattr(env, "sequence", -1)),
+                "manifest": manifest,
+                "max_chunk_len": int(RawChannelWriter.MAX_CHUNK_LEN),
+            }
+
+        writer = RawChannelWriter(stream_id, channel)
+        remaining = data
+        total = 0
+        write_returns = []
+        while remaining and time.time() < deadline:
+            if not channel.is_ready_to_send():
+                time.sleep(0.02)
+                continue
+            # eof_with_data: flag EOF on the final data-bearing write so its
+            # StreamDataMessage carries both payload and the EOF marker. The
+            # final write is the one whose remaining fits a single message.
+            if eof_with_data and len(remaining) <= StreamDataMessage.MAX_DATA_LEN:
+                writer._eof = True
+            n = writer.write(remaining)
+            if n and n > 0:
+                remaining = remaining[n:]
+                total += n
+                write_returns.append(int(n))
+            else:
+                time.sleep(0.02)
+
+        if use_close:
+            # RawChannelWriter.close drains the tx ring (waits for is_ready)
+            # then flushes an empty EOF message.
+            try:
+                writer.close()
+            except Exception:
+                pass
+        elif not eof_with_data:
+            # Default: flush an empty EOF message once the ring drains.
+            _wait_ready()
+            writer._eof = True
+            try:
+                writer.write(b"")
+            except Exception:
+                pass
+
+        # Let delivery settle so tx_ring_after reflects a drained ring (every
+        # emitted envelope proved and removed from the tx ring).
+        _wait_ready()
+        while time.time() < deadline:
+            try:
+                if len(channel._tx_ring) == 0:
+                    break
+            except Exception:
+                break
+            time.sleep(0.05)
+        try:
+            tx_ring_after = len(channel._tx_ring)
+        except Exception:
+            tx_ring_after = -1
+
+        return {
+            "written": total,
+            "eof": True,
+            "manifest": manifest,
+            "write_returns": write_returns,
+            "max_data_len": int(StreamDataMessage.MAX_DATA_LEN),
+            "max_chunk_len": int(RawChannelWriter.MAX_CHUNK_LEN),
+            "compression_tries": int(RawChannelWriter.COMPRESSION_TRIES),
+            "tx_ring_after": tx_ring_after,
+        }
+    finally:
+        try:
+            del channel.send
+        except Exception:
+            channel.send = orig_send
 
 
 def cmd_wire_buffer_received(params):
@@ -3928,6 +4093,16 @@ def cmd_wire_buffer_received(params):
 
     buffer_state = listener.get("buffer_state") or {}
     recv_lock = listener["recv_lock"]
+    # stream_id (default _WIRE_BUFFER_STREAM_ID): which receiver-relative
+    # RawChannelReader to drain. A reader registered for stream A sees nothing
+    # of a stream sent to B (Buffer.py:152) — read each id to pin that.
+    sid_param = params.get("stream_id")
+
+    def _reader():
+        if sid_param is not None:
+            return (buffer_state.get("readers") or {}).get(int(sid_param))
+        return buffer_state.get("reader")
+
     # Accumulate the reassembled stream as a hex string (the RawChannelReader
     # already holds the protocol-decoded bytes; we only concatenate the drained
     # chunks, never reconstruct any wire structure here). MAX_READ caps a single
@@ -3936,7 +4111,7 @@ def cmd_wire_buffer_received(params):
     data_hex = ""
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
-        reader = buffer_state.get("reader")
+        reader = _reader()
         chunk = None
         if reader is not None:
             try:
@@ -3952,7 +4127,7 @@ def cmd_wire_buffer_received(params):
             break
         time.sleep(0.05)
 
-    reader = buffer_state.get("reader")
+    reader = _reader()
     # Final drain.
     if reader is not None:
         try:
@@ -3967,6 +4142,157 @@ def cmd_wire_buffer_received(params):
         "eof": bool(reader is not None and getattr(reader, "_eof", False)),
         "aborted": bool(buffer_state.get("aborted")),
         "error": buffer_state.get("error"),
+    }
+
+
+def cmd_wire_channel_emit_capture(params):
+    """Send a REAL Channel message and capture the CONTEXT byte of the Packet
+    the Channel's outlet actually emits.
+
+    Wraps the link's LinkChannelOutlet.send to read the packet.context of every
+    packet it transmits (the packet is built by RNS itself —
+    LinkChannelOutlet.send does ``RNS.Packet(link, raw, context=RNS.Packet.CHANNEL)``,
+    Channel.py:669-670 — so this only READS the attribute), performs a real
+    Channel.send of a recording message, and returns {context, packet_hash,
+    delivered, channel_context}. `channel_context` is RNS.Packet.CHANNEL read
+    off the live module (the external ground-truth value the emit must equal).
+    """
+    RNS = _get_rns()
+    from RNS.Channel import MessageState
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+    timeout_ms = int(params.get("timeout_ms", 15000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+    outlet = channel._outlet
+
+    captured = []
+    orig_send = outlet.send
+
+    def capturing_send(raw, _orig=orig_send):
+        packet = _orig(raw)
+        try:
+            if packet is not None:
+                captured.append({
+                    "context": int(getattr(packet, "context", -1)),
+                    "packet_type": int(getattr(packet, "packet_type", -1)),
+                    "hash": (packet.packet_hash.hex()
+                             if getattr(packet, "packet_hash", None) else None),
+                })
+        except Exception:
+            pass
+        return packet
+
+    outlet.send = capturing_send
+    try:
+        deadline = time.time() + timeout_ms / 1000.0
+        while not channel.is_ready_to_send() and time.time() < deadline:
+            time.sleep(0.02)
+        msgclass = _get_channel_message_class()
+        envelope = channel.send(msgclass(payload))
+
+        def _delivered():
+            pkt = getattr(envelope, "packet", None)
+            if pkt is None:
+                return False
+            try:
+                return outlet.get_packet_state(pkt) == MessageState.MSGSTATE_DELIVERED
+            except Exception:
+                return False
+
+        while time.time() < deadline and not _delivered():
+            time.sleep(0.05)
+        last = captured[-1] if captured else {}
+        return {
+            "context": last.get("context"),
+            "packet_type": last.get("packet_type"),
+            "packet_hash": last.get("hash"),
+            "delivered": _delivered(),
+            "channel_context": int(RNS.Packet.CHANNEL),
+            "data_context": int(RNS.Packet.NONE),
+        }
+    finally:
+        try:
+            del outlet.send
+        except Exception:
+            outlet.send = orig_send
+
+
+def cmd_wire_listener_proof_log(params):
+    """Return the receiver-side proof log for a listening destination.
+
+    {contexts: [int,...], channel_proofs: int}. `contexts` is the context byte
+    of every inbound packet the receiver PROVED (its inbound Link.prove_packet),
+    in order; `channel_proofs` counts the CHANNEL-context (0x0E) proofs. A peer
+    with NO open channel proves ZERO CHANNEL packets (Link.py:1166-1167 drops
+    them unproven); a peer with a channel proves them (Link.py:1172).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+    with listener["recv_lock"]:
+        contexts = list(listener.get("proof_log", []))
+    channel_ctx = int(RNS.Packet.CHANNEL)
+    return {
+        "contexts": contexts,
+        "channel_proofs": sum(1 for c in contexts if c == channel_ctx),
+        "channel_context": channel_ctx,
+    }
+
+
+def cmd_wire_listener_channel_rx(params):
+    """Read the receiver-side Channel rx state for a listening destination.
+
+    Returns {next_rx_sequence, next_sequence, rx_ring} read straight off the
+    inbound Link's real RNS.Channel. The receive sequence advances only when a
+    StreamDataMessage/Envelope unpacks cleanly (Channel._receive); a chunk that
+    aborts the decompression bound never advances it (Buffer.py:95-97 raises in
+    unpack, before the sequence bump).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+    buffer_state = listener.get("buffer_state") or {}
+    reader = buffer_state.get("reader")
+    channel = None
+    if reader is not None:
+        channel = getattr(reader, "_channel", None)
+    if channel is None:
+        with listener["recv_lock"]:
+            links = list(listener.get("inbound_links", []))
+        if links:
+            channel = links[0].get_channel()
+    if channel is None:
+        raise ValueError("no inbound channel on this listener")
+    return {
+        "next_rx_sequence": int(channel._next_rx_sequence),
+        "next_sequence": int(channel._next_sequence),
+        "rx_ring": len(channel._rx_ring),
     }
 
 
@@ -6795,7 +7121,10 @@ WIRE_COMMANDS = {
     "wire_channel_received": cmd_wire_channel_received,
     "wire_channel_window": cmd_wire_channel_window,
     "wire_channel_send": cmd_wire_channel_send,
+    "wire_channel_emit_capture": cmd_wire_channel_emit_capture,
     "wire_channel_register": cmd_wire_channel_register,
+    "wire_listener_proof_log": cmd_wire_listener_proof_log,
+    "wire_listener_channel_rx": cmd_wire_listener_channel_rx,
     "wire_channel_envelope_pack": cmd_wire_channel_envelope_pack,
     "wire_buffer_pack": cmd_wire_buffer_pack,
     # Buffer (RawChannelReader/Writer) streaming

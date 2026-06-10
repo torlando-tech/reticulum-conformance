@@ -3175,11 +3175,19 @@ def _ensure_channel_state(inst, link_id):
 def cmd_wire_channel_inject(params):
     """Feed crafted envelopes into a link's real RNS.Channel receive path.
 
-    envelopes: list of {sequence: int, data: hex}. Each is packed into a real
-    RNS.Channel.Envelope (struct ">HHH" MSGTYPE/sequence/len + payload) and
-    handed to Channel._receive — exactly the bytes the channel would see off
-    the wire. RNS then reorders by sequence and drops duplicates; delivered
-    payloads (in delivery order) are observable via wire_channel_received.
+    envelopes: list of {sequence: int, data: hex, msgtype?: int}. Each is packed
+    into a real RNS.Channel.Envelope (struct ">HHH" MSGTYPE/sequence/len +
+    payload) and handed to Channel._receive — exactly the bytes the channel would
+    see off the wire. RNS then reorders by sequence and drops duplicates;
+    delivered payloads (in delivery order) are observable via
+    wire_channel_received.
+
+    `msgtype` (optional, per envelope) overrides the Channel MSGTYPE. Omitted (or
+    equal to the registered wire msgtype) -> the normal registered message type.
+    Any other value packs an envelope whose MSGTYPE is NOT in the channel's
+    message factories, so RNS drops it without advancing the rx sequence — the
+    observable for the unregistered-msgtype-dropped rule. The packing always goes
+    through real RNS Envelope.pack; only the message class's MSGTYPE differs.
     """
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
@@ -3190,13 +3198,32 @@ def cmd_wire_channel_inject(params):
         raise ValueError(f"Unknown handle: {handle}")
     state = _ensure_channel_state(inst, link_id)
     channel = state["channel"]
-    msgclass = _get_channel_message_class()
-    from RNS.Channel import Envelope
+    default_msgclass = _get_channel_message_class()
+    from RNS.Channel import Envelope, MessageBase
+
+    def _msgclass_for(msgtype):
+        if msgtype is None or int(msgtype) == _WIRE_CHANNEL_MSGTYPE:
+            return default_msgclass
+
+        class _AdHocChannelMessage(MessageBase):
+            MSGTYPE = int(msgtype)
+
+            def __init__(self, data=b""):
+                self.data = bytes(data)
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = bytes(raw)
+
+        return _AdHocChannelMessage
 
     injected = []
     for env in envelopes:
         seq = int(env["sequence"])
         data = bytes.fromhex(env.get("data", ""))
+        msgclass = _msgclass_for(env.get("msgtype"))
         message = msgclass(data)
         envelope = Envelope(outlet=channel._outlet, message=message, sequence=seq)
         raw = envelope.pack()

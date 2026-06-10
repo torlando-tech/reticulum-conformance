@@ -1127,8 +1127,9 @@ class _WirePeer:
         injected sequence list.
         """
         assert self.handle, "start_* must be called first"
-        wire_envelopes = [
-            {
+        wire_envelopes = []
+        for e in envelopes:
+            env = {
                 "sequence": int(e["sequence"]),
                 "data": (
                     e["data"].hex()
@@ -1136,8 +1137,9 @@ class _WirePeer:
                     else (e.get("data") or "")
                 ),
             }
-            for e in envelopes
-        ]
+            if e.get("msgtype") is not None:
+                env["msgtype"] = int(e["msgtype"])
+            wire_envelopes.append(env)
         resp = self.bridge.execute(
             "wire_channel_inject",
             handle=self.handle,

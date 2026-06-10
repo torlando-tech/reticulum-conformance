@@ -420,6 +420,111 @@ def cmd_token_verify_hmac(params):
     }
 
 
+def cmd_token_generate_key(params):
+    """Generate a Token key for a chosen AES mode via real RNS.
+
+    Delegates to RNS.Cryptography.Token.Token.generate_key(mode), mapping the
+    `mode` string to the genuine RNS AES class object that generate_key
+    dispatches on (Token.py:53-56). This pins the documented key lengths —
+    AES_128_CBC -> 32 bytes (a 16-byte signing key + 16-byte encryption key),
+    AES_256_CBC (the default) -> 64 bytes (32+32) — and the TypeError RNS
+    raises for any unrecognised mode. Previously generate_key was reachable
+    only implicitly through GROUP key creation in the default mode, so neither
+    the 128-bit length nor the invalid-mode path was observable. (N-Mcrypto)
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_128_CBC as _AES128, AES_256_CBC as _AES256
+    from RNS.Cryptography.Token import Token as _Token
+
+    mode_name = params.get('mode', 'AES_256_CBC')
+    # Map the request string onto the REAL RNS AES class generate_key compares
+    # against. An unknown string is forwarded verbatim so RNS itself raises the
+    # TypeError (we do not synthesise the error ourselves).
+    mode_map = {'AES_128_CBC': _AES128, 'AES_256_CBC': _AES256}
+    mode_arg = mode_map.get(mode_name, mode_name)
+    key = _Token.generate_key(mode_arg)
+    return {'key': bytes_to_hex(key)}
+
+
+def cmd_crypto_provider_op(params):
+    """Run one primitive through a CHOSEN RNS crypto provider (internal|pyca).
+
+    RNS selects its crypto backend once at import time (Provider.py): the
+    pure-Python primitives (PROVIDER_INTERNAL) or the OpenSSL/PyCA bindings
+    (PROVIDER_PYCA). Every other bridge command exercises only whichever the
+    install happens to pick, so the two providers are never compared. This
+    command drives the SAME input through a NAMED provider's REAL RNS
+    implementation so a test can assert byte-identical output across both
+    backends (the conformance requirement that the two providers are drop-in
+    equivalent on the wire).
+
+    No protocol bytes are assembled here — every value is produced by a genuine
+    RNS class:
+      * X25519/Ed25519 dispatch on distinct classes — internal lives in
+        RNS.Cryptography.X25519/.Ed25519, PyCA in RNS.Cryptography.Proxies — so
+        we import the chosen pair directly.
+      * AES_256_CBC dispatches INSIDE RNS.Cryptography.AES on Provider.PROVIDER;
+        we temporarily set that flag and reload the module so RNS's own dispatch
+        selects the requested backend, then restore it. (N-Mcrypto)
+    """
+    RNS = _get_full_rns()
+    import importlib
+    import RNS.Cryptography.Provider as _cp
+
+    op = params['op']
+    provider = params['provider']
+    if provider not in ('internal', 'pyca'):
+        raise ValueError(f"Unknown provider: {provider}")
+
+    if op == 'x25519_exchange':
+        if provider == 'internal':
+            from RNS.Cryptography.X25519 import X25519PrivateKey as Priv, X25519PublicKey as Pub
+        else:
+            from RNS.Cryptography.Proxies import (
+                X25519PrivateKeyProxy as Priv, X25519PublicKeyProxy as Pub)
+        priv = Priv.from_private_bytes(hex_to_bytes(params['private_key']))
+        peer = Pub.from_public_bytes(hex_to_bytes(params['peer_public_key']))
+        return {'result': bytes_to_hex(priv.exchange(peer))}
+
+    if op == 'ed25519_sign':
+        if provider == 'internal':
+            from RNS.Cryptography.Ed25519 import Ed25519PrivateKey as Priv
+        else:
+            from RNS.Cryptography.Proxies import Ed25519PrivateKeyProxy as Priv
+        priv = Priv.from_private_bytes(hex_to_bytes(params['private_key']))
+        return {'result': bytes_to_hex(priv.sign(hex_to_bytes(params['message'])))}
+
+    if op == 'ed25519_verify':
+        if provider == 'internal':
+            from RNS.Cryptography.Ed25519 import Ed25519PublicKey as Pub
+        else:
+            from RNS.Cryptography.Proxies import Ed25519PublicKeyProxy as Pub
+        pub = Pub.from_public_bytes(hex_to_bytes(params['public_key']))
+        try:
+            pub.verify(hex_to_bytes(params['signature']), hex_to_bytes(params['message']))
+            return {'valid': True}
+        except Exception:
+            return {'valid': False}
+
+    if op == 'aes_256_cbc_encrypt':
+        import RNS.Cryptography.AES as _AESmod
+        target = _cp.PROVIDER_INTERNAL if provider == 'internal' else _cp.PROVIDER_PYCA
+        saved = _cp.PROVIDER
+        try:
+            _cp.PROVIDER = target
+            importlib.reload(_AESmod)
+            ct = _AESmod.AES_256_CBC.encrypt(
+                hex_to_bytes(params['plaintext']),
+                hex_to_bytes(params['key']),
+                hex_to_bytes(params['iv']))
+        finally:
+            _cp.PROVIDER = saved
+            importlib.reload(_AESmod)
+        return {'result': bytes_to_hex(ct)}
+
+    raise ValueError(f"Unknown op: {op}")
+
+
 def cmd_identity_from_private_key(params):
     """Derive public key + hash from a 64-byte Identity private key.
 
@@ -2993,6 +3098,8 @@ COMMANDS = {
     'token_encrypt': cmd_token_encrypt,
     'token_decrypt': cmd_token_decrypt,
     'token_verify_hmac': cmd_token_verify_hmac,
+    'token_generate_key': cmd_token_generate_key,
+    'crypto_provider_op': cmd_crypto_provider_op,
     'identity_from_private_key': cmd_identity_from_private_key,
     'identity_encrypt': cmd_identity_encrypt,
     'identity_decrypt': cmd_identity_decrypt,

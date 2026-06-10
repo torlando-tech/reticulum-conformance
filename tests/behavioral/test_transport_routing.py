@@ -1,7 +1,7 @@
 """
 Behavioral tests: Transport core routing state machines (§4a).
 
-These close five confirmed-untested Transport-core gaps, each driven entirely
+These close confirmed-untested Transport-core gaps, each driven entirely
 through the real RNS `Transport.inbound` / `Transport.jobs` paths via the
 behavioral harness (inject raw bytes on a MockInterface, observe the resulting
 table state / emitted bytes). No RNS internals are reimplemented in the test;
@@ -788,6 +788,66 @@ def test_announce_rebroadcast_wire_format(behavioral):
         assert out["hops"] == 3, (
             f"wire_hops=2 + receive increment -> hops==3 on the rebroadcast, "
             f"got {out['hops']}"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_read_path_table"],
+    verifies=(
+        "An interface WITHOUT IFAC enabled drops any inbound packet that has the "
+        "IFAC flag bit (raw[0] & 0x80) set, before unpack (Transport.inbound IFAC "
+        "gate, else branch): a genuine announce with the flag clear is admitted "
+        "to the path table (positive control), but the byte-identical announce "
+        "with bit 7 forced on is dropped — no path entry. Confirms both that the "
+        "packet layer emits the IFAC flag as 0 and that an open interface refuses "
+        "IFAC-flagged traffic (an impl that ignores the flag accepts spoofed "
+        "IFAC-tagged packets)"
+    ),
+)
+def test_ifac_flagged_packet_dropped_on_open_interface(behavioral):
+    """Non-IFAC (open) MockInterface: an announce with raw[0]&0x80==0 is learned,
+    but the same announce with bit 7 set is dropped at the inbound IFAC gate
+    before reaching the path table. Two fresh instances so the negative starts
+    clean. Discriminating: an impl missing the open-interface IFAC-flag drop
+    learns the flagged announce's path (fails the negative)."""
+    # Positive control: a normally-flagged (bit 7 == 0) announce is admitted.
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface = inst.attach_mock_interface("open", mode="FULL")
+        raw, dest, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance", aspects=["ifac_open"], wire_hops=0,
+        )
+        assert raw[0] & 0x80 == 0, "packet layer must emit the IFAC flag bit as 0"
+        inst.inject(iface, raw)
+        time.sleep(0.2)
+        assert inst.read_path_table(dest)["found"] is True, (
+            "a non-IFAC-flagged announce was not learned on an open interface "
+            "(positive control)"
+        )
+    finally:
+        behavioral.cleanup()
+
+    # Negative: the same announce with the IFAC flag forced on must be dropped.
+    inst2 = behavioral.start(enable_transport=True)
+    try:
+        iface2 = inst2.attach_mock_interface("open", mode="FULL")
+        raw2, dest2, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance", aspects=["ifac_open"], wire_hops=0,
+        )
+        flagged = bytearray(raw2)
+        flagged[0] |= 0x80  # set the IFAC flag with no IFAC field present
+        inst2.inject(iface2, bytes(flagged))
+        time.sleep(0.2)
+        assert inst2.read_path_table(dest2)["found"] is False, (
+            "an IFAC-flagged packet was accepted on an interface without IFAC "
+            "enabled — the open-interface IFAC-flag drop did not fire"
         )
     finally:
         behavioral.cleanup()

@@ -1998,6 +1998,75 @@ class _WirePeer:
             "wire_inject_crafted_lrproof", handle=self.handle, variant=variant,
         )
 
+    def link_request_payload(
+        self, app_name: str = "conformance", aspects: list | None = None,
+    ) -> dict:
+        """Capture a real initiator LINKREQUEST payload WITHOUT sending it
+        (Packet.send patched off in the bridge), reporting the request_data and
+        its pub_bytes/sig_pub_bytes/signalling_bytes/mtu/mode/len fields read off
+        the live RNS.Link (Link.py:316). Lets a test pin the unencrypted layout
+        and the fresh-ephemeral-key property."""
+        assert self.handle, "start_* must be called first"
+        kwargs: dict = {"handle": self.handle, "app_name": app_name}
+        if aspects is not None:
+            kwargs["aspects"] = list(aspects)
+        return self.bridge.execute("wire_link_request_payload", **kwargs)
+
+    def link_signalling_bytes(self, mtu: int, mode: int) -> dict:
+        """Delegate to the static RNS.Link.signalling_bytes(mtu, mode), returning
+        the 3-byte signalling field for an enabled mode or {raised: True} for a
+        non-enabled mode, plus the bytemasks / enabled-mode list for independent
+        recomputation."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_signalling_bytes", handle=self.handle,
+            mtu=int(mtu), mode=int(mode),
+        )
+
+    def inject_crafted_link_request(self, variant: str, hops: int = 0) -> dict:
+        """Adversarial LINKREQUEST size/mode injector: feed a crafted payload of
+        `variant` (valid64 / valid67 / size_63 / size_66 / size_0 / bad_mode)
+        through the real Link.validate_request on a fresh self-owned IN
+        destination, reporting {variant, data_len, accepted, inbound_link_created,
+        establishment_timeout, mode, ...}. Only 64/67-byte enabled-mode payloads
+        create a link. `hops` sets the crafted packet's hop count for the
+        establishment_timeout derivation."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_request",
+            handle=self.handle, variant=variant, hops=int(hops),
+        )
+
+    def link_accept_gate(self, accepts: bool) -> dict:
+        """Drive Destination.accepts_links(accepts) then feed a genuine
+        LINKREQUEST through Destination.receive on a fresh self-owned IN
+        destination, reporting {accepts, links_before, links_after,
+        link_created}. Gate OFF -> no link; gate ON -> exactly one."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_accept_gate", handle=self.handle, accepts=bool(accepts),
+        )
+
+    def link_key_material(self, link_id: bytes) -> dict:
+        """Report which ephemeral-key fields (derived_key/shared_key/prv/pub) the
+        live RNS.Link currently holds. An ACTIVE link holds all four; after
+        Link.teardown the link_closed() purge nulls them all."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_key_material", handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def inject_closed_link_data(self, link_id: bytes) -> dict:
+        """Cache a pristine DATA packet encrypted to the still-ACTIVE inbound
+        link, tear the link down, then replay the cached packet through
+        link.receive — reporting {delivered, status_name, link_closed}. A CLOSED
+        link drops all traffic (Link.receive guard). Run on the RECEIVER peer."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_closed_link_data", handle=self.handle,
+            link_id=link_id.hex(),
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,
@@ -2264,6 +2333,26 @@ def wire_peers(wire_pair):
                 b.close()
             except Exception:
                 pass
+
+
+@pytest.fixture
+def wire_pair_started(wire_peers):
+    """A server/client TCP pair, both STARTED (interfaces up, settled), but with
+    NO destination/link opened.
+
+    For self-contained link-internals injectors that drive real RNS.Link /
+    RNS.Destination code on a peer's live instance without needing an
+    established wire link (request-payload capture, signalling-byte encoding,
+    LINKREQUEST size/mode validation, the destination accept gate). Yields
+    (server, client) ready to take wire_* commands.
+    """
+    server, client = wire_peers
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="", passphrase="", target_host="127.0.0.1", target_port=port,
+    )
+    time.sleep(0.5)
+    return server, client
 
 
 @pytest.fixture

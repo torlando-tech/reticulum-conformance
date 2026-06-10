@@ -4878,6 +4878,9 @@ def cmd_wire_inject_tampered_link_data(params):
       ciphertext — flip a byte inside IV/ciphertext -> HMAC mismatch -> drop.
       hmac       — flip the trailing HMAC byte -> mismatch -> drop.
       truncate   — drop the last byte -> malformed token -> drop.
+      foreign_interface — a PRISTINE packet, but presented on an interface that
+                 is NOT link.attached_interface -> Link.receive's interface-bind
+                 check (Link.py:975) rejects it before decrypt -> not delivered.
 
     Run this on the RECEIVER peer (it owns the inbound link + its packet
     handler). Returns {corruption, unpacked, delivered, link_active,
@@ -4932,13 +4935,27 @@ def cmd_wire_inject_tampered_link_data(params):
         raw[-1] = (raw[-1] + 1) % 256
     elif corruption == "truncate":
         raw = raw[:-1]
-    elif corruption != "none":
+    elif corruption in ("none", "foreign_interface"):
+        pass  # packet stays pristine; foreign_interface only changes rx iface
+    else:
         raise ValueError(f"unknown corruption: {corruption!r}")
 
     rx = RNS.Packet(None, bytes(raw))
     unpacked = rx.unpack()
     if unpacked:
-        rx.receiving_interface = link.attached_interface
+        if corruption == "foreign_interface":
+            # A real interface object that is NOT this link's attached one, so
+            # the bind check rejects an otherwise-valid packet. Any live
+            # interface on this handle other than the link's works; fall back
+            # to a sentinel object if none is available.
+            foreign = None
+            for cand in _interfaces_matching_handle(inst["rns"], inst["role"]):
+                if cand is not link.attached_interface:
+                    foreign = cand
+                    break
+            rx.receiving_interface = foreign if foreign is not None else object()
+        else:
+            rx.receiving_interface = link.attached_interface
         link.receive(rx)
     # The packet handler runs synchronously in link.receive, but allow a tiny
     # settle margin for any deferred dispatch.
@@ -5815,6 +5832,434 @@ def cmd_wire_first_hop_timeout(params):
     }
 
 
+# ---------------------------------------------------------------------------
+# Link establishment internals: request-payload layout, signalling-byte
+# encoding, LINKREQUEST size/mode validation, the destination accept gate,
+# ephemeral-key purge on close, and closed/foreign-interface link-receive
+# rejection. Every one of these DRIVES real RNS.Link / RNS.Destination code —
+# the request_data assembly in Link.__init__, the static Link.signalling_bytes
+# / Link.validate_request gates, Destination.receive's accept gate, and the
+# link_closed() key purge — and reads back what RNS computed. Nothing here
+# reconstructs a wire field by hand (the one exception, the bad-mode signalling
+# byte in cmd_wire_inject_crafted_link_request, is registered in the audit's
+# ADVERSARIAL_CORRUPTORS).
+# ---------------------------------------------------------------------------
+
+def _any_handle_interface(inst):
+    """Return any live interface on this handle (for a plausible
+    receiving_interface on a crafted inbound packet), or None."""
+    try:
+        ifaces = list(_interfaces_matching_handle(inst["rns"], inst["role"]))
+    except Exception:
+        ifaces = []
+    return ifaces[0] if ifaces else None
+
+
+def _build_initiator_request_data(RNS, app_name, aspects):
+    """Build a real initiator RNS.Link to a fresh self-controlled OUT
+    destination WITHOUT putting a LINKREQUEST on the wire (Packet.send is
+    patched to a no-op for the construction), and return
+    (link, request_data). The request_data is exactly what Link.__init__
+    assembled at Link.py:316 — pub_bytes||sig_pub_bytes||signalling_bytes —
+    every byte produced by real RNS. Caller must teardown the link."""
+    dest_identity = RNS.Identity()
+    out_destination = RNS.Destination(
+        dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        app_name, *aspects,
+    )
+    orig_send = RNS.Packet.send
+
+    def _noop_send(_pkt_self):
+        return None
+
+    RNS.Packet.send = _noop_send
+    try:
+        link = RNS.Link(out_destination)
+    finally:
+        RNS.Packet.send = orig_send
+    return link, link.request_data
+
+
+def cmd_wire_link_request_payload(params):
+    """Capture an initiator's real LINKREQUEST payload WITHOUT sending it.
+
+    Builds a genuine initiator RNS.Link (Packet.send patched off so nothing
+    hits the wire) and returns the request_data RNS assembled at Link.py:316
+    plus its constituent fields. Lets a test pin the unencrypted LINKREQUEST
+    layout = pub_bytes(X25519, 32) || sig_pub_bytes(Ed25519, 32) ||
+    signalling_bytes(3), i.e. ECPUBSIZE(64) + LINK_MTU_SIZE(3) = 67 bytes
+    (validate_request also accepts the bare 64-byte ECPUBSIZE form). Every
+    field is read off the live Link — pub_bytes/sig_pub_bytes are the freshly
+    generated X25519/Ed25519 public keys, signalling_bytes is the tail RNS
+    appended via Link.signalling_bytes.
+
+    Called twice (fresh Link each time) a test can also assert the keys differ
+    between two requests to the same destination (fresh ephemeral X25519 +
+    Ed25519 per request, Link.py:240-258).
+
+    Returns {request_data_hex, pub_bytes, sig_pub_bytes, signalling_bytes,
+    mtu, mode, len, ecpubsize, link_mtu_size, reticulum_mtu}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params.get("app_name", "conformance")
+    aspects = params.get("aspects", ["link-payload"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link, request_data = _build_initiator_request_data(RNS, app_name, aspects)
+    try:
+        ecpubsize = int(RNS.Link.ECPUBSIZE)
+        link_mtu_size = int(RNS.Link.LINK_MTU_SIZE)
+        # Split per the documented layout. pub_bytes/sig_pub_bytes are read
+        # straight off the live Link (not re-sliced from request_data) so the
+        # field accessors are pinned independently of the concatenation.
+        result = {
+            "request_data_hex": request_data.hex(),
+            "pub_bytes": link.pub_bytes.hex(),
+            "sig_pub_bytes": link.sig_pub_bytes.hex(),
+            "signalling_bytes": request_data[ecpubsize:].hex(),
+            "mtu": int(link.mtu),
+            "mode": int(link.mode),
+            "len": len(request_data),
+            "ecpubsize": ecpubsize,
+            "link_mtu_size": link_mtu_size,
+            "reticulum_mtu": int(RNS.Reticulum.MTU),
+        }
+    finally:
+        try:
+            link.teardown()
+        except Exception:
+            pass
+    return result
+
+
+def cmd_wire_link_signalling_bytes(params):
+    """Delegate to the static RNS.Link.signalling_bytes(mtu, mode).
+
+    Returns the 3-byte signalling field RNS encodes for an ENABLED mode, or
+    {raised: True} when the mode is not in Link.ENABLED_MODES (signalling_bytes
+    raises TypeError for any non-enabled mode, Link.py:148-151). Surfaces the
+    bytemasks / enabled-mode list / default so a test can independently
+    recompute the (mtu&MTU_BYTEMASK)+(((mode<<5)&MODE_BYTEMASK)<<16) packing and
+    pin both the positive encoding and the non-enabled-mode rejection.
+
+    Returns {mtu, mode, signalling_bytes|None, raised, mtu_bytemask,
+    mode_bytemask, enabled_modes, mode_default, link_mtu_size}.
+    """
+    RNS = _get_rns()
+    mtu = int(params["mtu"])
+    mode = int(params["mode"])
+    raised = False
+    signalling = None
+    try:
+        signalling = RNS.Link.signalling_bytes(mtu, mode)
+    except TypeError:
+        raised = True
+    return {
+        "mtu": mtu,
+        "mode": mode,
+        "signalling_bytes": signalling.hex() if signalling is not None else None,
+        "raised": raised,
+        "mtu_bytemask": int(RNS.Link.MTU_BYTEMASK),
+        "mode_bytemask": int(RNS.Link.MODE_BYTEMASK),
+        "enabled_modes": [int(m) for m in RNS.Link.ENABLED_MODES],
+        "mode_default": int(RNS.Link.MODE_DEFAULT),
+        "link_mtu_size": int(RNS.Link.LINK_MTU_SIZE),
+    }
+
+
+def _craft_link_request_packet(RNS, owner_identity, app_name, aspects, data, hops):
+    """Pack a genuine LINKREQUEST packet carrying `data` (addressed to an OUT
+    destination of owner_identity) and return the unpacked rx packet with hops
+    set. The packet is produced entirely by RNS.Packet.pack — only the carried
+    `data` (a real-RNS-derived payload, possibly sliced/empty) is chosen by the
+    caller."""
+    out_owner = RNS.Destination(
+        owner_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        app_name, *aspects,
+    )
+    pkt = RNS.Packet(out_owner, data, packet_type=RNS.Packet.LINKREQUEST)
+    pkt.pack()
+    rx = RNS.Packet(None, pkt.raw)
+    rx.unpack()
+    rx.hops = int(hops)
+    return rx
+
+
+def cmd_wire_inject_crafted_link_request(params):
+    """Adversarial LINKREQUEST payload-validation injector (receiver side).
+
+    Self-contained: creates a fresh IN SINGLE destination it owns and feeds a
+    crafted LINKREQUEST of `variant` through the real Link.validate_request
+    (Link.py:185-209), reporting whether an inbound link was created. Pins that
+    ONLY a 64-byte (ECPUBSIZE) or 67-byte (ECPUBSIZE+LINK_MTU_SIZE) payload
+    yields a link; every other size is silently dropped, and a payload whose
+    signalling mode byte is a non-enabled link mode is rejected by the
+    handshake's mode gate (Link.handshake raises for any mode not AES128/256-CBC,
+    Link.signalling_bytes/prove reject any non-ENABLED mode).
+
+    Variants (the 64/67-byte base is a real initiator's request_data; the size
+    variants are slices of it / empty; bad_mode overwrites the signalling mode
+    byte with a reserved mode — the ONLY hand-set wire byte, hence this command
+    is registered in the audit's ADVERSARIAL_CORRUPTORS):
+      valid64  — request_data[:ECPUBSIZE]            -> link created.
+      valid67  — full request_data (ECPUBSIZE+3)     -> link created.
+      size_63  — request_data[:63]                   -> dropped.
+      size_66  — request_data[:66]                   -> dropped.
+      size_0   — empty payload                       -> dropped.
+      bad_mode — 67-byte payload, signalling mode byte set to reserved mode 3
+                 -> handshake mode gate rejects, no link created.
+
+    `hops` (default 0) sets the crafted packet's hop count so a test can pin the
+    inbound establishment_timeout == ESTABLISHMENT_TIMEOUT_PER_HOP*max(1,hops) +
+    KEEPALIVE (Link.py:207). Returns {variant, data_len, accepted,
+    inbound_link_created, establishment_timeout, mode, establishment_timeout_per_hop,
+    keepalive}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    variant = params["variant"]
+    hops = int(params.get("hops", 0))
+    app_name = params.get("app_name", "conformance")
+    aspects = params.get("aspects", ["lr-validate"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    owner_identity = RNS.Identity()
+    owner = RNS.Destination(
+        owner_identity, RNS.Destination.IN, RNS.Destination.SINGLE,
+        app_name, *aspects,
+    )
+
+    base_link, base = _build_initiator_request_data(RNS, app_name, aspects)
+    ecpubsize = int(RNS.Link.ECPUBSIZE)
+    try:
+        if variant == "valid64":
+            data = base[:ecpubsize]
+        elif variant == "valid67":
+            data = base
+        elif variant == "size_63":
+            data = base[:63]
+        elif variant == "size_66":
+            data = base[:66]
+        elif variant == "size_0":
+            data = b""
+        elif variant == "bad_mode":
+            corrupted = list(base)
+            # Set the signalling mode bits (top 3 bits of the first signalling
+            # byte) to reserved mode 3 (0x03 << 5 == 0x60). The low MTU bits in
+            # this byte are 0 for the default MTU, so this isolates the mode.
+            corrupted[ecpubsize] = 0x60
+            data = bytes(corrupted)
+        else:
+            raise ValueError(f"unknown link-request variant: {variant!r}")
+    finally:
+        try:
+            base_link.teardown()
+        except Exception:
+            pass
+
+    rx = _craft_link_request_packet(RNS, owner_identity, app_name, aspects, data, hops)
+    rx.receiving_interface = _any_handle_interface(inst)
+    # Transport normally resolves packet.destination before Destination.receive;
+    # set it to the owner so validate_request's `link.destination = packet.destination`
+    # has a real destination to bind.
+    rx.destination = owner
+
+    link = RNS.Link.validate_request(owner, rx.data, rx)
+    accepted = link is not None
+    establishment_timeout = None
+    mode = None
+    if accepted:
+        establishment_timeout = getattr(link, "establishment_timeout", None)
+        mode = int(link.mode) if getattr(link, "mode", None) is not None else None
+        try:
+            link.teardown()
+        except Exception:
+            pass
+
+    return {
+        "variant": variant,
+        "data_len": len(data),
+        "accepted": accepted,
+        "inbound_link_created": accepted,
+        "establishment_timeout": establishment_timeout,
+        "mode": mode,
+        "establishment_timeout_per_hop": int(RNS.Link.ESTABLISHMENT_TIMEOUT_PER_HOP),
+        "keepalive": int(RNS.Link.KEEPALIVE),
+    }
+
+
+def cmd_wire_link_accept_gate(params):
+    """Pin Destination's link-accept gate (Destination.receive -> only answers a
+    LINKREQUEST when accept_link_requests is set, Destination.py:420-423).
+
+    Self-contained: creates a fresh IN SINGLE destination, sets its accept gate
+    via the real Destination.accepts_links(accepts), feeds a genuine 67-byte
+    LINKREQUEST through the real Destination.receive, and reports whether an
+    inbound link was appended to destination.links. With the gate OFF no link is
+    created (validate_request is never reached); with it ON exactly one link is
+    created — the positive control.
+
+    Returns {accepts, links_before, links_after, link_created}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    accepts = bool(params["accepts"])
+    app_name = params.get("app_name", "conformance")
+    aspects = params.get("aspects", ["accept-gate"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    owner_identity = RNS.Identity()
+    owner = RNS.Destination(
+        owner_identity, RNS.Destination.IN, RNS.Destination.SINGLE,
+        app_name, *aspects,
+    )
+    owner.accepts_links(accepts)
+
+    base_link, base = _build_initiator_request_data(RNS, app_name, aspects)
+    try:
+        rx = _craft_link_request_packet(
+            RNS, owner_identity, app_name, aspects, base, 0,
+        )
+    finally:
+        try:
+            base_link.teardown()
+        except Exception:
+            pass
+    rx.receiving_interface = _any_handle_interface(inst)
+    rx.destination = owner
+
+    links_before = len(owner.links)
+    owner.receive(rx)
+    links_after = len(owner.links)
+    # Clean up any link the gate created.
+    for lk in list(owner.links):
+        try:
+            lk.teardown()
+        except Exception:
+            pass
+    return {
+        "accepts": accepts,
+        "links_before": links_before,
+        "links_after": links_after,
+        "link_created": links_after > links_before,
+    }
+
+
+def cmd_wire_link_key_material(params):
+    """Report which ephemeral-key fields an established link currently holds.
+
+    Reads the live RNS.Link's prv / pub / shared_key / derived_key. An ACTIVE
+    link holds all four (the X25519 ephemeral private/public + the ECDH shared
+    secret + the HKDF-derived link key). After Link.teardown the link_closed()
+    purge (Link.py:728-733) nulls prv/pub/shared_key/derived_key, so the same
+    link reports all None — pinning forward-secret ephemeral-key purge on close
+    with no persistence.
+
+    Returns {status, status_name, derived_key_present, shared_key_present,
+    prv_present, pub_present}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    status = getattr(link, "status", None)
+    return {
+        "status": int(status) if status is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status),
+        "derived_key_present": getattr(link, "derived_key", None) is not None,
+        "shared_key_present": getattr(link, "shared_key", None) is not None,
+        "prv_present": getattr(link, "prv", None) is not None,
+        "pub_present": getattr(link, "pub", None) is not None,
+    }
+
+
+def cmd_wire_inject_closed_link_data(params):
+    """Pin that a CLOSED link silently drops all link-associated traffic
+    (Link.receive's `if not self.status == Link.CLOSED` guard, Link.py:974).
+
+    Builds a PRISTINE DATA packet encrypted to the still-ACTIVE inbound link
+    (RNS.Packet.pack, while the link key still exists), caches its raw bytes,
+    then tears the link down (Link.teardown, which purges derived_key so no new
+    packet could be encrypted post-close), and finally feeds the cached packet
+    through the real link.receive. The packet must NOT be delivered because
+    receive returns immediately once status == CLOSED. Run on the RECEIVER peer.
+
+    Returns {delivered_before, delivered, status_name, link_closed}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", "")) or secrets.token_bytes(16)
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    listener = None
+    for cand in inst.get("listeners", {}).values():
+        with cand["recv_lock"]:
+            ids = [getattr(x, "link_id", None) for x in cand.get("inbound_links", [])]
+        if link_id in ids:
+            listener = cand
+            break
+    if listener is None:
+        raise ValueError(
+            f"link_id {link_id.hex()} is not an inbound link of any listener on "
+            f"this peer (run on the RECEIVER peer)"
+        )
+
+    # Build + pack a pristine DATA packet BEFORE teardown (the link key is
+    # purged on close, so this MUST happen while the link is still ACTIVE).
+    out_packet = RNS.Packet(link, payload, context=RNS.Packet.NONE)
+    out_packet.pack()
+    cached_raw = out_packet.raw
+
+    with listener["recv_lock"]:
+        before = len(listener["recv_buffer"])
+
+    # Now close the link, then replay the cached packet into receive.
+    try:
+        link.teardown()
+    except Exception:
+        pass
+    time.sleep(0.05)
+
+    rx = RNS.Packet(None, cached_raw)
+    if rx.unpack():
+        rx.receiving_interface = link.attached_interface
+        link.receive(rx)
+    time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        after = len(listener["recv_buffer"])
+    status_after = getattr(link, "status", None)
+    return {
+        "delivered_before": False,
+        "delivered": after > before,
+        "status_name": _LINK_STATUS_NAMES.get(status_after),
+        "link_closed": status_after == RNS.Link.CLOSED,
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -5909,6 +6354,15 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
     "wire_inject_crafted_resource_proof": cmd_wire_inject_crafted_resource_proof,
     "wire_inject_crafted_resource_part": cmd_wire_inject_crafted_resource_part,
+    # Link establishment internals (request-payload layout / signalling-byte
+    # encoding / LINKREQUEST size+mode validation / accept gate / key purge /
+    # closed-link drop)
+    "wire_link_request_payload": cmd_wire_link_request_payload,
+    "wire_link_signalling_bytes": cmd_wire_link_signalling_bytes,
+    "wire_inject_crafted_link_request": cmd_wire_inject_crafted_link_request,
+    "wire_link_accept_gate": cmd_wire_link_accept_gate,
+    "wire_link_key_material": cmd_wire_link_key_material,
+    "wire_inject_closed_link_data": cmd_wire_inject_closed_link_data,
     "wire_resource_constants": cmd_wire_resource_constants,
     "wire_inject_crafted_resource_request": cmd_wire_inject_crafted_resource_request,
     "wire_resource_force_collision": cmd_wire_resource_force_collision,

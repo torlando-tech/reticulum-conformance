@@ -171,6 +171,12 @@ ADVERSARIAL_CORRUPTORS: dict[str, str] = {
         "damages one byte (or truncates), and feeds it to the real link.receive; "
         "asserts the genuine packet is delivered and the tampered one is dropped "
         "by RNS's own token-HMAC-before-decrypt — no protocol assembled here.",
+    "cmd_wire_inject_crafted_link_request":
+        "Feeds a crafted LINKREQUEST payload through the real "
+        "Link.validate_request. The 64/67-byte and size variants are slices of "
+        "a real initiator's request_data; the bad_mode variant overwrites the "
+        "single signalling mode byte of that real payload with a reserved mode "
+        "to prove the handshake mode gate rejects it — no protocol assembled.",
 }
 
 # Live-instance accessors / RNS loaders. A handler that *calls* one of these is

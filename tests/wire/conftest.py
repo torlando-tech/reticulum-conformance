@@ -1168,6 +1168,17 @@ class _WirePeer:
         assert self.handle, "start_* must be called first"
         wire_envelopes = []
         for e in envelopes:
+            if e.get("raw") is not None:
+                # Raw-override: crafted envelope bytes fed verbatim to
+                # Channel._receive (bypassing Envelope.pack) — e.g. a wrong
+                # length field. sequence is informational only.
+                raw = e["raw"]
+                env = {
+                    "raw": raw.hex() if isinstance(raw, (bytes, bytearray)) else raw,
+                    "sequence": int(e.get("sequence", -1)),
+                }
+                wire_envelopes.append(env)
+                continue
             env = {
                 "sequence": int(e["sequence"]),
                 "data": (
@@ -1205,11 +1216,27 @@ class _WirePeer:
             "wire_channel_window", handle=self.handle, link_id=link_id.hex()
         )
 
+    def channel_register(self, link_id: bytes, kind: str) -> dict:
+        """Drive Channel message-type registration validation on a real channel.
+
+        kind selects a crafted message class (non_message_base, msgtype_none,
+        reserved, not_constructible, valid) or the special
+        envelope_pack_no_msgtype path. Returns {accepted, error, ce_type}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_register",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            kind=kind,
+        )
+
     def channel_send(
         self,
         link_id: bytes,
         data: bytes,
         drop_acks: bool = False,
+        fail_outlet: bool = False,
         msgtype: int | None = None,
         timeout_ms: int = 20000,
     ) -> dict:
@@ -1249,6 +1276,7 @@ class _WirePeer:
             "link_id": link_id.hex(),
             "data": data.hex(),
             "drop_acks": bool(drop_acks),
+            "fail_outlet": bool(fail_outlet),
             "timeout_ms": int(timeout_ms),
         }
         if msgtype is not None:

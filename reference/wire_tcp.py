@@ -3325,6 +3325,17 @@ def cmd_wire_channel_inject(params):
 
     injected = []
     for env in envelopes:
+        if env.get("raw") is not None:
+            # Raw-override: feed crafted envelope bytes verbatim to the live
+            # Channel._receive, bypassing Envelope.pack entirely. The receiver
+            # parses the `>HHH` header off these exact bytes — used to drive a
+            # deliberately-wrong length field (the receiver ignores it and
+            # delivers raw[6:] regardless). The crafted bytes originate in the
+            # test (not assembled here); the bridge only hands them to RNS.
+            raw = bytes.fromhex(env["raw"])
+            channel._receive(raw)
+            injected.append(int(env.get("sequence", -1)))
+            continue
         seq = int(env["sequence"])
         data = bytes.fromhex(env.get("data", ""))
         msgclass = _msgclass_for(env.get("msgtype"))
@@ -3409,6 +3420,11 @@ def cmd_wire_channel_window(params):
         "tx_ring": len(ch._tx_ring),
         "tx_tries": max_tries,
         "tx_envelopes": tx_envelopes,
+        # Channel.mdu (Channel.py:642-655): outlet.mdu - 6, capped at 0xFFFF.
+        "mdu": int(ch.mdu),
+        # The uncapped outlet (link) MDU the ME_TOO_BIG guard actually compares
+        # against (Channel.send checks len(raw) > outlet.mdu, NOT channel.mdu).
+        "outlet_mdu": int(ch._outlet.mdu),
     }
 
 
@@ -3445,6 +3461,7 @@ def cmd_wire_channel_send(params):
     link_id = bytes.fromhex(link_id_hex)
     payload = bytes.fromhex(params.get("data", ""))
     drop_acks = bool(params.get("drop_acks", False))
+    fail_outlet = bool(params.get("fail_outlet", False))
     msgtype = params.get("msgtype")
     timeout_ms = int(params.get("timeout_ms", 20000))
 
@@ -3523,7 +3540,43 @@ def cmd_wire_channel_send(params):
             outlet.resend = dropping_resend
             outlet._wire_drop_acks = True
 
-    envelope = channel.send(message)
+    from RNS.Channel import ChannelException
+
+    if fail_outlet:
+        # Fault-injection: make the outlet's transmit return None for THIS send
+        # so Channel.send hits its "outlet did not transmit" branch — which
+        # RESTORES the reserved _next_sequence and raises ME_LINK_NOT_READY
+        # (Channel.py:619-626). Restored synchronously, then the wrapper is
+        # removed so a subsequent normal send reuses the freed sequence.
+        outlet = channel._outlet
+        orig_send = outlet.send
+        outlet.send = lambda raw: None
+        try:
+            channel.send(message)
+            outlet.send = orig_send
+            return {"sent": True, "rejected": False, "error": None,
+                    "next_sequence": int(channel._next_sequence)}
+        except ChannelException as e:
+            outlet.send = orig_send
+            return {
+                "sent": False, "rejected": True, "delivered": False,
+                "error": str(e), "ce_type": int(e.type),
+                "next_sequence": int(channel._next_sequence),
+                "window": int(channel.window), "window_max": int(channel.window_max),
+            }
+
+    try:
+        envelope = channel.send(message)
+    except ChannelException as e:
+        # ME_TOO_BIG and any other channel-layer rejection: the message was
+        # NOT transmitted and (for ME_TOO_BIG) _next_sequence was not advanced
+        # (the size guard runs before the increment, Channel.py:614-617).
+        return {
+            "sent": False, "rejected": True, "delivered": False,
+            "error": str(e), "ce_type": int(e.type),
+            "next_sequence": int(channel._next_sequence),
+            "window": int(channel.window), "window_max": int(channel.window_max),
+        }
 
     # Observe the outcome: delivery (non-drop) or retransmit/teardown (drop).
     def _delivered():
@@ -3543,13 +3596,215 @@ def cmd_wire_channel_send(params):
 
     return {
         "sent": True,
+        "rejected": False,
         "delivered": _delivered(),
         "tries": int(getattr(envelope, "tries", 0) or 0),
         "sequence": int(getattr(envelope, "sequence", -1)),
+        "next_sequence": int(channel._next_sequence),
         "window": int(channel.window),
         "window_max": int(channel.window_max),
         "link_status": int(getattr(link, "status", -1)) if link is not None else None,
     }
+
+
+def cmd_wire_channel_register(params):
+    """Drive RNS.Channel message-type registration validation on a real channel.
+
+    `kind` selects a crafted message class fed to the live
+    Channel._register_message_type / Channel.register_message_type
+    (Channel.py:318-345), returning {accepted, error, ce_type} — the
+    ChannelException code RNS raised (or None on accept). Kinds:
+
+      valid             — a well-formed MessageBase subclass; accepted.
+      non_message_base  — a plain class (not a MessageBase subclass).
+      msgtype_none      — a MessageBase subclass whose MSGTYPE is None.
+      reserved          — a MessageBase subclass with MSGTYPE >= 0xf000.
+      not_constructible — a MessageBase subclass whose __init__ requires args
+                          (so message_class() raises during validation).
+
+    The special kind `envelope_pack_no_msgtype` instead exercises
+    Envelope.pack's ME_NO_MSG_TYPE guard (Channel.py:193-194): it packs a real
+    Envelope wrapping a MSGTYPE-None message and returns the raised ce_type.
+
+    All exceptions come from real RNS; the bridge only constructs the crafted
+    classes and reports what RNS did.
+    """
+    RNS = _get_rns()
+    from RNS.Channel import MessageBase, ChannelException, Envelope
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    kind = params["kind"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+
+    if kind == "envelope_pack_no_msgtype":
+        class _NoTypeMessage(MessageBase):
+            MSGTYPE = None
+
+            def pack(self):
+                return b""
+
+            def unpack(self, raw):
+                pass
+
+        try:
+            Envelope(outlet=None, message=_NoTypeMessage(), sequence=0).pack()
+            return {"accepted": True, "error": None, "ce_type": None}
+        except ChannelException as e:
+            return {"accepted": False, "error": str(e), "ce_type": int(e.type)}
+
+    if kind == "non_message_base":
+        class _NotAMessage:  # deliberately NOT a MessageBase subclass
+            MSGTYPE = 0x0303
+
+        message_class = _NotAMessage
+    elif kind == "msgtype_none":
+        class _NoneType(MessageBase):
+            MSGTYPE = None
+
+            def pack(self):
+                return b""
+
+            def unpack(self, raw):
+                pass
+
+        message_class = _NoneType
+    elif kind == "reserved":
+        class _Reserved(MessageBase):
+            MSGTYPE = 0xF001
+
+            def pack(self):
+                return b""
+
+            def unpack(self, raw):
+                pass
+
+        message_class = _Reserved
+    elif kind == "not_constructible":
+        class _NeedsArg(MessageBase):
+            MSGTYPE = 0x0404
+
+            def __init__(self, required):  # no default -> () construction fails
+                self.required = required
+
+            def pack(self):
+                return b""
+
+            def unpack(self, raw):
+                pass
+
+        message_class = _NeedsArg
+    elif kind == "valid":
+        class _Valid(MessageBase):
+            MSGTYPE = 0x0505
+
+            def __init__(self, data=b""):
+                self.data = bytes(data)
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = bytes(raw)
+
+        message_class = _Valid
+    else:
+        raise ValueError(f"Unknown register kind: {kind}")
+
+    try:
+        channel.register_message_type(message_class)
+        return {"accepted": True, "error": None, "ce_type": None}
+    except ChannelException as e:
+        return {"accepted": False, "error": str(e), "ce_type": int(e.type)}
+
+
+def cmd_wire_channel_envelope_pack(params):
+    """Pack a Channel.Envelope via REAL RNS and return its wire bytes.
+
+    A pure-function delegation (no link/handle needed): builds a minimal
+    MessageBase subclass whose MSGTYPE == the requested `msgtype` and whose
+    pack() returns the requested `data`, wraps it in a real
+    RNS.Channel.Envelope at the requested `sequence`, and returns
+    Envelope.pack() — i.e. the exact `>HHH`(MSGTYPE, sequence, length) + data
+    header layout RNS itself emits (Channel.py:192-198). The test then asserts
+    the returned bytes equal an INDEPENDENT struct.pack of that header, pinning
+    the 6-byte big-endian envelope header. All byte assembly happens inside
+    real RNS Envelope.pack; the bridge never constructs wire bytes itself.
+    """
+    RNS = _get_rns()
+    from RNS.Channel import Envelope, MessageBase
+
+    msgtype = int(params["msgtype"])
+    sequence = int(params["sequence"])
+    data = bytes.fromhex(params.get("data", ""))
+
+    class _PackMessage(MessageBase):
+        MSGTYPE = msgtype
+
+        def __init__(self, payload=b""):
+            self.payload = bytes(payload)
+
+        def pack(self):
+            return self.payload
+
+        def unpack(self, raw):
+            self.payload = bytes(raw)
+
+    envelope = Envelope(outlet=None, message=_PackMessage(data), sequence=sequence)
+    raw = envelope.pack()
+    return {"raw": raw.hex(), "sequence": int(envelope.sequence)}
+
+
+def cmd_wire_buffer_pack(params):
+    """Pack (or unpack) a Buffer StreamDataMessage via REAL RNS.
+
+    Pure-function delegation over RNS.Buffer.StreamDataMessage (Buffer.py:44-97):
+
+      pack mode (default): construct StreamDataMessage(stream_id, data, eof,
+      compressed) and return {raw, msgtype}. raw is StreamDataMessage.pack() —
+      the 2-byte big-endian header (eof bit 0x8000, compressed bit 0x4000,
+      14-bit stream id 0x3fff) followed by the payload, all assembled inside
+      RNS. msgtype is StreamDataMessage.MSGTYPE (SMT_STREAM_DATA). A stream_id
+      above STREAM_ID_MAX (0x3fff) surfaces the constructor ValueError as
+      {error}.
+
+      unpack mode (when `unpack_raw` is supplied): construct an empty
+      StreamDataMessage and call its real unpack() on the supplied bytes,
+      returning the decoded {stream_id, eof, compressed, data} — pinning the
+      header bit-field decode and the `& 0x3fff` stream-id masking.
+    """
+    RNS = _get_rns()
+    from RNS.Buffer import StreamDataMessage
+
+    if params.get("unpack_raw") is not None:
+        raw = bytes.fromhex(params["unpack_raw"])
+        message = StreamDataMessage()
+        try:
+            message.unpack(raw)
+        except Exception as e:
+            return {"error": str(e)}
+        return {
+            "stream_id": int(message.stream_id),
+            "eof": bool(message.eof),
+            "compressed": bool(message.compressed),
+            "data": (message.data or b"").hex(),
+        }
+
+    stream_id = int(params["stream_id"])
+    data = bytes.fromhex(params.get("data", ""))
+    eof = bool(params.get("eof", False))
+    compressed = bool(params.get("compressed", False))
+    try:
+        message = StreamDataMessage(stream_id, data, eof=eof, compressed=compressed)
+        raw = message.pack()
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"raw": raw.hex(), "msgtype": int(StreamDataMessage.MSGTYPE)}
 
 
 # ---------------------------------------------------------------------------
@@ -5301,6 +5556,9 @@ WIRE_COMMANDS = {
     "wire_channel_received": cmd_wire_channel_received,
     "wire_channel_window": cmd_wire_channel_window,
     "wire_channel_send": cmd_wire_channel_send,
+    "wire_channel_register": cmd_wire_channel_register,
+    "wire_channel_envelope_pack": cmd_wire_channel_envelope_pack,
+    "wire_buffer_pack": cmd_wire_buffer_pack,
     # Buffer (RawChannelReader/Writer) streaming
     "wire_buffer_stream": cmd_wire_buffer_stream,
     "wire_buffer_received": cmd_wire_buffer_received,

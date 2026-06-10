@@ -2229,6 +2229,224 @@ def cmd_wire_get_request_log(params):
     }
 
 
+def cmd_wire_link_request_timeout(params):
+    """Issue a Link.request and read back the RequestReceipt's computed
+    default timeout WITHOUT waiting for a response.
+
+    Delegates to real RNS.Link.request. When the caller passes no explicit
+    timeout, RNS derives it as `rtt * traffic_timeout_factor +
+    Resource.RESPONSE_MAX_GRACE_TIME * 1.125` (Link.py:493-494) — i.e.
+    rtt*6 + 11.25 with the RNS 1.3.1 constants (TRAFFIC_TIMEOUT_FACTOR=6,
+    RESPONSE_MAX_GRACE_TIME=10). We return the resulting receipt.timeout
+    alongside the link's own reported rtt and those two constants so a test
+    can independently re-derive the formula and pin them equal. When
+    `timeout_ms` is supplied, RNS uses it verbatim and the formula is bypassed
+    (the negative control).
+
+    No request handler need be registered: request() constructs and returns
+    the RequestReceipt (with .timeout already populated) the instant the
+    REQUEST packet is handed to the link, so we read .timeout immediately and
+    never poll for a response. The receipt's own background timeout simply
+    elapses harmlessly.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    path = params["path"]
+    data = bytes.fromhex(params["data"]) if params.get("data") else None
+    explicit_timeout_ms = params.get("timeout_ms")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    timeout = None if explicit_timeout_ms is None else (int(explicit_timeout_ms) / 1000.0)
+    receipt = link.request(path, data=data, timeout=timeout)
+    if receipt is False:
+        raise RuntimeError("Link.request returned False (REQUEST packet not sent)")
+    return {
+        "receipt_timeout": float(receipt.timeout),
+        "rtt": float(link.rtt) if link.rtt is not None else None,
+        "traffic_timeout_factor": int(link.traffic_timeout_factor),
+        "response_max_grace_time": int(RNS.Resource.RESPONSE_MAX_GRACE_TIME),
+        "explicit_timeout": None if timeout is None else float(timeout),
+    }
+
+
+def cmd_wire_capture_response_packet(params):
+    """Capture the raw RESPONSE packet RNS delivers for a Link.request.
+
+    Arms an observer on the initiator's real RNS.Link that records every
+    inbound RESPONSE (context 0x0A) and RESOURCE_ADV (context 0x02) packet,
+    then issues link.request(path, data) and waits for it to conclude. For a
+    handler response that fits the link MDU, RNS sends a single RESPONSE packet
+    whose decrypted plaintext is `umsgpack.packb([request_id, response])`
+    (Link.py:897-899); for a response exceeding the MDU it instead forks the
+    response into a Resource (Link.py:901) — observable here as a RESOURCE_ADV
+    with no RESPONSE packet.
+
+    Returns {status, response, captured:[{context, plaintext}...]}. `plaintext`
+    is the real link.decrypt() output (hex) for RESPONSE packets and None for
+    RESOURCE_ADV. The bridge does NOT msgpack-decode the plaintext — the test
+    unpacks it and pins the [request_id, response] structure, so no protocol
+    bytes are reconstructed here. The observer is a thin wrapper that records
+    the packet and then hands it to the link's real receive path unchanged.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    path = params["path"]
+    data = bytes.fromhex(params["data"]) if params.get("data") else None
+    timeout_ms = int(params.get("timeout_ms", 15000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    captured = []
+    interesting = {RNS.Packet.RESPONSE, RNS.Packet.RESOURCE_ADV}
+    orig_receive = link.receive  # bound class method (no instance override yet)
+
+    def _observer(packet):
+        try:
+            if packet.context in interesting:
+                entry = {"context": int(packet.context), "plaintext": None}
+                if packet.context == RNS.Packet.RESPONSE:
+                    plaintext = link.decrypt(packet.data)
+                    if plaintext is not None:
+                        entry["plaintext"] = plaintext.hex()
+                captured.append(entry)
+        except Exception:
+            pass
+        return orig_receive(packet)
+
+    link.receive = _observer
+    try:
+        timeout_s = timeout_ms / 1000.0
+        receipt = link.request(path, data=data, timeout=timeout_s)
+        if receipt is False:
+            raise RuntimeError("Link.request returned False (REQUEST packet not sent)")
+        deadline = time.time() + timeout_s + 0.5
+        status = "timeout"
+        response_hex = None
+        while time.time() < deadline:
+            st = receipt.get_status()
+            if st == RNS.RequestReceipt.READY:
+                resp = receipt.get_response()
+                response_hex = (
+                    resp.hex() if isinstance(resp, (bytes, bytearray)) else None
+                )
+                status = "ready"
+                break
+            if st == RNS.RequestReceipt.FAILED:
+                status = "failed"
+                break
+            time.sleep(0.05)
+    finally:
+        # Restore the class method by dropping the instance override.
+        try:
+            del link.receive
+        except Exception:
+            link.receive = orig_receive
+    return {"status": status, "response": response_hex, "captured": captured}
+
+
+def cmd_wire_interface_hw_mtu(params):
+    """Surface the link-MTU-discovery config flag and the wire interface's
+    hardware MTU so the negotiated link MTU can be pinned to it.
+
+    Reads the live values off real RNS: `RNS.Reticulum.link_mtu_discovery()`
+    (the [reticulum] config flag, default True — Reticulum.py:104/:1722), the
+    configured interface's `HW_MTU` (TCPInterface.HW_MTU == 262144 by default,
+    or the configured `fixed_mtu`), its AUTOCONFIGURE_MTU / FIXED_MTU class
+    posture, and `RNS.Reticulum.MTU` (the 500-byte baseline used when discovery
+    is off). With discovery ON, an initiator signals its next-hop interface
+    HW_MTU (Link.py:309-314) and the negotiated link MTU settles on exactly
+    that — so a test reads this hw_mtu and asserts the established link.mtu
+    equals it (and is elevated above the 500 baseline).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    iface = _primary_wire_interface(inst)
+    if iface is None:
+        raise RuntimeError("No configured wire interface on this handle.")
+    hw_mtu = getattr(iface, "HW_MTU", None)
+    return {
+        "hw_mtu": int(hw_mtu) if hw_mtu is not None else None,
+        "link_mtu_discovery": bool(RNS.Reticulum.link_mtu_discovery()),
+        "reticulum_mtu": int(RNS.Reticulum.MTU),
+        "autoconfigure_mtu": bool(getattr(iface, "AUTOCONFIGURE_MTU", False)),
+        "fixed_mtu": bool(getattr(iface, "FIXED_MTU", False)),
+        "class_hw_mtu": int(type(iface).HW_MTU) if getattr(type(iface), "HW_MTU", None) is not None else None,
+    }
+
+
+def cmd_wire_send_oversize_link_packet(params):
+    """Attempt to send a single link DATA packet of `size` bytes and report
+    whether real RNS accepts it.
+
+    A Packet whose destination is a Link is MTU-bounded by the *negotiated link
+    MTU*, not the global Reticulum.MTU: Packet.__init__ sets
+    `self.MTU = destination.mtu` for a LINK destination (Packet.py:153-154), and
+    Packet.pack() raises IOError when the packed size exceeds that bound
+    (Packet.py:235-236). So a payload above the link MDU is rejected at the link
+    MTU, while a payload that would blow the 500-byte global MTU still sends fine
+    over a high-MTU link.
+
+    Builds `size` opaque random bytes (no protocol assembly), constructs a real
+    RNS.Packet over the link, calls .send(), and reports {sent, rejected, error,
+    mtu, mdu, packet_mtu, raw_len, size}. Every byte is RNS's: the payload is
+    opaque random data and the size check is RNS's own Packet.pack().
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    size = int(params["size"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    payload = os.urandom(size)
+    packet = RNS.Packet(link, payload, RNS.Packet.DATA)
+    result = {
+        "size": size,
+        "mtu": int(link.mtu) if getattr(link, "mtu", None) is not None else None,
+        "mdu": int(link.mdu) if getattr(link, "mdu", None) is not None else None,
+        "packet_mtu": int(packet.MTU),
+    }
+    try:
+        receipt = packet.send()
+        result["sent"] = receipt is not False
+        result["rejected"] = False
+        result["error"] = None
+        result["raw_len"] = (
+            len(packet.raw) if getattr(packet, "raw", None) is not None else None
+        )
+    except Exception as e:
+        result["sent"] = False
+        result["rejected"] = True
+        result["error"] = str(e)
+        result["raw_len"] = None
+    return result
+
+
 def cmd_wire_link_poll(params):
     """Poll the receive buffer for a listening destination.
 
@@ -7088,6 +7306,10 @@ WIRE_COMMANDS = {
     "wire_link_identify_pending": cmd_wire_link_identify_pending,
     "wire_link_request": cmd_wire_link_request,
     "wire_link_request_large": cmd_wire_link_request_large,
+    "wire_link_request_timeout": cmd_wire_link_request_timeout,
+    "wire_capture_response_packet": cmd_wire_capture_response_packet,
+    "wire_interface_hw_mtu": cmd_wire_interface_hw_mtu,
+    "wire_send_oversize_link_packet": cmd_wire_send_oversize_link_packet,
     "wire_get_request_log": cmd_wire_get_request_log,
     "wire_listen": cmd_wire_listen,
     "wire_link_open": cmd_wire_link_open,

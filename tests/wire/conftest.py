@@ -1051,6 +1051,77 @@ class _WirePeer:
             "wire_link_mtu", handle=self.handle, link_id=link_id.hex()
         )
 
+    def link_request_timeout(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int | None = None,
+    ) -> dict:
+        """Issue link.request and read back the RequestReceipt's computed
+        timeout WITHOUT waiting for a response.
+
+        With timeout_ms=None, RNS derives the timeout from the link RTT
+        (rtt*6 + 11.25); pass an explicit timeout_ms to bypass the formula.
+        Returns {receipt_timeout, rtt, traffic_timeout_factor,
+        response_max_grace_time, explicit_timeout}.
+        """
+        assert self.handle, "start_* must be called first"
+        params = dict(
+            handle=self.handle, link_id=link_id.hex(), path=path, data=data.hex()
+        )
+        if timeout_ms is not None:
+            params["timeout_ms"] = int(timeout_ms)
+        return self.bridge.execute("wire_link_request_timeout", **params)
+
+    def capture_response_packet(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int = 15000,
+    ) -> dict:
+        """Issue link.request and capture the raw RESPONSE / RESOURCE_ADV
+        packets RNS delivers on the initiator's link.
+
+        Returns {status, response, captured:[{context, plaintext}...]} where
+        plaintext is the decrypted RESPONSE packet payload (hex) and context
+        is the packet's context byte (RESPONSE=0x0A, RESOURCE_ADV=0x02).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_capture_response_packet",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            path=path,
+            data=data.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+
+    def interface_hw_mtu(self) -> dict:
+        """Read this peer's wire interface HW_MTU + the link_mtu_discovery
+        config flag.
+
+        Returns {hw_mtu, link_mtu_discovery, reticulum_mtu, autoconfigure_mtu,
+        fixed_mtu, class_hw_mtu}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_interface_hw_mtu", handle=self.handle)
+
+    def send_oversize_link_packet(self, link_id: bytes, size: int) -> dict:
+        """Attempt a single link DATA packet of `size` bytes; report whether
+        RNS accepts or rejects it at the negotiated link MTU bound.
+
+        Returns {sent, rejected, error, mtu, mdu, packet_mtu, raw_len, size}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_oversize_link_packet",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            size=int(size),
+        )
+
     def send_packet(
         self,
         destination_hash: bytes,

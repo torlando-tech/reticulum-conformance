@@ -224,6 +224,35 @@ def test_packet_hash_matches_across_impls(sut, reference):
 
 
 @conformance_case(
+    commands=["packet_build", "packet_hash"],
+    verifies="RNS get_hashable_part masks the mutable/interface-scoped flag bits out of the packet hash: starting from a PLAIN DATA packet, flipping bit 7 (IFAC), bit 5 (context_flag) or bit 4 (propagation/transport_type) in the flags byte leaves packet_hash UNCHANGED (these bits are excluded via raw[0] & 0x0f), while flipping a low-nibble bit (packet_type) DOES change the hash — so a relayed/interface-rescoped packet keeps one hashlist identity. Complements the hops-byte and transport_id masking already pinned",
+)
+def test_packet_hash_masks_flag_bits_7_5_4(sut):
+    built = sut.execute(
+        "packet_build", dest_type="plain", packet_type=_PTYPE_DATA,
+        context=0, context_flag=0, hops=0, data=random_hex(24),
+    )
+    raw = bytes.fromhex(built["raw"])
+    base = sut.execute("packet_hash", raw=raw.hex())["hash"]
+    # Bits 7 (IFAC), 5 (context_flag) and 4 (propagation/transport_type) are
+    # masked out of get_hashable_part; mutating any of them must not move the hash.
+    for bit, name in ((0x80, "IFAC bit7"), (0x20, "context_flag bit5"),
+                      (0x10, "propagation bit4")):
+        mutated = bytearray(raw)
+        mutated[0] ^= bit
+        h = sut.execute("packet_hash", raw=bytes(mutated).hex())["hash"]
+        assert_hex_equal(h, base, f"flipping {name} changed the packet hash (not masked)")
+    # Contrast: a low-nibble bit (packet_type, bit 0) IS part of the hashable
+    # part, so flipping it MUST change the hash — proving the hash isn't constant.
+    contrast = bytearray(raw)
+    contrast[0] ^= 0x01
+    assert sut.execute("packet_hash", raw=bytes(contrast).hex())["hash"] != base, (
+        "flipping a low-nibble flag bit did not change the hash — the hashable "
+        "part is not actually covering the packet_type bits"
+    )
+
+
+@conformance_case(
     commands=["packet_build", "packet_unpack", "packet_hash"],
     verifies="RNS HEADER_2 (transport-relayed) ANNOUNCE wire format: the 16-byte transport_id placed between the hops byte and the destination_hash round-trips through the other impl's unpack byte-for-byte, and the transport_id is masked OUT of the packet hash — hashing the HEADER_1-equivalent bytes (transport_id stripped at raw[2:18], header_type bit cleared) yields the identical hash, exactly as RNS.Packet.get_hashable_part skips raw[2:18] for HEADER_2 so a relayed announce keeps the originator's hashlist identity",
 )

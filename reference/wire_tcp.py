@@ -6272,6 +6272,299 @@ def cmd_wire_inject_closed_link_data(params):
     }
 
 
+def cmd_wire_capture_lrproof_frame(params):
+    """Capture the RAW outbound LRPROOF (link-request-proof) frame and surface
+    its flag-byte shape + on-wire layout (the link-accepting peer's Link.prove,
+    Link.py:371-380; Packet.get_packed_flags / Packet.pack, Packet.py:169-184).
+
+    get_packed_flags SPECIAL-CASES context==LRPROOF: it forces the destination-
+    type bits to RNS.Destination.LINK (0b11) and pack() then writes the link_id
+    in the destination-address position instead of a destination hash. The
+    reference link-establishment path never exposes these bytes, so the LRPROOF's
+    flag shape was unobservable.
+
+    Self-contained: creates a destination from a fresh identity, opens an
+    initiator Link to it (so it owns a real link_id / pub_bytes / signalling
+    bytes), and builds the LRPROOF exactly as Link.prove does — a genuine
+    RNS.Packet(link, signature||pub||signalling, packet_type=PROOF,
+    context=LRPROOF) packed by real RNS. Returns the raw frame plus the link_id
+    so a test can decode raw[0]'s dest-type/packet-type/header bits and confirm
+    the 16 destination-position bytes equal the link_id (not a dest hash).
+
+    Returns {raw, flags, link_id, packet_type, context, expected_link_dest_type,
+    truncated_hashlength}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    dest_identity = RNS.Identity()
+    out_destination = RNS.Destination(
+        dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "lrproof-shape",
+    )
+    link = RNS.Link(out_destination)
+
+    # Build the LRPROOF body exactly as Link.prove (Link.py:371-377): the
+    # signature over link_id||pub||sig_pub||signalling, then signature||pub||
+    # signalling as the proof payload. Real RNS keys throughout.
+    signalling_bytes = RNS.Link.signalling_bytes(link.mtu, link.mode)
+    signed_data = link.link_id + link.pub_bytes + link.sig_pub_bytes + signalling_bytes
+    # The destination identity signs the proof (Link.prove signs with the
+    # accepting owner's identity; an initiator-side Link has no owner, so the
+    # controlled destination identity stands in — the signature content does not
+    # affect the flag-byte shape this command captures).
+    signature = dest_identity.sign(signed_data)
+    proof_data = signature + link.pub_bytes + signalling_bytes
+
+    proof = RNS.Packet(
+        link, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF,
+    )
+    proof.pack()
+    raw = proof.raw
+    try:
+        link.teardown()
+    except Exception:
+        pass
+    return {
+        "raw": raw.hex(),
+        "flags": int(proof.flags),
+        "link_id": link.link_id.hex(),
+        "packet_type": int(RNS.Packet.PROOF),
+        "context": int(RNS.Packet.LRPROOF),
+        "expected_link_dest_type": int(RNS.Destination.LINK),
+        "truncated_hashlength": int(RNS.Reticulum.TRUNCATED_HASHLENGTH // 8),
+    }
+
+
+def cmd_wire_inject_crafted_link_proof(params):
+    """Adversarial / positive LINK-DATA packet-proof injector (link packet proofs
+    are EXPLICIT-only; PacketReceipt.validate_link_proof, Packet.py:450-495).
+
+    A link DATA packet's proof is validated by validate_link_proof, which — unlike
+    the single-packet validate_proof — accepts ONLY the 96-byte EXPLICIT form
+    (packet_hash(32)||signature(64)); the 64-byte IMPLICIT branch is disabled
+    (Packet.py:478-493 `pass`), so a valid-signature implicit proof is STILL
+    rejected. The ordinary harness only ever sees the receiver's genuine explicit
+    proof, so the implicit-rejection branch was untested.
+
+    Self-contained: creates a fresh Link and gives it a self-consistent signing
+    keypair (peer_sig_pub := its own sig_pub) so the REAL link.sign produces a
+    signature the REAL link.validate verifies — no cross-process key needed. A
+    real RNS.PacketReceipt over a packed SINGLE-destination packet supplies a
+    genuine packet hash. Each variant is run on its OWN fresh receipt (a valid
+    proof mutates status):
+      valid_explicit   — receipt.hash || link.sign(receipt.hash) (96B): MUST
+                         validate (DELIVERED) — the positive 96-byte-explicit
+                         acceptance.
+      implicit_valid_sig — link.sign(receipt.hash) alone (64B, VALID signature):
+                         MUST be rejected (links are explicit-only), proving the
+                         FORM is enforced, not merely the signature.
+      implicit_random  — 64 random bytes: rejected (length/disabled-branch).
+      wrong_length_short — 32 bytes (!= 64/96): rejected by the length gate.
+
+    Returns {variant, validated, status, status_name, proof_len, expl_length,
+    impl_length}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    dest_identity = RNS.Identity()
+    out_destination = RNS.Destination(
+        dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "link-proof",
+    )
+    link = RNS.Link(out_destination)
+    # Self-consistent signing keypair: validate against the link's OWN sig pub
+    # so a real link.sign() yields a signature real link.validate() accepts.
+    link.peer_sig_pub = link.sig_pub
+    link.peer_sig_pub_bytes = link.sig_pub_bytes
+
+    # A real packed SINGLE-destination packet supplies a genuine packet hash.
+    base_packet = RNS.Packet(out_destination, secrets.token_bytes(20), create_receipt=True)
+    base_packet.pack()
+    receipt = RNS.PacketReceipt(base_packet)
+
+    impl_len = int(RNS.PacketReceipt.IMPL_LENGTH)
+    expl_len = int(RNS.PacketReceipt.EXPL_LENGTH)
+    sig_len = RNS.Identity.SIGLENGTH // 8  # 64
+
+    if variant == "valid_explicit":
+        proof = receipt.hash + link.sign(receipt.hash)
+    elif variant == "implicit_valid_sig":
+        proof = link.sign(receipt.hash)               # 64B, valid signature
+    elif variant == "implicit_random":
+        proof = secrets.token_bytes(sig_len)          # 64B random
+    elif variant == "wrong_length_short":
+        proof = secrets.token_bytes(sig_len // 2)     # 32B
+    else:
+        raise ValueError(f"unknown link-proof variant: {variant!r}")
+
+    proof = bytes(proof)
+    try:
+        validated = bool(receipt.validate_link_proof(proof, link, None))
+    except Exception:
+        validated = False
+    status = receipt.get_status()
+    try:
+        link.teardown()
+    except Exception:
+        pass
+    return {
+        "variant": variant,
+        "validated": validated,
+        "status": int(status),
+        "status_name": _PACKET_RECEIPT_STATUS_NAMES.get(status),
+        "proof_len": len(proof),
+        "expl_length": expl_len,
+        "impl_length": impl_len,
+    }
+
+
+def cmd_wire_inject_single_proof_format(params):
+    """Positive / negative single-packet (non-link) PROOF FORMAT injector
+    (PacketReceipt.validate_proof, Packet.py:498-549).
+
+    For a SINGLE-destination receipt, validate_proof accepts a spec-conformant
+    EXPLICIT proof (packet_hash(32)||signature(64) == 96B) and a spec-conformant
+    IMPLICIT proof (signature(64) == 64B), in both cases verifying the signature
+    with the destination's identity over the receipt's packet hash. The ordinary
+    cross-process harness can never sign a VALID proof (the receiver's private
+    key lives on the other peer), so the positive 96-byte-explicit acceptance was
+    untested — the existing crafted-proof injector only covers rejections.
+
+    Self-contained: builds the destination from a fresh identity it CONTROLS, so
+    it can sign a genuinely-valid proof per the spec format. Each variant on its
+    own fresh receipt:
+      valid_explicit — receipt.hash || identity.sign(receipt.hash) (96B): MUST
+                       validate (DELIVERED) — the positive 96-byte EXPLICIT
+                       acceptance.
+      valid_implicit — identity.sign(receipt.hash) (64B): MUST validate
+                       (non-link receipts honor the implicit form too).
+      forged_explicit — receipt.hash || WRONG-key signature (96B): rejected.
+      wrong_hash_explicit — random(32) || valid signature (96B): the leading
+                       proof-hash != receipt.hash, rejected before the signature.
+
+    Returns {variant, validated, status, status_name, proof_len, expl_length,
+    impl_length}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity()
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "proof-format",
+    )
+    base_packet = RNS.Packet(out_destination, secrets.token_bytes(20), create_receipt=True)
+    base_packet.pack()
+    receipt = RNS.PacketReceipt(base_packet)
+
+    impl_len = int(RNS.PacketReceipt.IMPL_LENGTH)
+    expl_len = int(RNS.PacketReceipt.EXPL_LENGTH)
+    hash_len = RNS.Identity.HASHLENGTH // 8  # 32
+
+    if variant == "valid_explicit":
+        proof = receipt.hash + identity.sign(receipt.hash)
+    elif variant == "valid_implicit":
+        proof = identity.sign(receipt.hash)
+    elif variant == "forged_explicit":
+        proof = receipt.hash + RNS.Identity().sign(receipt.hash)   # wrong key
+    elif variant == "wrong_hash_explicit":
+        proof = secrets.token_bytes(hash_len) + identity.sign(receipt.hash)
+    else:
+        raise ValueError(f"unknown single-proof-format variant: {variant!r}")
+
+    proof = bytes(proof)
+    try:
+        validated = bool(receipt.validate_proof(proof))
+    except Exception:
+        validated = False
+    status = receipt.get_status()
+    return {
+        "variant": variant,
+        "validated": validated,
+        "status": int(status),
+        "status_name": _PACKET_RECEIPT_STATUS_NAMES.get(status),
+        "proof_len": len(proof),
+        "expl_length": expl_len,
+        "impl_length": impl_len,
+    }
+
+
+def cmd_wire_packet_receipt_generation(params):
+    """Report whether RNS actually creates a PacketReceipt for a packet of a
+    given destination-type / context, even with create_receipt=True
+    (Transport.outbound's generate_receipt gate, Transport.py:1094-1113).
+
+    The gate suppresses receipts unless the packet is DATA, the destination is
+    NOT PLAIN, the context is NOT a link-control context (KEEPALIVE 0xFA ..
+    LRPROOF 0xFF), and NOT a resource context (RESOURCE 0x01 .. RESOURCE_RCL
+    0x07). This command builds a real RNS.Packet(create_receipt=True) of the
+    requested shape, sends it out the peer's live interface (so the REAL gate
+    runs in Transport.outbound's packet_sent), and reports whether RNS attached a
+    receipt — nothing is recomputed; packet.receipt is read straight off RNS.
+
+    dest_type: "single" (SINGLE) or "plain" (PLAIN). context: int (default NONE).
+    Note: an LRPROOF (0xFF) context can only be packed on a LINK destination, so
+    the 0xFA-0xFF band is exercised here via its non-link-only packable members
+    (e.g. KEEPALIVE 0xFA, LRRTT 0xFE).
+
+    Returns {dest_type, context, sent, has_receipt, create_receipt_flag}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_type = str(params.get("dest_type", "single")).lower()
+    context = int(params.get("context", RNS.Packet.NONE))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    if dest_type == "single":
+        identity = RNS.Identity()
+        destination = RNS.Destination(
+            identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "conformance", "receipt-gen",
+        )
+    elif dest_type == "plain":
+        destination = RNS.Destination(
+            None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+            "conformance", "receipt-gen",
+        )
+    else:
+        raise ValueError(f"dest_type must be 'single' or 'plain' (got {dest_type!r})")
+
+    packet = RNS.Packet(
+        destination, secrets.token_bytes(12), context=context, create_receipt=True,
+    )
+    packet.send()
+    # Give Transport.outbound's packet_sent a moment to run on the live instance.
+    deadline = time.time() + 1.0
+    while not getattr(packet, "sent", False) and time.time() < deadline:
+        time.sleep(0.02)
+    return {
+        "dest_type": dest_type,
+        "context": context,
+        "sent": bool(getattr(packet, "sent", False)),
+        "has_receipt": getattr(packet, "receipt", None) is not None,
+        "create_receipt_flag": bool(getattr(packet, "create_receipt", False)),
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -6366,6 +6659,12 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
     "wire_inject_crafted_resource_proof": cmd_wire_inject_crafted_resource_proof,
     "wire_inject_crafted_resource_part": cmd_wire_inject_crafted_resource_part,
+    # Packet-proof capture: LRPROOF flag-shape, link explicit-only proofs,
+    # single-packet explicit/implicit proof FORMAT acceptance, receipt-gen gate
+    "wire_capture_lrproof_frame": cmd_wire_capture_lrproof_frame,
+    "wire_inject_crafted_link_proof": cmd_wire_inject_crafted_link_proof,
+    "wire_inject_single_proof_format": cmd_wire_inject_single_proof_format,
+    "wire_packet_receipt_generation": cmd_wire_packet_receipt_generation,
     # Link establishment internals (request-payload layout / signalling-byte
     # encoding / LINKREQUEST size+mode validation / accept gate / key purge /
     # closed-link drop)

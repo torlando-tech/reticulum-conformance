@@ -2004,6 +2004,66 @@ class _WirePeer:
             "wire_inject_crafted_lrproof", handle=self.handle, variant=variant,
         )
 
+    def capture_lrproof_frame(self) -> dict:
+        """Capture a genuine outbound LRPROOF frame's raw bytes + flag shape.
+
+        Self-contained on this peer: builds a real RNS LRPROOF (Link.prove /
+        Packet.pack with context=LRPROOF) and returns {raw, flags, link_id,
+        packet_type, context, expected_link_dest_type, truncated_hashlength}.
+        get_packed_flags forces the LINK destination-type bits for an LRPROOF and
+        pack() writes the link_id in the destination-address position; the test
+        decodes raw[0] and pins both against the spec."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_capture_lrproof_frame", handle=self.handle)
+        return {
+            "raw": bytes.fromhex(resp["raw"]),
+            "flags": int(resp["flags"]),
+            "link_id": bytes.fromhex(resp["link_id"]),
+            "packet_type": int(resp["packet_type"]),
+            "context": int(resp["context"]),
+            "expected_link_dest_type": int(resp["expected_link_dest_type"]),
+            "truncated_hashlength": int(resp["truncated_hashlength"]),
+        }
+
+    def inject_crafted_link_proof(self, variant: str) -> dict:
+        """Self-contained LINK-DATA packet-proof injector: links accept ONLY the
+        96-byte EXPLICIT proof (PacketReceipt.validate_link_proof). Variants
+        valid_explicit (96B valid sig -> validates) / implicit_valid_sig (64B
+        VALID sig -> rejected, proving form is enforced) / implicit_random /
+        wrong_length_short. Returns {variant, validated, status, status_name,
+        proof_len, expl_length, impl_length}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_proof", handle=self.handle, variant=variant,
+        )
+
+    def inject_single_proof_format(self, variant: str) -> dict:
+        """Self-contained single-packet (non-link) PROOF FORMAT injector. Builds
+        the destination from an identity it controls, so it can sign a genuinely-
+        valid proof per the spec. Variants valid_explicit (96B -> validates) /
+        valid_implicit (64B -> validates) / forged_explicit (wrong key ->
+        rejected) / wrong_hash_explicit (hash != receipt -> rejected). Returns
+        {variant, validated, status, status_name, proof_len, expl_length,
+        impl_length}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_single_proof_format", handle=self.handle, variant=variant,
+        )
+
+    def packet_receipt_generation(
+        self, dest_type: str = "single", context: int = 0,
+    ) -> dict:
+        """Report whether RNS actually creates a PacketReceipt for a packet of the
+        given dest_type ('single'|'plain') / context, with create_receipt=True
+        (the Transport.outbound generate_receipt gate). Sends a real packet out
+        this peer's interface and reads packet.receipt straight off RNS. Returns
+        {dest_type, context, sent, has_receipt, create_receipt_flag}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_packet_receipt_generation",
+            handle=self.handle, dest_type=dest_type, context=int(context),
+        )
+
     def link_request_payload(
         self, app_name: str = "conformance", aspects: list | None = None,
     ) -> dict:

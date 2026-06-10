@@ -4384,6 +4384,81 @@ def cmd_wire_send_forged_link_close(params):
     }
 
 
+def cmd_wire_inject_crafted_proof(params):
+    """Adversarial single-packet PROOF injector.
+
+    Crafts a PROOF of a chosen `variant` against a pending PacketReceipt and
+    feeds it through the REAL RNS.PacketReceipt.validate_proof gate (Packet.py):
+    a 96-byte EXPLICIT proof is packet_hash(32)||signature(64), a 64-byte
+    IMPLICIT proof is signature(64), any OTHER length is rejected outright, and
+    the signature is validated against the receipt destination's identity. This
+    drives the proof-acceptance rules the ordinary harness can't reach — a
+    forged signature, a wrong proof-hash, or a disallowed length.
+
+    The receiver's private key lives in a different bridge process (the peers
+    talk over real TCP), so a genuinely-valid proof cannot be signed here — the
+    positive control is the real receiver proving over the wire (PROVE_ALL).
+    Every variant below is a REJECTION case, none of which needs the receiver
+    key:
+      forged_implicit / forged_explicit — a structurally valid Ed25519 signature
+        under a THROWAWAY (wrong) key; the length is correct but the signature
+        must fail validation against the receipt destination's identity.
+      wrong_hash_explicit — a random proof-hash prefix (!= receipt.hash) with a
+        throwaway signature; the explicit proof-hash check rejects it before the
+        signature is even considered.
+      wrong_length_short / wrong_length_mid / wrong_length_long — random bytes of
+        32 / 65 / 97 bytes (none equal to IMPL_LENGTH=64 or EXPL_LENGTH=96),
+        exercising the length gate.
+
+    Calls receipt.validate_proof(proof) directly (the exact gate Transport hands
+    an inbound PROOF to) and returns {variant, validated, status, status_name,
+    proved, proof_len}. Reusable for any pending PacketReceipt.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    receipt_id = params["receipt_id"]
+    variant = params["variant"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    receipt = inst.get("receipts", {}).get(receipt_id)
+    if receipt is None:
+        raise ValueError(f"Unknown receipt_id: {receipt_id}")
+
+    proven_hash = receipt.hash
+    HASHLEN = RNS.Identity.HASHLENGTH // 8   # 32
+    SIGLEN = RNS.Identity.SIGLENGTH // 8     # 64
+
+    if variant == "forged_implicit":
+        proof = RNS.Identity().sign(proven_hash)
+    elif variant == "forged_explicit":
+        proof = proven_hash + RNS.Identity().sign(proven_hash)
+    elif variant == "wrong_hash_explicit":
+        proof = secrets.token_bytes(HASHLEN) + RNS.Identity().sign(proven_hash)
+    elif variant == "wrong_length_short":
+        proof = secrets.token_bytes(HASHLEN)               # 32B
+    elif variant == "wrong_length_mid":
+        proof = secrets.token_bytes(SIGLEN + 1)            # 65B
+    elif variant == "wrong_length_long":
+        proof = secrets.token_bytes(HASHLEN + SIGLEN + 1)  # 97B
+    else:
+        raise ValueError(f"unknown proof variant: {variant!r}")
+
+    proof = bytes(proof)
+    validated = bool(receipt.validate_proof(proof))
+    status = receipt.get_status()
+    return {
+        "variant": variant,
+        "validated": validated,
+        "status": int(status),
+        "status_name": _PACKET_RECEIPT_STATUS_NAMES.get(status),
+        "proved": bool(getattr(receipt, "proved", False)),
+        "proof_len": len(proof),
+    }
+
+
 def cmd_wire_link_identify_pending(params):
     """Call RNS.Link.identify on a PENDING (pre-ACTIVE) link and assert it is a
     no-op that does not crash (Link.py:459-475/:468).
@@ -4546,6 +4621,7 @@ WIRE_COMMANDS = {
     "wire_known_key_validate": cmd_wire_known_key_validate,
     # Deferred Link edges (forged LINKCLOSE / identify on PENDING link)
     "wire_send_forged_link_close": cmd_wire_send_forged_link_close,
+    "wire_inject_crafted_proof": cmd_wire_inject_crafted_proof,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

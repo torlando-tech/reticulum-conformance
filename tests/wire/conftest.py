@@ -1760,6 +1760,57 @@ class _WirePeer:
             forged_id=forged_id.hex(),
         )
 
+    def send_packet(
+        self,
+        destination_hash: bytes,
+        data: bytes,
+        app_name: str,
+        aspects: list,
+        create_receipt: bool = True,
+    ) -> dict:
+        """Send a single SINGLE-destination DATA packet with a tracked
+        PacketReceipt and return {sent, receipt_id, hops} immediately (the
+        non-blocking counterpart to send_packet_with_proof_request). Poll the
+        receipt with packet_receipt_status, or drive it adversarially with
+        inject_crafted_proof."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_packet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            data=data.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            create_receipt=create_receipt,
+        )
+
+    def packet_receipt_status(self, receipt_id: str, timeout_ms: int = 0) -> dict:
+        """Poll a tracked PacketReceipt; returns {status, status_name,
+        delivered, proved}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_packet_receipt_status",
+            handle=self.handle,
+            receipt_id=receipt_id,
+            timeout_ms=timeout_ms,
+        )
+
+    def inject_crafted_proof(self, receipt_id: str, variant: str) -> dict:
+        """Adversarial PROOF injector: craft a forged/malformed PROOF of
+        `variant` against the pending PacketReceipt `receipt_id` and run it
+        through the real RNS.PacketReceipt.validate_proof gate, reporting
+        {validated, status, status_name, proved, proof_len}.
+
+        All variants are REJECTION cases (forged_implicit, forged_explicit,
+        wrong_hash_explicit, wrong_length_short/mid/long) — see
+        wire_inject_crafted_proof. A genuinely-valid proof can't be signed
+        cross-process, so the positive control is a real PROVE_ALL delivery."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_proof",
+            handle=self.handle, receipt_id=receipt_id, variant=variant,
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,

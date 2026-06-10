@@ -83,7 +83,7 @@
 | 3.5 | `test_token_cross_decrypt` | `token_encrypt`, `token_decrypt` | RNS Token cross-impl interop: tokens produced by either impl decrypt to the original plaintext on the other |
 | 3.6 | `test_token_encrypt_is_fresh_per_call` | `token_encrypt` | Invariant: two RNS Tokens encrypted from byte-identical key+plaintext differ (RNS draws a fresh AES IV per call) — a deterministic token would reuse the IV and leak plaintext equality |
 
-## 4. Destination (3 tests)
+## 4. Destination (6 tests)
 
 **File:** `tests/test_destination.py`
 
@@ -92,6 +92,9 @@
 | 4.1 | `test_name_hash` | `name_hash` | RNS `name_hash` of `"lxmf.delivery"` (the canonical LXMF delivery destination) is byte-identical across impls |
 | 4.2 | `test_destination_hash` | `identity_from_private_key`, `destination_hash` | RNS `destination_hash`: given an `identity_hash` + `app_name` + `aspects`, the 16-byte destination address (RNS.Destination.hash — expand_name -> name_hash -> truncated_hash(name_hash + identity_hash)) is byte-identical across impls |
 | 4.3 | `test_destination_hash_rejects_dotted_names` | `identity_from_private_key`, `destination_hash` | RNS forbids '.' in app_name and aspects (Destination.expand_name raises ValueError, because '.' is the reserved name-component separator): destination_hash on a dotted app_name OR a dotted aspect is rejected, while the dotless equivalent succeeds — so an impl that silently accepts dotted names (and would derive a different destination address) fails |
+| 4.4 | `test_dest_hash_no_identity_derivation` | `packet_build`, `packet_unpack`, `name_hash`, `truncated_hash` | Identity-less (PLAIN) destination address = SHA-256(name_hash)[:16] with NO identity material mixed in (RNS.Destination.hash, identity=None): the 16-byte destination_hash RNS computed for a real PLAIN destination 'conformance.packet' equals truncated_hash(name_hash('conformance.packet')) re-derived independently — an impl that folds identity bytes (or a different digest) into a no-identity address diverges |
+| 4.5 | `test_dest_hash_identity_bound_multiaspect_derivation` | `identity_from_private_key`, `destination_hash`, `name_hash`, `truncated_hash` | Identity-bound destination address over a MULTI-aspect name = SHA-256(name_hash(app.a.b.c) \|\| identity_hash)[:16]: RNS.Destination.hash for app_name='myapp', aspects=['alpha','beta','gamma'] equals the independently re-derived truncated_hash(name_hash('myapp.alpha.beta.gamma') \|\| identity_hash), and reordering the aspects changes the address — pinning the dotted multi-aspect expansion AND the name_hash\|\|identity_hash composition order |
+| 4.6 | `test_dest_type_bits_group_on_wire` | `packet_build`, `packet_unpack` | GROUP destination type encodes to flag bits 3-2 == 1 on the wire (SINGLE=0, GROUP=1, PLAIN=2, LINK=3): a real GROUP-destination packet built by RNS reports destination_type==1 and the other impl decodes raw[0] back to destination_type==1 — pins the GROUP wire code-point that the suite otherwise only used as an opaque hop-drop input |
 
 ## 5. Packet (8 tests)
 

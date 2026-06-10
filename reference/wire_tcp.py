@@ -4556,6 +4556,83 @@ def cmd_wire_inject_tampered_link_data(params):
     }
 
 
+def cmd_wire_inject_crafted_link_identify(params):
+    """Adversarial LINKIDENTIFY injector.
+
+    The initiator of a link can reveal its identity to the non-initiator with a
+    LINKIDENTIFY packet whose encrypted payload is public_key(64)||signature(64),
+    where the signature is over link_id||public_key (Link.identify). The
+    non-initiator validates it (Link.receive LINKIDENTIFY branch): non-initiator
+    only, exactly KEYSIZE//8 + SIGLENGTH//8 == 128 plaintext bytes, and the
+    signature MUST verify against the CLAIMED public key — otherwise the identity
+    is NOT adopted (remote_identity stays None). The existing identify test only
+    drives a VALIDLY-signed identify from an unlisted identity (a policy check),
+    never the cryptographic rejection.
+
+    This injector crafts the LINKIDENTIFY of a chosen `variant`, encrypts it to
+    the established link, and feeds it through the real link.receive on the
+    NON-INITIATOR peer, reporting whether the claimed identity was adopted.
+    Every part is real RNS: a freshly-generated claimed identity signs (or a
+    throwaway key forges) the payload, and link.receive runs RNS's own
+    validation. Variants:
+      valid             — claimed identity signs link_id||pubkey; MUST be adopted.
+      forged_signature  — a DIFFERENT (throwaway) identity signs; must be rejected.
+      wrong_signed_data — the claimed identity signs UNRELATED data; rejected.
+      wrong_length      — a 96-byte plaintext (!= 128); rejected by the length gate.
+
+    Run on the NON-INITIATOR peer (the one holding the inbound link). Returns
+    {variant, claimed_identity_hash, remote_identity_after, adopted, initiator}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    claimed = RNS.Identity()
+    public_key = claimed.get_public_key()
+    signed_data = link.link_id + public_key
+
+    if variant == "valid":
+        signature = claimed.sign(signed_data)
+        payload = public_key + signature
+    elif variant == "forged_signature":
+        signature = RNS.Identity().sign(signed_data)  # signed by the WRONG key
+        payload = public_key + signature
+    elif variant == "wrong_signed_data":
+        signature = claimed.sign(secrets.token_bytes(96))  # sig over unrelated data
+        payload = public_key + signature
+    elif variant == "wrong_length":
+        signature = claimed.sign(signed_data)
+        payload = public_key + signature[: RNS.Identity.SIGLENGTH // 16]  # 96B total
+    else:
+        raise ValueError(f"unknown link-identify variant: {variant!r}")
+
+    out_packet = RNS.Packet(link, payload, RNS.Packet.DATA, context=RNS.Packet.LINKIDENTIFY)
+    out_packet.pack()
+    rx = RNS.Packet(None, out_packet.raw)
+    if rx.unpack():
+        rx.receiving_interface = link.attached_interface
+        link.receive(rx)
+    time.sleep(0.05)
+
+    remote_after = link.get_remote_identity()
+    return {
+        "variant": variant,
+        "claimed_identity_hash": claimed.hash.hex(),
+        "remote_identity_after": remote_after.hash.hex() if remote_after is not None else None,
+        "adopted": remote_after is not None and remote_after.hash == claimed.hash,
+        "initiator": bool(getattr(link, "initiator", False)),
+    }
+
+
 def cmd_wire_link_identify_pending(params):
     """Call RNS.Link.identify on a PENDING (pre-ACTIVE) link and assert it is a
     no-op that does not crash (Link.py:459-475/:468).
@@ -4720,6 +4797,7 @@ WIRE_COMMANDS = {
     "wire_send_forged_link_close": cmd_wire_send_forged_link_close,
     "wire_inject_crafted_proof": cmd_wire_inject_crafted_proof,
     "wire_inject_tampered_link_data": cmd_wire_inject_tampered_link_data,
+    "wire_inject_crafted_link_identify": cmd_wire_inject_crafted_link_identify,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

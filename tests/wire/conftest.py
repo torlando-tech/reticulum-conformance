@@ -1828,6 +1828,20 @@ class _WirePeer:
             data=data.hex(), corruption=corruption,
         )
 
+    def inject_crafted_link_identify(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial LINKIDENTIFY injector: craft an identify packet of
+        `variant` (valid / forged_signature / wrong_signed_data / wrong_length),
+        encrypt it to the established link, and feed it through the real
+        link.receive on THIS (non-initiator) peer, reporting {variant,
+        claimed_identity_hash, remote_identity_after, adopted, initiator}. Run on
+        the peer holding the INBOUND link. A valid identify is adopted; every
+        forgery leaves remote_identity None."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_identify",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,

@@ -1690,6 +1690,33 @@ def _ensure_minimal_rns():
     return RNS
 
 
+def _ensure_minimal_rns_on(rns_module):
+    """Ensure a minimal Reticulum instance exists on the GIVEN RNS module object.
+
+    `_ensure_minimal_rns` creates the instance on the bridge's CACHED RNS handle
+    (`_rns_module`). Across a long session that handle can diverge from
+    `sys.modules['RNS']`, which is what `from RNS import X` rebinds a submodule's
+    own `import RNS` to. A command that creates the instance via
+    `_ensure_minimal_rns` but then reaches RNS through such a submodule (e.g.
+    `Discovery.RNS`) sees `Reticulum.get_instance() == None` on that other module
+    and fails. Creating the instance on the EXACT module the submodule reads
+    keeps them consistent. No-op when that module already has a live instance.
+    """
+    if rns_module.Reticulum.get_instance() is None:
+        import tempfile
+        cfg = tempfile.mkdtemp(prefix="rns_minimal_")
+        cfg_file = os.path.join(cfg, "config")
+        with open(cfg_file, "w") as f:
+            f.write(
+                "[reticulum]\nenable_transport = no\nshare_instance = no\n\n[interfaces]\n"
+            )
+        rns_module.loglevel = int(
+            os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(rns_module.LOG_CRITICAL))
+        )
+        rns_module.Reticulum(configdir=cfg)
+    return rns_module
+
+
 def cmd_rns_start(params):
     """Start Reticulum with TCP server interface.
 
@@ -3179,9 +3206,13 @@ def cmd_discovery_announce_identity(params):
     oracle (hash_from_name_and_identity).
     """
     # A real Reticulum instance must exist: InterfaceAnnouncer.__init__ builds a
-    # real Destination, whose registration needs Transport.owner set.
-    RNS = _ensure_minimal_rns()
+    # real Destination, whose registration needs Transport.owner set. Bind to the
+    # EXACT module Discovery reads (Discovery.RNS) and ensure the instance lives
+    # there — the cached _ensure_minimal_rns handle can diverge across a session.
+    _get_full_rns()
     from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
 
     has_net = bool(params.get('has_network_identity'))
     net_priv = params.get('network_identity_priv')
@@ -3225,8 +3256,13 @@ def cmd_discovery_feature_defaults(params):
     Lets a test assert every discovery feature defaults OFF (opt-in). Pure
     attribute / getter reads on real RNS — nothing reconstructed.
     """
-    RNS = _ensure_minimal_rns()
-    from RNS.Interfaces.Interface import Interface
+    # Bind to the live RNS module (== Discovery.RNS) and ensure the instance is
+    # on it, so Interface() / should_autoconnect see a live get_instance().
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+    Interface = RNS.Interfaces.Interface.Interface
     iface = Interface()
     return {
         'interface_discoverable': iface.discoverable,
@@ -3254,8 +3290,10 @@ def cmd_discovery_inject_records(params):
     only chooses each record's age and reads back RNS's verdict; the threshold
     comparisons, status codes and sort are 100% RNS.
     """
-    RNS = _ensure_minimal_rns()
+    _get_full_rns()
     from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
     import time as _time
 
     # No source allowlist configured -> the allowlist removal branch is inert.

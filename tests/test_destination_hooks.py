@@ -320,6 +320,49 @@ def test_group_destination_requires_key(sut):
 
 
 @conformance_case(
+    commands=["destination_default_app_data"],
+    verifies="RNS.Destination.announce (Destination.py:289-295) substitutes self.default_app_data into the announce stream when announce() is called with app_data=None: a bytes default is used directly, a callable default is invoked for its bytes. An explicitly supplied app_data takes precedence, and with no default the announce carries empty app_data. The app_data read back off the wire equals the value the test set.",
+)
+def test_default_app_data_substitution(sut):
+    default_bytes = b"my-default-app-data".hex()
+    override = b"explicit-override".hex()
+
+    # bytes default is folded into the announce when app_data is omitted.
+    r_bytes = sut.execute(
+        "destination_default_app_data",
+        direction="in", type="single", app_name="lxmf", aspects=_rand_aspects(),
+        default_kind="bytes", default_value=default_bytes,
+    )
+    assert r_bytes["default_app_data_set"] is True
+    assert_hex_equal(r_bytes["app_data"], default_bytes)
+
+    # callable default is invoked and its bytes return value used.
+    r_call = sut.execute(
+        "destination_default_app_data",
+        direction="in", type="single", app_name="lxmf", aspects=_rand_aspects(),
+        default_kind="callable", default_value=default_bytes,
+    )
+    assert_hex_equal(r_call["app_data"], default_bytes)
+
+    # No default set -> announce carries empty app_data.
+    r_none = sut.execute(
+        "destination_default_app_data",
+        direction="in", type="single", app_name="lxmf", aspects=_rand_aspects(),
+        default_kind="none",
+    )
+    assert r_none["default_app_data_set"] is False
+    assert r_none["app_data"] == ""
+
+    # Explicit app_data overrides the default.
+    r_over = sut.execute(
+        "destination_default_app_data",
+        direction="in", type="single", app_name="lxmf", aspects=_rand_aspects(),
+        default_kind="bytes", default_value=default_bytes, override_app_data=override,
+    )
+    assert_hex_equal(r_over["app_data"], override)
+
+
+@conformance_case(
     commands=["destination_register_request_handler_validate"],
     verifies="RNS.Destination.register_request_handler (Destination.py:384-386) raises ValueError for an empty path ('Invalid path specified'), a non-callable response_generator ('Invalid response generator specified'), and an allow policy outside request_policies == [0x00,0x01,0x02] ('Invalid request policy'). Positive control: a valid registration stores one handler.",
 )

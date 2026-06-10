@@ -2352,6 +2352,53 @@ def cmd_destination_group_encrypt(params):
     }
 
 
+def cmd_destination_default_app_data(params):
+    """Set a destination's default_app_data, then announce(send=False) with
+    app_data=None so RNS substitutes Destination.default_app_data into the
+    signed/announce stream (Destination.py:289-295 — bytes are used directly, a
+    callable is invoked and its bytes return value used). The app_data carried
+    on the wire is read back off the RNS-produced announce_data at the offsets
+    RNS itself wrote, so a test can assert the default was folded in.
+
+    default_kind selects: 'bytes' (use default_value), 'callable' (a function
+    returning default_value), or 'none' (no default set). override_app_data, if
+    given, is passed explicitly to announce() and must take precedence.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+
+    default_kind = params.get('default_kind', 'bytes')
+    default_value = hex_to_bytes(params['default_value']) if params.get('default_value') else b""
+    if default_kind == 'bytes':
+        dest.set_default_app_data(default_value)
+    elif default_kind == 'callable':
+        dest.set_default_app_data(lambda: default_value)
+    # 'none' -> leave default_app_data as None
+
+    override = hex_to_bytes(params['override_app_data']) if params.get('override_app_data') else None
+    packet = dest.announce(app_data=override, send=False)
+    packet.pack()
+
+    # Read app_data off the announce_data tail using live RNS field sizes — the
+    # same offsets cmd_announce_build parses. No bytes are assembled here.
+    keysize = RNS.Identity.KEYSIZE // 8
+    name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+    ratchet_size = RNS.Identity.RATCHETSIZE // 8
+    sig_len = RNS.Identity.SIGLENGTH // 8
+    random_hash_len = 10
+    data = packet.data
+    cursor = keysize + name_hash_len + random_hash_len
+    if packet.context_flag == RNS.Packet.FLAG_SET:
+        cursor += ratchet_size
+    cursor += sig_len
+    app_data_on_wire = data[cursor:]
+
+    return {
+        'app_data': bytes_to_hex(app_data_on_wire),
+        'default_app_data_set': dest.default_app_data is not None,
+    }
+
+
 def cmd_destination_register_request_handler_validate(params):
     """Construct a destination and call register_request_handler with
     caller-controlled argument validity so RNS's own checks run:
@@ -2564,6 +2611,7 @@ COMMANDS = {
     'destination_set_proof_strategy_raw': cmd_destination_set_proof_strategy_raw,
     'destination_rotate_ratchets': cmd_destination_rotate_ratchets,
     'destination_group_encrypt': cmd_destination_group_encrypt,
+    'destination_default_app_data': cmd_destination_default_app_data,
     'destination_register_request_handler_validate': cmd_destination_register_request_handler_validate,
     'destination_path_response_cache': cmd_destination_path_response_cache,
 }

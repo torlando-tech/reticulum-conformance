@@ -1992,6 +1992,59 @@ def cmd_rns_set_proof_strategy(params):
     return {'set': True, 'strategy': strategy_name}
 
 
+def cmd_packet_constants(params):
+    """Return the live RNS wire-size / header constants so tests can pin them
+    against the spec literals (not against another read of the same value).
+
+    Every field is read straight off real RNS (RNS.Reticulum.*, RNS.Packet.*,
+    RNS.Link.*, RNS.Identity.*) — no arithmetic is reconstructed here, the test
+    asserts each against its documented literal.
+    """
+    RNS = _get_full_rns()
+    R = RNS.Reticulum
+    P = RNS.Packet
+    L = RNS.Link
+    I = RNS.Identity
+    return {
+        'mtu': int(R.MTU),
+        'header_minsize': int(R.HEADER_MINSIZE),
+        'header_maxsize': int(R.HEADER_MAXSIZE),
+        'mdu': int(R.MDU),
+        'ifac_min_size': int(R.IFAC_MIN_SIZE),
+        'packet_mdu': int(P.MDU),
+        'packet_plain_mdu': int(P.PLAIN_MDU),
+        'packet_encrypted_mdu': int(P.ENCRYPTED_MDU),
+        'link_mdu': int(L.MDU),
+        'hashlength': int(I.HASHLENGTH),
+        'siglength': int(I.SIGLENGTH),
+        'truncated_hashlength': int(I.TRUNCATED_HASHLENGTH),
+        'keysize': int(I.KEYSIZE),
+        'name_hash_length': int(I.NAME_HASH_LENGTH),
+    }
+
+
+def cmd_identity_random_hash(params):
+    """Return one RNS.Identity.get_random_hash() value (hex).
+
+    Delegates to real RNS; the test asserts it is the documented length and that
+    repeated calls differ (non-repetition over a sample)."""
+    RNS = _get_full_rns()
+    return {'random_hash': bytes_to_hex(RNS.Identity.get_random_hash())}
+
+
+def cmd_hdlc_escape(params):
+    """Apply RNS's HDLC send-side byte-stuffing (the forward primitive
+    RNS.Interfaces.TCPInterface.HDLC.escape) to a payload.
+
+    Delegates entirely to the real exposed staticmethod — the inverse
+    (hdlc_deframe) is already tested as a round-trip; this exposes the forward
+    direction so the ESC-before-FLAG escape order can be pinned directly."""
+    RNS = _get_full_rns()
+    from RNS.Interfaces.TCPInterface import HDLC
+    data = hex_to_bytes(params['data'])
+    return {'escaped': bytes_to_hex(HDLC.escape(data))}
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2027,6 +2080,9 @@ COMMANDS = {
     'packet_build': cmd_packet_build,
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
+    'packet_constants': cmd_packet_constants,
+    'identity_random_hash': cmd_identity_random_hash,
+    'hdlc_escape': cmd_hdlc_escape,
     # Ratchet operations
     'ratchet_id': cmd_ratchet_id,
     'ratchet_public_from_private': cmd_ratchet_public_from_private,

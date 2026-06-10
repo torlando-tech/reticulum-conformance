@@ -3077,6 +3077,264 @@ def cmd_discovery_sanitize_name(params):
     }
 
 
+def cmd_discovery_craft_announce(params):
+    """ADVERSARIAL announce crafter for the interface-discovery receive path.
+
+    Starts from a GENUINE announce produced by the real
+    InterfaceAnnouncer.get_interface_announce_data (via
+    cmd_discovery_build_announce_appdata), unpacks its info map with RNS's OWN
+    vendored umsgpack (RNS.vendor.umsgpack — the exact serializer RNS uses for
+    this record), applies ONE semantic mutation to the decoded dict, then
+    re-packs with that SAME serializer and re-stamps with the real LXMF
+    LXStamper proof-of-work before re-emitting app_data for replay through the
+    real received_announce.
+
+    Supported mutations (each exercises a distinct receive-path rejection
+    branch, Discovery.py:247-261):
+      * drop_field        -> remove a mandatory msgpack key (KeyError / the
+                             INTERFACE_TYPE-absent callback(None) path)
+      * set_interface_type-> overwrite INTERFACE_TYPE with a non-whitelisted
+                             string (ValueError at the DISCOVERABLE list gate)
+      * set_fields        -> wrong-type / wrong-length a field (TRANSPORT,
+                             TRANSPORT_ID, REACHABLE_ON, ...) for the type gates
+
+    No protocol logic is reconstructed: the field-key numbering, the flag byte,
+    the msgpack framing and the stamp PoW all come from real RNS / real LXMF;
+    only the *decoded dict* is edited. The byte buffer is `b"\\x00" + packed +
+    stamp` — the flag byte is the spec-literal 0x00 RNS emits for an unencrypted
+    announce and the parts are RNS's own. Used purely to prove the real receiver
+    REJECTS the malformation; pinned in ADVERSARIAL_CORRUPTORS.
+    """
+    _get_full_rns()
+    from RNS import Discovery
+    from RNS.vendor import umsgpack
+    from LXMF import LXStamper
+    RNS = Discovery.RNS
+
+    base = cmd_discovery_build_announce_appdata(params)
+    if base.get('aborted'):
+        return {'aborted': True, 'app_data': None}
+
+    # Decode the genuine RNS-produced info map with RNS's own serializer.
+    packed = hex_to_bytes(base['packed_info'])
+    info = umsgpack.unpackb(packed)
+
+    drop = params.get('drop_field')
+    if drop is not None:
+        info.pop(int(drop), None)
+
+    set_type = params.get('set_interface_type')
+    if set_type is not None:
+        info[Discovery.INTERFACE_TYPE] = set_type
+
+    for spec in (params.get('set_fields') or []):
+        key = int(spec['key'])
+        kind = spec.get('kind', 'str')
+        val = spec['value']
+        if kind == 'bytes':
+            val = hex_to_bytes(val)
+        elif kind == 'int':
+            val = int(val)
+        elif kind == 'float':
+            val = float(val)
+        elif kind == 'bool':
+            val = bool(val)
+        info[key] = val
+
+    # Re-pack with RNS's own serializer and re-stamp with real LXStamper, so the
+    # mutated announce still clears the genuine stamp gate and the rejection is
+    # attributable to the mutation alone.
+    new_packed = umsgpack.packb(info)
+    infohash = RNS.Identity.full_hash(new_packed)
+    stamp_value = params.get('stamp_value', 14)
+    rounds = Discovery.InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS
+    stamp, value = LXStamper.generate_stamp(
+        infohash, stamp_cost=stamp_value, expand_rounds=rounds)
+    if not stamp:
+        return {'aborted': True, 'app_data': None}
+
+    # Layout: flags(0x00, unencrypted) || packed || stamp — flag literal and
+    # parts are RNS's; nothing protocol-specific assembled.
+    app_data = b"\x00" + new_packed + stamp
+    return {
+        'aborted': False,
+        'app_data': bytes_to_hex(app_data),
+        'stamp_value': value,
+        'stamp_size': LXStamper.STAMP_SIZE,
+    }
+
+
+def cmd_discovery_announce_identity(params):
+    """Run the REAL InterfaceAnnouncer.__init__ identity selection
+    (Discovery.py:54-58) and report which identity the discovery Destination is
+    built under.
+
+    A lightweight owner stand-in carries `has_network_identity()`,
+    `network_identity` and `identity`; the real constructor picks the network
+    identity when has_network_identity() is True else the transport identity,
+    and builds the real RNS.Destination(identity, IN, SINGLE, "rnstransport",
+    "discovery", "interface"). The destination hash is read off that real
+    Destination — not recomputed here. Returns the chosen identity hash and both
+    candidate hashes so a test can anchor the selection against the naming
+    oracle (hash_from_name_and_identity).
+    """
+    # A real Reticulum instance must exist: InterfaceAnnouncer.__init__ builds a
+    # real Destination, whose registration needs Transport.owner set.
+    RNS = _ensure_minimal_rns()
+    from RNS import Discovery
+
+    has_net = bool(params.get('has_network_identity'))
+    net_priv = params.get('network_identity_priv')
+    id_priv = params.get('identity_priv')
+    net_identity = (RNS.Identity.from_bytes(hex_to_bytes(net_priv))
+                    if net_priv else None)
+    base_identity = (RNS.Identity.from_bytes(hex_to_bytes(id_priv))
+                     if id_priv else None)
+
+    class _Owner:
+        def has_network_identity(self_o):
+            return has_net
+    owner = _Owner()
+    owner.network_identity = net_identity
+    owner.identity = base_identity
+
+    announcer = Discovery.InterfaceAnnouncer(owner)
+    dest = announcer.discovery_destination
+    chosen = net_identity if has_net else base_identity
+    return {
+        'discovery_destination_hash': bytes_to_hex(dest.hash),
+        'chosen_identity_hash': bytes_to_hex(chosen.hash),
+        'network_identity_hash': (bytes_to_hex(net_identity.hash)
+                                  if net_identity else None),
+        'identity_hash': (bytes_to_hex(base_identity.hash)
+                          if base_identity else None),
+        'app_name': Discovery.APP_NAME,
+    }
+
+
+def cmd_discovery_feature_defaults(params):
+    """Report the interface-discovery opt-in gates for a freshly-initialised
+    node, read straight off real RNS:
+
+      * a fresh base RNS Interface's `discoverable` / `supports_discovery`
+        (Interface.py:105-106)
+      * Reticulum's master `discover_interfaces` gate (Reticulum.py:259)
+      * should_autoconnect_discovered_interfaces() / max_autoconnected_
+        interfaces() (Reticulum.py:1802-1807)
+
+    Lets a test assert every discovery feature defaults OFF (opt-in). Pure
+    attribute / getter reads on real RNS — nothing reconstructed.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS.Interfaces.Interface import Interface
+    iface = Interface()
+    return {
+        'interface_discoverable': iface.discoverable,
+        'interface_supports_discovery': iface.supports_discovery,
+        'discover_interfaces': getattr(
+            RNS.Reticulum, '_Reticulum__discover_interfaces'),
+        'should_autoconnect_discovered_interfaces':
+            RNS.Reticulum.should_autoconnect_discovered_interfaces(),
+        'max_autoconnected_interfaces':
+            RNS.Reticulum.max_autoconnected_interfaces(),
+    }
+
+
+def cmd_discovery_inject_records(params):
+    """Drive the REAL InterfaceDiscovery.list_discovered_interfaces
+    (Discovery.py:402-448) over genuine discovery records with controlled ages.
+
+    For each requested record this builds a GENUINE announce, runs it through
+    the real received_announce to obtain the real `info` dict, back-dates only
+    its `last_heard`/`received` timestamp (and optionally overrides the stamp
+    `value` for the sort key), and writes it via the real
+    InterfaceDiscovery.interface_discovered — which msgpack-serialises and
+    stores the record itself. list_discovered_interfaces is then invoked and its
+    real status assignment / staleness removal / sort order reported. The bridge
+    only chooses each record's age and reads back RNS's verdict; the threshold
+    comparisons, status codes and sort are 100% RNS.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS import Discovery
+    import time as _time
+
+    # No source allowlist configured -> the allowlist removal branch is inert.
+    setattr(RNS.Reticulum, '_Reticulum__interface_sources', [])
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', True)
+
+    disc = Discovery.InterfaceDiscovery(discover_interfaces=False)
+
+    def _clean():
+        for fn in os.listdir(disc.storagepath):
+            try:
+                os.unlink(os.path.join(disc.storagepath, fn))
+            except OSError:
+                pass
+
+    _clean()
+
+    now = _time.time()
+    requested = []
+    for rec in params['records']:
+        name = rec['name']
+        age = float(rec['age_seconds'])
+        built = cmd_discovery_build_announce_appdata({
+            'interface_type': 'TCPServerInterface',
+            'stamp_value': rec.get('stamp_value', 6),
+            'transport_enabled': True,
+            'fields': {'name': name, 'reachable_on': 'example.com',
+                       'port': 4242},
+        })
+        app_data = hex_to_bytes(built['app_data'])
+        captured = {}
+
+        def _cb(info, _c=captured):
+            if info:
+                _c.update(info)
+
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=rec.get('stamp_value', 6), callback=_cb)
+        announced = RNS.Identity()
+        handler.received_announce(announced.hash, announced, app_data)
+        if not captured:
+            raise ValueError(f"could not build genuine record for {name!r}")
+
+        captured['received'] = now - age
+        if 'value' in rec:
+            captured['value'] = int(rec['value'])
+        disc.interface_discovered(captured)
+        requested.append({
+            'name': name,
+            'discovery_hash': bytes_to_hex(captured['discovery_hash']),
+        })
+
+    listed = disc.list_discovered_interfaces()
+    out_records = []
+    for info in listed:
+        out_records.append({
+            'name': info.get('name'),
+            'status': info.get('status'),
+            'status_code': info.get('status_code'),
+            'value': info.get('value'),
+            'last_heard': info.get('last_heard'),
+            'discovery_hash': bytes_to_hex(info['discovery_hash'])
+            if isinstance(info.get('discovery_hash'), bytes)
+            else info.get('discovery_hash'),
+        })
+
+    _clean()
+    return {
+        'requested': requested,
+        'listed': out_records,
+        'threshold_unknown': Discovery.InterfaceDiscovery.THRESHOLD_UNKNOWN,
+        'threshold_stale': Discovery.InterfaceDiscovery.THRESHOLD_STALE,
+        'threshold_remove': Discovery.InterfaceDiscovery.THRESHOLD_REMOVE,
+        'status_available': Discovery.InterfaceDiscovery.STATUS_AVAILABLE,
+        'status_unknown': Discovery.InterfaceDiscovery.STATUS_UNKNOWN,
+        'status_stale': Discovery.InterfaceDiscovery.STATUS_STALE,
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -3187,6 +3445,10 @@ COMMANDS = {
     'discovery_stamp': cmd_discovery_stamp,
     'discovery_validate_address': cmd_discovery_validate_address,
     'discovery_sanitize_name': cmd_discovery_sanitize_name,
+    'discovery_craft_announce': cmd_discovery_craft_announce,
+    'discovery_announce_identity': cmd_discovery_announce_identity,
+    'discovery_feature_defaults': cmd_discovery_feature_defaults,
+    'discovery_inject_records': cmd_discovery_inject_records,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

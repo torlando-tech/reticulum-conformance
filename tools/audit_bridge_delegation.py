@@ -177,6 +177,15 @@ ADVERSARIAL_CORRUPTORS: dict[str, str] = {
         "a real initiator's request_data; the bad_mode variant overwrites the "
         "single signalling mode byte of that real payload with a reserved mode "
         "to prove the handshake mode gate rejects it — no protocol assembled.",
+    "cmd_discovery_craft_announce":
+        "Takes a GENUINE announce from the real InterfaceAnnouncer builder, "
+        "unpacks its info map with RNS's OWN vendored umsgpack, mutates ONE "
+        "decoded field (drop a mandatory key / wrong-type a field / set a "
+        "non-whitelisted INTERFACE_TYPE), re-packs with that same serializer "
+        "and re-stamps with real LXStamper, then replays it through the real "
+        "received_announce to prove the malformation is rejected. The only "
+        "asm:* signal is umsgpack — RNS's own serializer round-tripping an RNS "
+        "dict; the field numbering, flag byte and stamp PoW are all RNS's/LXMF's.",
 }
 
 # Live-instance accessors / RNS loaders. A handler that *calls* one of these is

@@ -4484,6 +4484,180 @@ def cmd_wire_destination_latest_ratchet_id(params):
 
 
 # ---------------------------------------------------------------------------
+# Receiver-side ratchet ADOPTION (a peer that heard a ratcheted announce) and
+# adoption-driven sender-side target-key selection. These delegate entirely to
+# RNS.Identity.get_ratchet / recall / encrypt and RNS.Destination.decrypt — the
+# same code Destination.encrypt uses to pick an ECDH target (Destination.py:
+# 595-599) — so a test can prove peer B adopts peer A's announced ratchet and
+# then encrypts to A under that ratchet (not A's static X25519 key).
+# ---------------------------------------------------------------------------
+
+def cmd_wire_get_adopted_ratchet(params):
+    """Report the ratchet this peer ADOPTED for a REMOTE destination after
+    hearing that destination's ratcheted announce (receiver-side adoption,
+    RNS.Identity.get_ratchet / _get_ratchet_id, Identity.py:396-411,499-520).
+
+    When peer B receives peer A's announce with the ratchet context flag set,
+    RNS.Transport validates it and Identity._remember_ratchet caches A's
+    announced ratchet PUBLIC key under A's destination hash. This surfaces that
+    adopted ratchet (32-byte public + its 10-byte ratchet id) so a test can
+    assert B adopted A's announced ratchet, that a newer announce REPLACES it,
+    and that an unknown / never-announced destination yields nothing.
+
+    Returns {found, ratchet_public, ratchet_id}.
+    """
+    RNS = _get_rns()
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    ratchet_public = RNS.Identity.get_ratchet(destination_hash)
+    if not ratchet_public:
+        return {"found": False, "ratchet_public": None, "ratchet_id": None}
+    ratchet_id = RNS.Identity._get_ratchet_id(ratchet_public)
+    return {
+        "found": True,
+        "ratchet_public": ratchet_public.hex(),
+        "ratchet_id": ratchet_id.hex(),
+    }
+
+
+def cmd_wire_encrypt_to_remote(params):
+    """Encrypt a plaintext to a REMOTE destination, auto-selecting the ratchet
+    this peer ADOPTED from that destination's announce — the same target-key
+    choice Destination.encrypt makes (Destination.py:595-599), via
+    RNS.Identity.recall + get_ratchet + Identity.encrypt(ratchet=...).
+
+    B recalls A's Identity from the received announce, looks up the ratchet it
+    adopted for A (get_ratchet), and encrypts to that ratchet public key. With
+    use_ratchet=False the static X25519 key is used instead (the negative
+    control), so a test can prove the adopted-ratchet ciphertext decrypts under
+    A's ratchet PRIVATE key rather than A's static key.
+
+    Returns {ciphertext, used_ratchet, ratchet_id, ratchet_public}.
+    """
+    RNS = _get_rns()
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    use_ratchet = bool(params.get("use_ratchet", True))
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; ensure an "
+            f"announce for this destination was received first."
+        )
+    ratchet_public = (
+        RNS.Identity.get_ratchet(destination_hash) if use_ratchet else None
+    )
+    ciphertext = identity.encrypt(plaintext, ratchet=ratchet_public)
+    ratchet_id = (
+        RNS.Identity._get_ratchet_id(ratchet_public) if ratchet_public else None
+    )
+    return {
+        "ciphertext": ciphertext.hex(),
+        "used_ratchet": ratchet_public is not None,
+        "ratchet_id": ratchet_id.hex() if ratchet_id is not None else None,
+        "ratchet_public": ratchet_public.hex() if ratchet_public else None,
+    }
+
+
+def cmd_wire_destination_decrypt(params):
+    """Decrypt a ciphertext on a local SINGLE destination, exposing WHICH ratchet
+    (if any) decrypted it (real RNS.Destination.decrypt, Destination.py:611-643).
+
+    Destination.decrypt passes ratchet_id_receiver=self, so Identity.decrypt sets
+    destination.latest_ratchet_id to the id of the ratchet that succeeded, or to
+    None when the message was decrypted with the static private key instead
+    (Identity.py:886-913). This is the discriminator that proves an inbound
+    ciphertext was encrypted to this destination's adopted ratchet (id set) vs
+    its static key (id None).
+
+    Returns {decrypted, plaintext, latest_ratchet_id}.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    ciphertext = bytes.fromhex(params["ciphertext"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on handle {handle}."
+        )
+    # Clear any stale tracking from a previous decrypt so the read-back reflects
+    # only this call (Destination.decrypt re-sets it via ratchet_id_receiver).
+    destination.latest_ratchet_id = None
+    plaintext = destination.decrypt(ciphertext)
+    latest = getattr(destination, "latest_ratchet_id", None)
+    return {
+        "decrypted": plaintext is not None,
+        "plaintext": (
+            plaintext.hex() if isinstance(plaintext, (bytes, bytearray)) else None
+        ),
+        "latest_ratchet_id": (
+            latest.hex() if isinstance(latest, (bytes, bytearray)) else None
+        ),
+    }
+
+
+def cmd_wire_reannounce(params):
+    """Re-announce an already-registered SINGLE IN destination (real
+    RNS.Destination.announce, Destination.py:265-311).
+
+    For a ratchet-enabled destination, announce() rotates the ratchet (gated by
+    the rotation interval) and carries the new latest ratchet public key, then
+    Identity._remember_ratchet caches it, so a receiver re-adopts the newer
+    ratchet. Pass rotate_ago_s to backdate latest_ratchet_time so the rotation
+    gate opens deterministically (Destination.rotate_ratchets, Destination.py:
+    227-241), forcing a genuinely NEW ratchet for the "newer announce replaces
+    the adopted ratchet" case.
+
+    Returns {announced, current_ratchet_id}.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    app_data_hex = params.get("app_data") or ""
+    rotate_ago_s = params.get("rotate_ago_s")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on handle {handle}."
+        )
+    if rotate_ago_s is not None and getattr(destination, "ratchets", None) is not None:
+        destination.latest_ratchet_time = time.time() - float(rotate_ago_s)
+    app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
+    destination.announce(app_data=app_data)
+    return {
+        "announced": True,
+        "current_ratchet_id": _current_ratchet_id(destination),
+    }
+
+
+def cmd_wire_set_proof_implicit(params):
+    """Toggle this instance's implicit-vs-explicit single-packet PROOF policy
+    (RNS.Reticulum.should_use_implicit_proof, Reticulum.py:555-558,1699-1705).
+
+    With enabled=False the PROVER emits the EXPLICIT proof form
+    (packet_hash(32) || signature(64) = EXPL_LENGTH bytes) instead of the
+    implicit signature-only form (Identity.prove, Identity.py:959-970). Set on
+    the destination owner (the prover) before the proof is requested, so a test
+    can drive and validate the 96-byte explicit layout end-to-end.
+
+    Returns {implicit_proof}.
+    """
+    RNS = _get_rns()
+    enabled = bool(params.get("enabled", True))
+    # should_use_implicit_proof() reads the (name-mangled) class attribute set
+    # in Reticulum.__init__; flip it directly so the prover's emit path branches.
+    RNS.Reticulum._Reticulum__use_implicit_proof = enabled
+    return {"implicit_proof": bool(RNS.Reticulum.should_use_implicit_proof())}
+
+
+# ---------------------------------------------------------------------------
 # Single-packet PROOF emission (implicit vs explicit), PLAIN no-op crypto,
 # request-handler deregister, known-public-key-mismatch rejection, and the
 # two deferred Link edges (forged LINKCLOSE, identify on a PENDING link).
@@ -6644,6 +6818,12 @@ WIRE_COMMANDS = {
     "wire_set_retained_ratchets": cmd_wire_set_retained_ratchets,
     "wire_ratchet_file_roundtrip": cmd_wire_ratchet_file_roundtrip,
     "wire_destination_latest_ratchet_id": cmd_wire_destination_latest_ratchet_id,
+    # Receiver-side ratchet adoption + adoption-driven target-key selection
+    "wire_get_adopted_ratchet": cmd_wire_get_adopted_ratchet,
+    "wire_encrypt_to_remote": cmd_wire_encrypt_to_remote,
+    "wire_destination_decrypt": cmd_wire_destination_decrypt,
+    "wire_reannounce": cmd_wire_reannounce,
+    "wire_set_proof_implicit": cmd_wire_set_proof_implicit,
     # Single-packet PROOF emission (implicit vs explicit)
     "wire_send_packet_with_proof_request": cmd_wire_send_packet_with_proof_request,
     # PLAIN destination no-op encrypt/decrypt

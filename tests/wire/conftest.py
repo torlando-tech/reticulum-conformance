@@ -1616,6 +1616,127 @@ class _WirePeer:
             "latest_ratchet_time": resp.get("latest_ratchet_time"),
         }
 
+    def get_adopted_ratchet(self, destination_hash: bytes) -> dict:
+        """Report the ratchet this peer ADOPTED for a REMOTE destination after
+        hearing its ratcheted announce (wire_get_adopted_ratchet ->
+        RNS.Identity.get_ratchet / _get_ratchet_id, Identity.py:396-411,499-520).
+
+        Returns {found, ratchet_public, ratchet_id}; ratchet_public (32 bytes)
+        and ratchet_id (10 bytes) are decoded to bytes (or None when this peer
+        has not adopted a ratchet for the destination).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_get_adopted_ratchet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        pub = resp.get("ratchet_public")
+        rid = resp.get("ratchet_id")
+        return {
+            "found": bool(resp.get("found", False)),
+            "ratchet_public": bytes.fromhex(pub) if pub else None,
+            "ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def encrypt_to_remote(
+        self, destination_hash: bytes, plaintext: bytes, use_ratchet: bool = True
+    ) -> dict:
+        """Encrypt to a REMOTE destination, auto-selecting the ratchet this peer
+        ADOPTED from its announce (wire_encrypt_to_remote -> RNS.Identity.recall
+        + get_ratchet + Identity.encrypt, mirroring Destination.encrypt's target
+        choice, Destination.py:595-599).
+
+        use_ratchet=False forces the static X25519 key (negative control).
+        Returns {ciphertext, used_ratchet, ratchet_id, ratchet_public}; bytes
+        fields decoded (ratchet_id/ratchet_public None when no ratchet used).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_encrypt_to_remote",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            plaintext=plaintext.hex(),
+            use_ratchet=bool(use_ratchet),
+        )
+        rid = resp.get("ratchet_id")
+        pub = resp.get("ratchet_public")
+        return {
+            "ciphertext": bytes.fromhex(resp["ciphertext"]),
+            "used_ratchet": bool(resp.get("used_ratchet", False)),
+            "ratchet_id": bytes.fromhex(rid) if rid else None,
+            "ratchet_public": bytes.fromhex(pub) if pub else None,
+        }
+
+    def destination_decrypt(
+        self, destination_hash: bytes, ciphertext: bytes
+    ) -> dict:
+        """Decrypt a ciphertext on a local SINGLE destination and report which
+        ratchet decrypted it (wire_destination_decrypt -> RNS.Destination.decrypt,
+        Destination.py:611-643).
+
+        latest_ratchet_id is the id of the ratchet that succeeded, or None when
+        the static private key decrypted it (Identity.decrypt, Identity.py:886-913).
+        Returns {decrypted, plaintext, latest_ratchet_id} (bytes decoded).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_destination_decrypt",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            ciphertext=ciphertext.hex(),
+        )
+        pt = resp.get("plaintext")
+        rid = resp.get("latest_ratchet_id")
+        return {
+            "decrypted": bool(resp.get("decrypted", False)),
+            "plaintext": bytes.fromhex(pt) if pt else None,
+            "latest_ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def reannounce(
+        self,
+        destination_hash: bytes,
+        app_data: bytes | None = None,
+        rotate_ago_s: float | None = None,
+    ) -> dict:
+        """Re-announce an already-registered IN destination (wire_reannounce ->
+        RNS.Destination.announce, Destination.py:265-311).
+
+        rotate_ago_s backdates latest_ratchet_time so the rotation gate opens and
+        a genuinely NEW ratchet is announced (the "newer announce replaces the
+        adopted ratchet" driver). Returns {announced, current_ratchet_id} (id
+        decoded to bytes or None).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+        }
+        if app_data is not None:
+            params["app_data"] = app_data.hex()
+        if rotate_ago_s is not None:
+            params["rotate_ago_s"] = float(rotate_ago_s)
+        resp = self.bridge.execute("wire_reannounce", **params)
+        rid = resp.get("current_ratchet_id")
+        return {
+            "announced": bool(resp.get("announced", False)),
+            "current_ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def set_proof_implicit(self, enabled: bool) -> dict:
+        """Toggle this instance's implicit-vs-explicit single-packet PROOF policy
+        (wire_set_proof_implicit -> RNS.Reticulum.should_use_implicit_proof,
+        Reticulum.py:1699-1705). With enabled=False the prover emits the explicit
+        packet_hash||signature proof form. Returns {implicit_proof}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_set_proof_implicit",
+            handle=self.handle,
+            enabled=bool(enabled),
+        )
+
     def set_retained_ratchets(
         self, destination_hash: bytes, n: int, pad_to: int | None = None
     ) -> dict:

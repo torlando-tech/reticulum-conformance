@@ -48,9 +48,9 @@
 | 1.40 | `test_ed25519_verify_wrong_length_signature_returns_false` | `ed25519_generate`, `ed25519_sign`, `ed25519_verify` | Ed25519 verification is a total predicate: a valid 64-byte signature verifies True (positive anchor), but a wrong-length signature (63 or 65 bytes) verifies False — returned as a boolean, NOT raised — so an impl that crashes on a malformed signature instead of rejecting it fails |
 | 1.41 | `test_ed25519_verify_wrong_public_key_returns_false` | `ed25519_generate`, `ed25519_sign`, `ed25519_verify` | Ed25519 rejects a valid signature presented under the WRONG public key: the signature verifies True under its own key (positive anchor) but False under an unrelated public key — pins that verification binds signature to the specific signing key |
 
-## 2. Identity (10 tests)
+## 2. Identity (12 tests)
 
-### `tests/test_identity.py` (7 tests)
+### `tests/test_identity.py` (9 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
@@ -61,14 +61,16 @@
 | 2.5 | `test_identity_decrypt_rejects_forged_ciphertext` | `identity_from_private_key`, `identity_encrypt`, `identity_decrypt` | Negative control (with positive control): a genuine ciphertext decrypts to the original plaintext, but a ciphertext with one flipped bit in its trailing HMAC tag fails authentication — RNS.Identity.decrypt yields plaintext=None (and an impl that raises is also accepted), never attacker-controlled plaintext. Both paths run on each impl. |
 | 2.6 | `test_identity_encrypt_decrypt` | `identity_from_private_key`, `identity_encrypt`, `identity_decrypt` | RNS Identity encrypt/decrypt cross-impl round-trip in both directions — exercises the X25519+HKDF+AES composition used for unicast encryption |
 | 2.7 | `test_identity_encrypt_is_fresh_per_call` | `identity_from_private_key`, `identity_encrypt`, `identity_decrypt` | Invariant: two encryptions of byte-identical plaintext for the same Identity produce different ciphertext (RNS draws a fresh ephemeral X25519 key + AES IV per call), and both still decrypt back to the original |
+| 2.8 | `test_identity_verify_malformed_signature_returns_false` | `identity_from_private_key`, `identity_sign`, `identity_verify` | RNS.Identity.validate is a TOTAL boolean predicate: a genuine signature verifies True (positive anchor), but a structurally malformed signature — wrong length (63 bytes, 65 bytes) or empty (0 bytes) — verifies False, returned as a boolean rather than raised. An SUT that throws on a malformed signature instead of rejecting it fails |
+| 2.9 | `test_announce_validate_rejects_malformed_body` | `announce_build`, `announce_validate` | RNS.Identity.validate_announce rejects malformed announces by returning False and never crashes: a genuine announce validates True (positive anchor), but an announce whose BODY is truncated (signature/key slices fall short) or whose public-key bytes are corrupted validates False — exercising the body-truncation and undecodable-key paths the suite previously only hit at packet unpack |
 
 ### `tests/test_identity_persistence.py` (3 tests)
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
-| 2.8 | `test_identity_to_file_from_file_round_trip` | `identity_from_private_key`, `identity_to_file`, `identity_from_file` | RNS.Identity round-trips through the on-disk file format (raw 64-byte private key) via to_file -> from_file with byte-identical public_key + hash on the reloaded Identity. Catches an impl whose to_file / from_file disagree on byte layout (Sideband's identity-on-disk format). |
-| 2.9 | `test_identity_file_format_cross_impl` | `identity_from_private_key`, `identity_to_file`, `identity_from_file` | Cross-impl on-disk format: an identity written by either impl can be loaded by the other, and BOTH reload paths recover the byte-identical public_key + hash of the identity derived directly from the same 64-byte private key. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path. |
-| 2.10 | `test_identity_from_file_missing_path` | `identity_from_file` | Negative control: identity_from_file on a non-existent path returns found=False (or on Python's RNS, raises which the bridge surfaces as an error). Catches an impl that silently fabricates an Identity for a missing file — a vector for accidentally generating fresh keys on every boot. |
+| 2.10 | `test_identity_to_file_from_file_round_trip` | `identity_from_private_key`, `identity_to_file`, `identity_from_file` | RNS.Identity round-trips through the on-disk file format (raw 64-byte private key) via to_file -> from_file with byte-identical public_key + hash on the reloaded Identity. Catches an impl whose to_file / from_file disagree on byte layout (Sideband's identity-on-disk format). |
+| 2.11 | `test_identity_file_format_cross_impl` | `identity_from_private_key`, `identity_to_file`, `identity_from_file` | Cross-impl on-disk format: an identity written by either impl can be loaded by the other, and BOTH reload paths recover the byte-identical public_key + hash of the identity derived directly from the same 64-byte private key. The 64-byte raw private key on disk is the interop contract between Python LXMF / Sideband and any cross-impl reload path. |
+| 2.12 | `test_identity_from_file_missing_path` | `identity_from_file` | Negative control: identity_from_file on a non-existent path returns found=False (or on Python's RNS, raises which the bridge surfaces as an error). Catches an impl that silently fabricates an Identity for a missing file — a vector for accidentally generating fresh keys on every boot. |
 
 ## 3. Token Encryption (6 tests)
 

@@ -851,3 +851,71 @@ def test_ifac_flagged_packet_dropped_on_open_interface(behavioral):
         )
     finally:
         behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_drain_tx", "behavioral_read_path_table",
+              "behavioral_read_announce_table", "packet_build", "packet_unpack",
+              "name_hash", "truncated_hash"],
+    verifies=(
+        "A TRANSPORT-DISABLED instance does NOT answer a path request for a "
+        "non-local destination it has a path to: with transport disabled, after "
+        "learning a path to D (path_table entry present — the precondition that "
+        "proves the node KNOWS the path), a path request for D schedules NO "
+        "cached-announce rebroadcast (no announce_table answer), because "
+        "Transport only answers on behalf of others when transport_enabled() or "
+        "the request is from a local client (Transport.path_request). An impl "
+        "that answers regardless of the transport gate would leak routing for a "
+        "node that opted out of transport"
+    ),
+)
+def test_transport_disabled_does_not_answer_path_request(behavioral):
+    """Transport off: the node learns D's path but must not answer remote path
+    requests for it (only transport nodes / local-client requests are answered).
+    The path-table precondition anchors the no-answer to the transport gate, not
+    to the node never having learned the path. The transport-ENABLED counterpart
+    (the same PR IS answered) is pinned by test_path_request_tag_dedup."""
+    inst = behavioral.start(enable_transport=False)
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        iface_b = inst.attach_mock_interface("b", mode="FULL")
+
+        # Seed a path to D via a PATH_RESPONSE announce (caches the announce
+        # without scheduling a forward retransmit).
+        seed, dest, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="testapp", aspects=["notransport_pr"],
+            emission_ts=1_000_000_000, wire_hops=0,
+            context=CONTEXT_PATH_RESPONSE,
+        )
+        inst.inject(iface_b, seed)
+        time.sleep(0.2)
+
+        # Precondition: the transport-disabled node DID learn the path — so a
+        # later non-answer is the transport gate, not ignorance of the path.
+        assert inst.read_path_table(dest)["found"] is True, (
+            "transport-disabled node did not learn the seeded path; the "
+            "no-answer assertion below would be vacuous"
+        )
+
+        inst.drain_tx(iface_a)
+        inst.drain_tx(iface_b)
+
+        # A path request for D (a non-local destination) must NOT be answered:
+        # no cached-announce rebroadcast is scheduled.
+        pr = build_path_request(
+            behavioral.bridge, dest,
+            transport_id=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+            tag=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+        )
+        inst.inject(iface_a, pr)
+        time.sleep(0.2)
+
+        assert inst.read_announce_table(dest)["found"] is False, (
+            "a transport-disabled node scheduled a path-request answer for a "
+            "non-local destination — it answered despite transport being disabled"
+        )
+    finally:
+        behavioral.cleanup()

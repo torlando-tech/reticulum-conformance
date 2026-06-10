@@ -328,3 +328,32 @@ def test_packet_unpack_rejects_truncated(sut, reference):
         assert rejected["unpacked"] is False, (
             f"truncated input ({why}) must be rejected, got {rejected}"
         )
+
+
+@conformance_case(
+    commands=["packet_build", "packet_unpack"],
+    verifies="RNS rejects truncated HEADER_2 (transport-relayed) frames: a HEADER_2 announce needs at least 35 bytes (flags+hops+16B transport_id+16B destination_hash+context), so feeding any 19–34 byte frame that has the HEADER_2 bit set to packet_unpack returns unpacked=False rather than fabricating a transport_id or destination from bytes that aren't there, while the full HEADER_2 frame unpacks (positive control). Pins the HEADER_2_MIN_SIZE gate the suite previously enforced only in the harness parser",
+)
+def test_packet_unpack_rejects_truncated_header2(sut):
+    transport_id = random_hex(16)
+    built = sut.execute(
+        "packet_build",
+        dest_type="single", packet_type=_PTYPE_ANNOUNCE,
+        context=0, context_flag=0, hops=0, data=random_hex(40),
+        header_type=2, transport_id=transport_id,
+    )
+    raw = bytes.fromhex(built["raw"])
+    # Positive control: the full HEADER_2 frame unpacks and is reported HEADER_2.
+    good = sut.execute("packet_unpack", raw=raw.hex())
+    assert good["unpacked"] is True and good["header_type"] == _HEADER_2
+    # The header_type bit is set, so the parser MUST require >=35 bytes. Any
+    # frame in [19, 34] with that bit set lacks room for transport_id+dest.
+    for length in (19, 24, 33, 34):
+        truncated = raw[:length]
+        # Confirm the HEADER_2 bit survives the truncation (it lives in raw[0]).
+        assert (truncated[0] & 0x40) >> 6 == _HEADER_2
+        rejected = sut.execute("packet_unpack", raw=truncated.hex())
+        assert rejected["unpacked"] is False, (
+            f"a {length}-byte HEADER_2 frame must be rejected (< 35-byte minimum), "
+            f"got {rejected}"
+        )

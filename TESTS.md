@@ -98,7 +98,7 @@
 | 4.5 | `test_dest_hash_identity_bound_multiaspect_derivation` | `identity_from_private_key`, `destination_hash`, `name_hash`, `truncated_hash` | Identity-bound destination address over a MULTI-aspect name = SHA-256(name_hash(app.a.b.c) \|\| identity_hash)[:16]: RNS.Destination.hash for app_name='myapp', aspects=['alpha','beta','gamma'] equals the independently re-derived truncated_hash(name_hash('myapp.alpha.beta.gamma') \|\| identity_hash), and reordering the aspects changes the address — pinning the dotted multi-aspect expansion AND the name_hash\|\|identity_hash composition order |
 | 4.6 | `test_dest_type_bits_group_on_wire` | `packet_build`, `packet_unpack` | GROUP destination type encodes to flag bits 3-2 == 1 on the wire (SINGLE=0, GROUP=1, PLAIN=2, LINK=3): a real GROUP-destination packet built by RNS reports destination_type==1 and the other impl decodes raw[0] back to destination_type==1 — pins the GROUP wire code-point that the suite otherwise only used as an opaque hop-drop input |
 
-## 5. Packet (8 tests)
+## 5. Packet (9 tests)
 
 **File:** `tests/test_packet.py`
 
@@ -112,6 +112,7 @@
 | 5.6 | `test_packet_header2_transport_id_roundtrip_and_hash_masking` | `packet_build`, `packet_unpack`, `packet_hash` | RNS HEADER_2 (transport-relayed) ANNOUNCE wire format: the 16-byte transport_id placed between the hops byte and the destination_hash round-trips through the other impl's unpack byte-for-byte, and the transport_id is masked OUT of the packet hash — hashing the HEADER_1-equivalent bytes (transport_id stripped at raw[2:18], header_type bit cleared) yields the identical hash, exactly as RNS.Packet.get_hashable_part skips raw[2:18] for HEADER_2 so a relayed announce keeps the originator's hashlist identity |
 | 5.7 | `test_packet_build_rejects_oversize_mtu` | `packet_build` | RNS enforces the per-packet MTU (RNS.Reticulum.MTU == 500 bytes) at pack time: building a packet whose payload pushes the wire size past the MTU is rejected (Packet.pack raises), while a payload that comfortably fits is accepted (positive control) — so an impl that silently emits oversize packets fails |
 | 5.8 | `test_packet_unpack_rejects_truncated` | `packet_build`, `packet_unpack` | RNS rejects malformed/truncated packets: feeding raw bytes shorter than the minimum HEADER_1 header (flags+hops+16B destination_hash+context = 19 bytes), including empty input, to packet_unpack returns unpacked=False rather than fabricating header fields, while a well-formed packet unpacks (positive control) |
+| 5.9 | `test_packet_unpack_rejects_truncated_header2` | `packet_build`, `packet_unpack` | RNS rejects truncated HEADER_2 (transport-relayed) frames: a HEADER_2 announce needs at least 35 bytes (flags+hops+16B transport_id+16B destination_hash+context), so feeding any 19–34 byte frame that has the HEADER_2 bit set to packet_unpack returns unpacked=False rather than fabricating a transport_id or destination from bytes that aren't there, while the full HEADER_2 frame unpacks (positive control). Pins the HEADER_2_MIN_SIZE gate the suite previously enforced only in the harness parser |
 
 ## 6. Framing (6 tests)
 

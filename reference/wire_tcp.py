@@ -4556,6 +4556,82 @@ def cmd_wire_inject_tampered_link_data(params):
     }
 
 
+def cmd_wire_inject_crafted_resource_part(params):
+    """Adversarial resource-part injector (part acceptance, receiver side).
+
+    A Resource receiver accepts an incoming part only if its map hash —
+    get_map_hash(part.data) = full_hash(part.data || random_hash)[:MAPHASH_LEN] —
+    matches an entry in the expected hashmap window (Resource.receive_part). A
+    part with any other map hash (a corrupted-in-flight or forged part) is
+    silently dropped. A receiver that reassembles whatever arrives accepts
+    forged content.
+
+    Self-contained: builds a real sender Resource on the link (advertise=False),
+    constructs the receiver from the sender's real ResourceAdvertisement via the
+    real Resource.accept, then feeds a real RESOURCE part through the real
+    Resource.receive_part — reporting whether the part was inserted. Variants:
+      valid           — the sender's own first part; its map hash matches the
+                        hashmap, so it MUST be accepted (positive control).
+      forged_map_hash — random part data, whose map hash is not in the hashmap;
+                        must be DROPPED (not inserted).
+
+    Returns {variant, accepted, parts_before, parts_after, total_parts}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender = RNS.Resource(secrets.token_bytes(2000), link, advertise=False)
+    advertisement = RNS.ResourceAdvertisement(sender)
+    adv_plaintext = advertisement.pack()
+
+    # Feed the real advertisement bytes + link to the real Resource.accept, which
+    # unpacks the advertisement and builds the receiver Resource itself.
+    adv_packet = RNS.Packet(link, adv_plaintext, context=RNS.Packet.RESOURCE_ADV)
+    adv_packet.plaintext = adv_plaintext
+    adv_packet.link = link
+    receiver = RNS.Resource.accept(adv_packet)
+
+    def _received(resource):
+        return sum(1 for part in resource.parts if part is not None)
+
+    parts_before = _received(receiver)
+
+    if variant == "valid":
+        part_data = sender.parts[0].data
+    elif variant == "forged_map_hash":
+        part_data = secrets.token_bytes(len(sender.parts[0].data))
+    else:
+        raise ValueError(f"unknown resource-part variant: {variant!r}")
+
+    part_packet = RNS.Packet(link, part_data, context=RNS.Packet.RESOURCE)
+    part_packet.pack()
+    rx = RNS.Packet(None, part_packet.raw)
+    if rx.unpack():
+        receiver.receive_part(rx)
+
+    parts_after = _received(receiver)
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return {
+        "variant": variant,
+        "accepted": parts_after > parts_before,
+        "parts_before": parts_before,
+        "parts_after": parts_after,
+        "total_parts": len(receiver.parts),
+    }
+
+
 def cmd_wire_inject_crafted_resource_proof(params):
     """Adversarial RESOURCE_PRF injector (resource proof validation, sender side).
 
@@ -4954,6 +5030,7 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_link_identify": cmd_wire_inject_crafted_link_identify,
     "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
     "wire_inject_crafted_resource_proof": cmd_wire_inject_crafted_resource_proof,
+    "wire_inject_crafted_resource_part": cmd_wire_inject_crafted_resource_part,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

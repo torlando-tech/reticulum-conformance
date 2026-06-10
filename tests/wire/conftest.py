@@ -1842,6 +1842,18 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
+    def inject_crafted_resource_part(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial resource-part injector: build a real sender Resource +
+        receiver (via Resource.accept), then feed a part of `variant` (valid /
+        forged_map_hash) through the real Resource.receive_part, reporting
+        {variant, accepted, parts_before, parts_after, total_parts}. The sender's
+        own part is accepted; a forged-map-hash part is dropped."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_part",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
     def inject_crafted_resource_proof(self, link_id: bytes, variant: str) -> dict:
         """Adversarial RESOURCE_PRF injector: build a real sender Resource on the
         link and run a crafted proof of `variant` (valid / wrong_proof /

@@ -76,3 +76,40 @@ def test_resource_proof_validation_rejects_forgeries(wire_link_setup):
     )
     assert ok["status_name"] == "COMPLETE", f"valid proof: resource not COMPLETE: {ok!r}"
     assert ok["proof_len"] == 64, f"valid proof length must be 64, got {ok!r}"
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path",
+        "link_open", "inject_crafted_resource_part",
+    ],
+    verifies=(
+        "A Resource RECEIVER accepts an incoming part only if its map hash "
+        "(full_hash(part.data||random_hash)[:MAPHASH_LEN]) matches the expected "
+        "hashmap window: a forged part (random data, map hash not in the hashmap) "
+        "is silently dropped (not inserted), while the sender's own genuine part "
+        "is accepted (positive control). A receiver that reassembles whatever "
+        "arrives — without checking the map hash — accepts forged content"
+    ),
+)
+def test_resource_part_acceptance_rejects_forged_map_hash(wire_link_setup):
+    _server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Negative: a forged part (map hash not in the hashmap) must be dropped.
+    bad = client.inject_crafted_resource_part(link_id, "forged_map_hash")
+    assert bad["accepted"] is False, (
+        f"a forged-map-hash part was INSERTED — the receiver reassembled content "
+        f"without verifying the part map hash: {bad!r}"
+    )
+    assert bad["parts_after"] == bad["parts_before"], (
+        f"forged part changed the received-parts count: {bad!r}"
+    )
+
+    # Positive control: the sender's own genuine part IS accepted.
+    ok = client.inject_crafted_resource_part(link_id, "valid")
+    assert ok["accepted"] is True, (
+        f"a genuine part was not accepted by the receiver (positive control): {ok!r}"
+    )
+    assert ok["parts_after"] == ok["parts_before"] + 1, (
+        f"a genuine part must insert exactly one part: {ok!r}"
+    )

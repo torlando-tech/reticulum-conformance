@@ -3010,6 +3010,52 @@ def cmd_wire_send_link_data(params):
     return {"sent": True, "receipt_id": receipt_id}
 
 
+def cmd_wire_send_over_closed_link(params):
+    """Drive real RNS.Packet.send() over a CLOSED link and report that nothing
+    was transmitted (Packet.py:280-286).
+
+    RNS.Packet.send short-circuits when the destination is a Link in state
+    CLOSED: it sets self.sent=False, self.receipt=None and returns False
+    WITHOUT incrementing the link's txbytes or handing the packet to any
+    interface. This builds a real RNS.Packet bound to the (already torn-down)
+    link, snapshots link.txbytes, calls the real send(), and reports the
+    boolean RNS returned plus the txbytes delta so a test can assert send()==
+    False AND bytes_transmitted==0.
+
+    The caller must first drive the link to CLOSED (e.g. wire_link_teardown).
+    Returns {link_status, link_status_name, sent, bytes_transmitted}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", "")) or b"after-close"
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    status_names = {
+        RNS.Link.PENDING: "PENDING", RNS.Link.HANDSHAKE: "HANDSHAKE",
+        RNS.Link.ACTIVE: "ACTIVE", RNS.Link.STALE: "STALE",
+        RNS.Link.CLOSED: "CLOSED",
+    }
+    tx_before = int(getattr(link, "txbytes", 0))
+    packet = RNS.Packet(link, payload, create_receipt=True)
+    result = packet.send()
+    tx_after = int(getattr(link, "txbytes", 0))
+    return {
+        "link_status": int(link.status),
+        "link_status_name": status_names.get(link.status, str(link.status)),
+        # send() returns False on a closed link, else a receipt or None.
+        "sent": result is not False,
+        "bytes_transmitted": tx_after - tx_before,
+    }
+
+
 def cmd_wire_send_keepalive_probe(params):
     """Inject a decrypted 0xFF keepalive into a link's receive path and report
     the link's response — making the keepalive byte protocol observable
@@ -4184,6 +4230,15 @@ def cmd_wire_send_packet_with_proof_request(params):
     proof_len = len(proof_data) if isinstance(proof_data, (bytes, bytearray)) else None
     impl_len = int(RNS.PacketReceipt.IMPL_LENGTH)
     expl_len = int(RNS.PacketReceipt.EXPL_LENGTH)
+    # Capture the RAW wire frame of the PROOF the receiver emitted (the bytes
+    # RNS received and unpacked into proof_packet) so a test can assert the
+    # proof packet's flag-byte shape — PROOF type, context NONE, HEADER_1,
+    # hops, and the SINGLE destination-type bits — and that it is addressed to
+    # the truncated hash of the proved packet (ProofDestination.hash,
+    # Packet.py:336-339). proved_packet_hash is the receipt's full packet hash;
+    # the proof's destination_hash is its first TRUNCATED_HASHLENGTH//8 bytes.
+    proof_raw = getattr(proof_packet, "raw", None) if proof_packet is not None else None
+    proved_packet_hash = getattr(receipt, "hash", None)
     return {
         "sent": True,
         "receipt_id": receipt_id,
@@ -4197,6 +4252,11 @@ def cmd_wire_send_packet_with_proof_request(params):
         "proof_is_explicit": proof_len == expl_len if proof_len is not None else None,
         "impl_length": impl_len,
         "expl_length": expl_len,
+        "proof_raw": proof_raw.hex() if isinstance(proof_raw, (bytes, bytearray)) else None,
+        "proved_packet_hash": (
+            proved_packet_hash.hex()
+            if isinstance(proved_packet_hash, (bytes, bytearray)) else None
+        ),
     }
 
 
@@ -5011,6 +5071,7 @@ WIRE_COMMANDS = {
     "wire_set_proof_strategy": cmd_wire_set_proof_strategy,
     # Link DATA proof strategy / keepalive byte values
     "wire_send_link_data": cmd_wire_send_link_data,
+    "wire_send_over_closed_link": cmd_wire_send_over_closed_link,
     "wire_send_keepalive_probe": cmd_wire_send_keepalive_probe,
     "wire_last_keepalive": cmd_wire_last_keepalive,
     # Transport posture / link MTU / single-packet PacketReceipt observation

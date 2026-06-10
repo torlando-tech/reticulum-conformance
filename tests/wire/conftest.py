@@ -1083,6 +1083,21 @@ class _WirePeer:
             create_receipt=bool(create_receipt),
         )
 
+    def send_over_closed_link(self, link_id: bytes, data: bytes = b"") -> dict:
+        """Attempt RNS.Packet.send() over a CLOSED link (Packet.py:280-286).
+
+        The link must already be torn down (call link_teardown first). Returns
+        {link_status, link_status_name, sent, bytes_transmitted}: a closed link
+        yields sent=False and bytes_transmitted=0 (RNS transmits nothing).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_over_closed_link",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+        )
+
     def send_keepalive_probe(self, link_id: bytes) -> dict:
         """Inject a decrypted 0xFF keepalive into a link's receive path.
 
@@ -1640,6 +1655,16 @@ class _WirePeer:
             "proof_is_explicit": resp.get("proof_is_explicit"),
             "impl_length": resp.get("impl_length"),
             "expl_length": resp.get("expl_length"),
+            # Raw wire frame of the emitted PROOF + the proved packet's full
+            # hash, so a test can pin the proof packet's flag-byte shape and
+            # its truncated-hash destination addressing.
+            "proof_raw": (
+                bytes.fromhex(resp["proof_raw"]) if resp.get("proof_raw") else None
+            ),
+            "proved_packet_hash": (
+                bytes.fromhex(resp["proved_packet_hash"])
+                if resp.get("proved_packet_hash") else None
+            ),
         }
 
     # --- PLAIN destination no-op encrypt / decrypt ------------------------

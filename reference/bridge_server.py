@@ -807,6 +807,98 @@ def cmd_packet_hash(params):
     if not packet.unpack():
         raise ValueError("malformed packet — RNS.Packet.unpack rejected it")
     return {'hash': bytes_to_hex(packet.get_hash())}
+
+
+def cmd_packet_build_raw_header2(params):
+    """Build a HEADER_2 packet and call RNS.Packet.pack() WITHOUT any
+    pre-validation, surfacing RNS's OWN failure.
+
+    Unlike packet_build (which guards HEADER_2 in the harness before pack),
+    this constructs the real RNS.Packet exactly as the caller asks — including
+    omitting the transport_id (transport_id=None) or asking for a non-ANNOUNCE
+    HEADER_2 — and lets RNS.Packet.pack() decide. RNS.Packet.pack
+    (Packet.py:220-229) raises IOError("Packet with header type 2 must have a
+    transport ID") when transport_id is None, and for a non-ANNOUNCE HEADER_2 it
+    never assigns self.ciphertext, so .raw assembly raises AttributeError. Either
+    way the failure comes from RNS, not the harness.
+
+    Params: {packet_type (int, default ANNOUNCE), transport_id (optional hex),
+    data (hex, optional)}. Returns {raw, raw_len} on a successful pack, or
+    {error: <RNS exception message>, error_type: <exception class name>} when
+    RNS refuses.
+    """
+    RNS = _get_full_rns()
+    packet_type = int(params.get('packet_type', RNS.Packet.ANNOUNCE))
+    data = hex_to_bytes(params.get('data', '')) or b'\x00'
+    transport_id = (
+        hex_to_bytes(params['transport_id'])
+        if params.get('transport_id') is not None else None
+    )
+    # A SINGLE OUT destination supplies destination.hash for the HEADER_2 body.
+    destination = RNS.Destination(
+        RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "packet",
+    )
+    packet = RNS.Packet(
+        destination, data,
+        packet_type=packet_type,
+        header_type=RNS.Packet.HEADER_2,
+        transport_id=transport_id,
+        create_receipt=False,
+    )
+    try:
+        packet.pack()
+    except Exception as e:
+        return {'error': str(e), 'error_type': type(e).__name__}
+    return {'raw': bytes_to_hex(packet.raw), 'raw_len': len(packet.raw)}
+
+
+def cmd_packet_resend_observe(params):
+    """Pack a packet, then drive real RNS.Packet.resend() and report whether the
+    re-pack produced fresh wire bytes.
+
+    RNS.Packet.resend (Packet.py:305-323) re-packs the packet before
+    re-transmitting precisely so an encrypted destination gets fresh ephemeral
+    key material / IV on every attempt. This builds a real RNS.Packet for the
+    requested dest_type, packs it (raw_1/hash_1), marks it sent (resend's
+    precondition), then calls the real resend() — which internally calls
+    self.pack() again — and reads raw_2/hash_2 straight off the packet RNS
+    mutated. No interface is attached, so resend()'s Transport.outbound returns
+    False, but the re-pack (the byte-generation under test) still runs.
+
+    Params: {dest_type: 'single'|'plain'|'group', data (hex)}. Returns
+    {raw_1, hash_1, raw_2, hash_2}.
+    """
+    RNS = _get_full_rns()
+    dest_type = params.get('dest_type', 'single')
+    data = hex_to_bytes(params.get('data', '')) or b'conformance-resend'
+    if dest_type == 'plain':
+        destination = RNS.Destination(
+            None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+            "conformance", "packet",
+        )
+    elif dest_type == 'group':
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP,
+            "conformance", "packet",
+        )
+        destination.create_keys()
+    else:
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "conformance", "packet",
+        )
+    packet = RNS.Packet(destination, data, create_receipt=False)
+    packet.pack()
+    raw_1 = bytes_to_hex(packet.raw)
+    hash_1 = bytes_to_hex(packet.get_hash())
+    # resend() requires the packet to have been sent already; RNS sets .sent in
+    # send(). We set it so resend's precondition passes and the real re-pack runs.
+    packet.sent = True
+    packet.resend()
+    raw_2 = bytes_to_hex(packet.raw)
+    hash_2 = bytes_to_hex(packet.get_hash())
+    return {'raw_1': raw_1, 'hash_1': hash_1, 'raw_2': raw_2, 'hash_2': hash_2}
 # Announce operations
 
 def cmd_announce_build(params):
@@ -2586,6 +2678,8 @@ def cmd_packet_constants(params):
         'truncated_hashlength': int(I.TRUNCATED_HASHLENGTH),
         'keysize': int(I.KEYSIZE),
         'name_hash_length': int(I.NAME_HASH_LENGTH),
+        'token_overhead': int(I.TOKEN_OVERHEAD),
+        'aes128_blocksize': int(I.AES128_BLOCKSIZE),
     }
 
 
@@ -2647,6 +2741,8 @@ COMMANDS = {
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
     'packet_constants': cmd_packet_constants,
+    'packet_build_raw_header2': cmd_packet_build_raw_header2,
+    'packet_resend_observe': cmd_packet_resend_observe,
     'identity_random_hash': cmd_identity_random_hash,
     'hdlc_escape': cmd_hdlc_escape,
     # Ratchet operations

@@ -57,13 +57,16 @@ from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     CONTEXT_PATH_RESPONSE,
     HEADER_2,
+    PACKET_TYPE_ANNOUNCE,
     PACKET_TYPE_PROOF,
+    TRANSPORT_TRANSPORT,
     TRUNCATED_HASH_BYTES,
     _promote_to_header2,
     build_announce_from_destination,
     build_data_packet,
     build_path_request,
     build_proof,
+    first_announce,
     parse_packet_header,
 )
 
@@ -719,6 +722,72 @@ def test_announce_signature_gate_blocks_state_change(behavioral):
         assert inst2.read_path_table(dest_hash2)["found"] is False, (
             "a tampered-signature announce created a path-table entry — the "
             "inbound signature gate did not fire before the state change"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_drain_tx"],
+    verifies=(
+        "A transport-enabled node rebroadcasting a heard announce out another "
+        "interface emits it in the transport-relay wire form: HEADER_2, "
+        "transport_type==TRANSPORT, the node's OWN identity hash as transport_id, "
+        "the destination_hash carried through unchanged, and the hop count = "
+        "wire_hops + 1 (the receive increment). An impl that rebroadcasts as "
+        "HEADER_1 (no transport_id) lets downstream peers learn a direct path "
+        "that black-holes"
+    ),
+)
+def test_announce_rebroadcast_wire_format(behavioral):
+    """Inject a valid announce (wire_hops=2) on interface A of a transport node
+    with two FULL interfaces; the rebroadcast on interface B must be the
+    HEADER_2/TRANSPORT relay form carrying this node's identity as transport_id
+    and hops==3. Discriminating: an impl that forwards HEADER_1 fails the
+    header/transport_id assertions; one that does not increment fails the hops
+    assertion."""
+    inst = behavioral.start(enable_transport=True)
+    self_id = inst.identity_hash
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        iface_b = inst.attach_mock_interface("b", mode="FULL")
+
+        raw, dest, _pub = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["rebroadcast"],
+            random_prefix=b"\x2a" * 5,
+            emission_ts=1_000_000_200,
+            wire_hops=2,
+        )
+        inst.inject(iface_a, raw)
+        # The rebroadcast goes through the announce retransmit job (a random
+        # 0-0.5s initial delay), so wait past that window before draining.
+        time.sleep(1.0)
+
+        out = first_announce(inst.drain_tx(iface_b))
+        assert out is not None, (
+            "no announce was rebroadcast on the second interface — the transport "
+            "node did not forward the heard announce"
+        )
+        assert out["packet_type"] == PACKET_TYPE_ANNOUNCE
+        assert out["destination_hash"] == dest, "rebroadcast targets the wrong destination"
+        assert out["header_type"] == HEADER_2, (
+            f"rebroadcast must be HEADER_2 (transport relay), got header_type={out['header_type']}"
+        )
+        assert out["transport_type"] == TRANSPORT_TRANSPORT, (
+            f"rebroadcast must carry transport_type==TRANSPORT, got {out['transport_type']}"
+        )
+        assert out["transport_id"] == self_id, (
+            f"rebroadcast must carry this node's identity as transport_id; got "
+            f"{out['transport_id'].hex() if out['transport_id'] else None}, "
+            f"expected {self_id.hex()}"
+        )
+        assert out["hops"] == 3, (
+            f"wire_hops=2 + receive increment -> hops==3 on the rebroadcast, "
+            f"got {out['hops']}"
         )
     finally:
         behavioral.cleanup()

@@ -434,6 +434,7 @@ class _WirePeer:
         aspects: list,
         app_data: bytes = b"",
         enable_ratchets: bool = False,
+        app_data_empty: bool = False,
     ) -> bytes:
         """Create and announce a fresh SINGLE IN destination; return its hash.
 
@@ -459,6 +460,11 @@ class _WirePeer:
         }
         if enable_ratchets:
             params["enable_ratchets"] = True
+        # app_data_empty requests an explicit b"" app_data (present-but-empty),
+        # distinct from omitting app_data; cmd_wire_announce only treats an empty
+        # app_data as present when this flag is set, otherwise it sends None.
+        if app_data_empty:
+            params["app_data_empty"] = True
         resp = self.bridge.execute("wire_announce", **params)
         self.last_announce = resp
         return bytes.fromhex(resp["destination_hash"])

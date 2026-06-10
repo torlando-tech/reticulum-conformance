@@ -908,6 +908,13 @@ def cmd_wire_announce(params):
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
     app_data_hex = params.get("app_data") or ""
+    # app_data_empty distinguishes an explicit empty-but-present app_data (b"")
+    # from an omitted one. Without it, an empty app_data_hex is indistinguishable
+    # from absent, so the announce always collapses to app_data=None and the
+    # None-vs-empty recall distinction (Identity.validate_announce, Identity.py:
+    # 542/560-561: ratchetless no-app_data -> None, ratcheted no-app_data -> b"")
+    # cannot be exercised from the wire side.
+    app_data_empty = bool(params.get("app_data_empty", False))
     enable_ratchets = bool(params.get("enable_ratchets", False))
 
     with _instances_lock:
@@ -932,7 +939,12 @@ def cmd_wire_announce(params):
         )
         ratchets_enabled = bool(destination.enable_ratchets(ratchets_path))
 
-    app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
+    if app_data_hex:
+        app_data = bytes.fromhex(app_data_hex)
+    elif app_data_empty:
+        app_data = b""
+    else:
+        app_data = None
     destination.announce(app_data=app_data)
     # Keep a reference so the destination/identity aren't GC'd before the
     # TX loop picks up the announce packet.

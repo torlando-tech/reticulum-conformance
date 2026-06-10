@@ -3335,6 +3335,114 @@ def cmd_discovery_inject_records(params):
     }
 
 
+# Probe interface source: a minimal real RNS Interface subclass that opens no
+# sockets/hardware. Loaded via RNS's own external-interface mechanism
+# (Reticulum._synthesize_interface -> exec of a module exporting interface_class,
+# Reticulum.py:999-1021) so that the full real config-parsing pipeline
+# (mode-forcing, bitrate/announce_cap/ifac_size bound checks, discovery-interval
+# floor) runs and writes its results onto a genuine interface object we can read.
+_CONFIG_PARSE_PROBE_SRC = '''
+class ConfigParseProbeInterface(Interface):
+    AUTOCONFIGURE_MTU = False
+    DEFAULT_IFAC_SIZE = 16
+    def __init__(self, owner, configuration):
+        super().__init__()
+        self.owner = owner
+        self.online = False
+        self.IN = True
+        self.OUT = True
+        self.bitrate = 62500
+    def process_outgoing(self, data):
+        pass
+    def __str__(self):
+        return "ConfigParseProbeInterface[probe]"
+interface_class = ConfigParseProbeInterface
+'''
+
+_CONFIG_PARSE_PROBE_TYPE = "ConfigParseProbeInterface"
+
+
+def _ensure_config_parse_probe(RNS):
+    """Write the no-op probe interface module into the live instance's
+    interfacepath so RNS's external-interface loader can instantiate it."""
+    path = os.path.join(RNS.Reticulum.interfacepath,
+                        f"{_CONFIG_PARSE_PROBE_TYPE}.py")
+    if not os.path.isfile(path):
+        os.makedirs(RNS.Reticulum.interfacepath, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(_CONFIG_PARSE_PROBE_SRC)
+
+
+_MODE_NAMES = {
+    0x01: "full", 0x02: "pointtopoint", 0x03: "access_point",
+    0x04: "roaming", 0x05: "boundary", 0x06: "gateway",
+}
+
+
+def cmd_config_parse_interface(params):
+    """Push a raw RNS config string through RNS's OWN interface config parser
+    and read back the stored interface attributes.
+
+    Delegates entirely to real RNS: the raw text is parsed by RNS's vendored
+    ConfigObj (the exact parser Reticulum uses on its config file), and the
+    resulting section is handed to the live Reticulum instance's real
+    `_synthesize_interface` (Reticulum.py:685-1034). That method performs all
+    the config-derived decisions under test — interface_mode selection and the
+    discoverable=true mode-forcing (Reticulum.py:807-848), the
+    bitrate>=MINIMUM_BITRATE bound (:765-768), the announce_cap (0,100] bound
+    (:791-794), the ifac_size>=IFAC_MIN_SIZE*8 bound (:719-722), and the
+    discovery announce-interval 5-minute floor / 6h default (:824-828) — and
+    writes them onto a genuine Interface object. The interface is the no-op
+    ConfigParseProbeInterface (a real RNS Interface subclass that opens nothing),
+    loaded through RNS's external-interface mechanism, so no sockets/hardware are
+    touched. We then read the stored attrs straight off RNS and detach the probe.
+
+    params:
+        config_text (str): raw config text containing a single [interfaces]
+            subsection; the interface `type` must be ConfigParseProbeInterface.
+        interface_name (str): the subsection name to synthesize.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS.vendor.configobj import ConfigObj
+    import io as _io
+
+    name = params['interface_name']
+    config_text = params['config_text']
+    _ensure_config_parse_probe(RNS)
+
+    co = ConfigObj(_io.StringIO(config_text))
+    if 'interfaces' not in co or name not in co['interfaces']:
+        return {'error': f'config_text has no [[{name}]] under [interfaces]'}
+    section = co['interfaces'][name]
+
+    inst = _rns_instance
+    before = set(id(i) for i in RNS.Transport.interfaces)
+    inst._synthesize_interface(section, name)
+    created = [i for i in RNS.Transport.interfaces if id(i) not in before]
+
+    result = {
+        # selected_interface_mode and configured_bitrate are written back into
+        # the config section by _synthesize_interface (Reticulum.py:925-926).
+        'selected_interface_mode': section.get('selected_interface_mode'),
+        'configured_bitrate': section.get('configured_bitrate'),
+    }
+    iface = created[0] if created else None
+    if iface is not None:
+        mode = int(iface.mode)
+        result.update({
+            'mode': mode,
+            'mode_name': _MODE_NAMES.get(mode),
+            'bitrate': int(iface.bitrate),
+            'announce_cap': float(iface.announce_cap),
+            'ifac_size': int(iface.ifac_size),
+            'default_ifac_size': int(iface.DEFAULT_IFAC_SIZE),
+            'discoverable': bool(iface.discoverable),
+            'discovery_announce_interval': iface.discovery_announce_interval,
+        })
+        RNS.Transport.remove_interface(iface)
+    return result
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -3449,6 +3557,8 @@ COMMANDS = {
     'discovery_announce_identity': cmd_discovery_announce_identity,
     'discovery_feature_defaults': cmd_discovery_feature_defaults,
     'discovery_inject_records': cmd_discovery_inject_records,
+    # Reticulum config parsing — raw config string through RNS's own parser
+    'config_parse_interface': cmd_config_parse_interface,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

@@ -177,6 +177,15 @@ ADVERSARIAL_CORRUPTORS: dict[str, str] = {
         "a real initiator's request_data; the bad_mode variant overwrites the "
         "single signalling mode byte of that real payload with a reserved mode "
         "to prove the handshake mode gate rejects it — no protocol assembled.",
+    "cmd_wire_inject_malformed_resource_adv":
+        "Takes a GENUINE ResourceAdvertisement from real RNS (real "
+        "ResourceAdvertisement.pack), unpacks its info map with RNS's OWN "
+        "vendored umsgpack, drops ONE mandatory key ('h'), re-packs with that "
+        "same serializer (garbage variant is just random bytes), then replays it "
+        "through the real Resource.accept to prove the malformed advertisement is "
+        "dropped (no inbound Resource, no crash). The only asm:* signal is "
+        "umsgpack — RNS's own serializer round-tripping an RNS dict; no protocol "
+        "field is reconstructed by hand.",
     "cmd_discovery_craft_announce":
         "Takes a GENUINE announce from the real InterfaceAnnouncer builder, "
         "unpacks its info map with RNS's OWN vendored umsgpack, mutates ONE "

@@ -2227,6 +2227,78 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
+    def inject_corrupt_assembled_resource(self, link_id: bytes, variant: str) -> dict:
+        """Assembly-time hash check: build a real sender + receiver, fill the
+        receiver buffer with genuine part bytes (variant 'valid') or corrupt one
+        slot (variant 'corrupt'), run the real Resource.assemble, and report
+        {variant, status_name, complete, corrupt, proof_sent, proof_calls}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_corrupt_assembled_resource",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_duplicate_resource_adv(self, link_id: bytes) -> dict:
+        """Duplicate RESOURCE_ADV de-dup: drive one genuine advertisement through
+        the real Resource.accept twice and report {first_accepted, second_created,
+        incoming_count}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_duplicate_resource_adv",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def inject_malformed_resource_adv(self, link_id: bytes, variant: str) -> dict:
+        """Malformed RESOURCE_ADV drop: feed undecodable msgpack ('garbage') or a
+        valid-but-missing-key ('missing_key') advertisement through the real
+        Resource.accept and report {variant, inbound_started, crashed}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_malformed_resource_adv",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_resource_adv_flags(self, link_id: bytes, variant: str) -> dict:
+        """Request/response advertisement accept logic: drive a request /
+        response / plain advertisement through the real Link.receive dispatcher
+        under a given resource_strategy and report {variant, accepted, strategy}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_resource_adv_flags",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_receiver_request_state(self, link_id: bytes, n: int = 2) -> dict:
+        """Inbound Resource window / consecutive-height read-back: build a real
+        receiver, feed `n` genuine parts in order, and report window/window_min/
+        window_max/consecutive_height_*/hashmap_height_*/received_count."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_receiver_request_state",
+            handle=self.handle, link_id=link_id.hex(), n=n,
+        )
+
+    def inject_hashmap_update(self, link_id: bytes) -> dict:
+        """HMU idempotence: apply the same later hashmap segment twice to a
+        >74-part receiver through the real Resource.hashmap_update and report
+        {height_after_advert, height_after_first, height_after_duplicate,
+        grew_on_first, grew_on_duplicate}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_hashmap_update",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_receiver_proof_count(self, link_id: bytes) -> dict:
+        """Per-part proof suppression: count proofs as parts arrive and assert
+        exactly one is emitted after assembly. Reports {proofs_before_final,
+        proofs_after_assembly, status_name, complete}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_receiver_proof_count",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
     def resource_force_collision(self, link_id: bytes) -> dict:
         """Drive the hashmap collision-guard remap: force a map-hash collision on
         the first build pass and report {remapped, random_hash_before,

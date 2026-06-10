@@ -5703,6 +5703,30 @@ def cmd_wire_inject_tampered_link_data(params):
     }
 
 
+def _link_rx_packet(RNS, link, plaintext, context):
+    """Produce a genuine inbound RNS.Packet carrying `plaintext` under `context`,
+    ready to feed into the real Link.receive dispatcher.
+
+    Uses ONLY real RNS machinery: RNS.Packet(link, plaintext, context).pack()
+    encrypts the plaintext with the link's own token and lays out the wire bytes;
+    re-parsing those bytes via RNS.Packet(None, raw).unpack() yields exactly the
+    object Transport would hand to Link.receive (so Link.receive's own
+    self.decrypt(packet.data) round-trips back to `plaintext`). The
+    receiving_interface is set to the link's attached interface so Link.receive's
+    interface-match guard (Link.py:975) passes. No wire bytes are hand-built.
+    """
+    tx = RNS.Packet(link, plaintext, context=context)
+    tx.pack()
+    rx = RNS.Packet(None, tx.raw)
+    rx.unpack()
+    rx.receiving_interface = link.attached_interface
+    # Transport associates an inbound link packet with its Link before handing it
+    # to Link.receive; some dispatch paths (RESOURCE_ADV -> Resource.accept) read
+    # packet.link, so bind it the same way.
+    rx.link = link
+    return rx
+
+
 def cmd_wire_inject_crafted_resource_part(params):
     """Adversarial resource-part injector (part acceptance, receiver side).
 
@@ -6017,7 +6041,653 @@ def cmd_wire_inject_crafted_resource_request(params):
             pass
         return out
 
+    elif variant == "duplicate":
+        # Link-level RESOURCE_REQ de-duplication (Link.py:1109-1115): the Link
+        # serves a part-request only if packet.packet_hash is NOT already in the
+        # outgoing Resource's req_hashlist; a re-delivered (duplicate) request
+        # packet is silently ignored, preventing a re-send storm / sequencing
+        # error. Build a real multi-part sender, register it as the link's
+        # outgoing resource, then drive the SAME genuine RESOURCE_REQ packet
+        # through the real Link.receive twice and compare sent_parts.
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        link.mtu = 200 + overhead
+        try:
+            sender = RNS.Resource(secrets.token_bytes(1500), link, advertise=False)
+        finally:
+            link.mtu = saved_mtu
+        sender.adv_sent = time.time()
+        sender.status = RNS.Resource.TRANSFERRING
+        link.register_outgoing_resource(sender)
+
+        not_exhausted = RNS.Resource.HASHMAP_IS_NOT_EXHAUSTED.to_bytes(1, "big")
+        # sender.hashmap is RNS's own concatenation of every part's map hash;
+        # naming all of them requests all parts (same as the serve_all path).
+        request_data = not_exhausted + sender.hash + sender.hashmap
+        # A genuine encrypted inbound RESOURCE_REQ packet; reuse the SAME object
+        # for both deliveries so its packet_hash is byte-identical (that hash is
+        # exactly what Link.req_hashlist de-dups on).
+        rx = _link_rx_packet(RNS, link, request_data, RNS.Packet.RESOURCE_REQ)
+        req_hash = rx.packet_hash
+
+        link.receive(rx)
+        first_sent = int(getattr(sender, "sent_parts", 0))
+        in_hashlist_after_first = req_hash in (sender.req_hashlist or [])
+
+        link.receive(rx)
+        second_sent = int(getattr(sender, "sent_parts", 0))
+
+        out = {
+            "variant": variant,
+            "total_parts": len(sender.parts),
+            "first_served": first_sent,
+            "second_served": second_sent,
+            "first_in_hashlist": bool(in_hashlist_after_first),
+            "req_hashlist_len": len(sender.req_hashlist or []),
+            # Idempotent on the duplicate: no further parts served, and the
+            # request appears exactly once in req_hashlist.
+            "deduped": bool(second_sent == first_sent and len(sender.req_hashlist or []) == 1),
+        }
+        try:
+            link.cancel_outgoing_resource(sender)
+        except Exception:
+            pass
+        try:
+            sender.cancel()
+        except Exception:
+            pass
+        return out
+
     raise ValueError(f"unknown resource-request variant: {variant!r}")
+
+
+def _build_resource_receiver(RNS, link, payload_len=2000, force_sdu=None,
+                             request_id=None, is_response=False):
+    """Build a real sender Resource on `link` plus the receiver Resource the real
+    Resource.accept constructs from the sender's genuine ResourceAdvertisement.
+
+    Returns (sender, receiver, adv_packet). force_sdu temporarily shrinks the
+    link MTU (restored immediately) so the payload chunks into many small parts
+    (the >74-part / multi-segment-hashmap regime). request_id/is_response build a
+    request- or response-flavoured advertisement (q+u / q+p flags).
+    """
+    # The receiver Resource.accept builds re-derives its per-part SDU from the
+    # LIVE link.mtu, so the shrunk MTU must stay in effect through accept too —
+    # otherwise the sender (small SDU, many parts) and receiver (large SDU, few
+    # parts) disagree on part count and accept's hashmap_update indexes out of
+    # range. Restore the live MTU only after the receiver is constructed.
+    saved_mtu = link.mtu
+    if force_sdu is not None:
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        link.mtu = int(force_sdu) + overhead
+    # Resource.accept spawns a receiver watchdog thread whose part-request /
+    # timeout retries fire almost immediately on a fast local link and would
+    # cancel (FAIL) the inbound transfer out from under a synchronous inspection.
+    # Disable the watchdog for the duration of accept so the receiver is built in
+    # a stable, inspectable state; the test drives the state machine explicitly
+    # and cancels the receiver itself. (Inspection-only; no protocol bytes faked.)
+    saved_watchdog = RNS.Resource.watchdog_job
+    RNS.Resource.watchdog_job = lambda self: None
+    try:
+        sender = RNS.Resource(
+            secrets.token_bytes(payload_len), link, advertise=False,
+            request_id=request_id, is_response=is_response,
+        )
+        adv_plaintext = RNS.ResourceAdvertisement(sender).pack()
+        adv_packet = RNS.Packet(link, adv_plaintext, context=RNS.Packet.RESOURCE_ADV)
+        adv_packet.plaintext = adv_plaintext
+        adv_packet.link = link
+        receiver = RNS.Resource.accept(adv_packet)
+    finally:
+        RNS.Resource.watchdog_job = saved_watchdog
+        link.mtu = saved_mtu
+    return sender, receiver, adv_packet
+
+
+def cmd_wire_inject_corrupt_assembled_resource(params):
+    """Assembly-time hash check (receiver side, Resource.assemble, Resource.py:
+    672-715).
+
+    A Resource receiver concludes a transfer COMPLETE — and only then emits its
+    single RESOURCE_PRF proof (Resource.prove) — IFF the SHA-256 of the assembled
+    plaintext plus the random hash equals the advertised resource hash
+    (full_hash(data+random_hash) == self.hash). If any assembled part differs,
+    the recomputed hash diverges and the receiver MUST mark the transfer CORRUPT
+    and send NO proof. An impl that proved on assembly regardless of the hash
+    would confirm corrupt deliveries.
+
+    Self-contained: builds a real sender Resource + a real receiver (via
+    Resource.accept), populates the receiver's part buffer with the sender's
+    GENUINE encrypted part bytes, then runs the real Resource.assemble:
+      valid   — every slot holds the sender's own part bytes; assembles to the
+                advertised hash -> COMPLETE, exactly one proof sent (positive
+                control).
+      corrupt — one slot is replaced with random bytes of the same length, so the
+                reassembled encrypted stream fails its integrity check at assembly
+                (token authentication / hash compare both land in assemble's
+                CORRUPT paths) -> CORRUPT, no proof.
+
+    Proof emission is observed by wrapping the receiver's real prove() with a
+    counter (the real prove still runs); CORRUPT never reaches the prove call.
+
+    Returns {variant, status, status_name, complete, corrupt, proof_sent,
+    proof_calls, total_parts}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Small forced SDU -> a handful of parts so the buffer fills quickly.
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=900, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+
+    # Genuine encrypted part bytes, in order — exactly what receive_part would
+    # have stored after the map-hash gate.
+    for i in range(len(receiver.parts)):
+        receiver.parts[i] = sender.parts[i].data
+
+    if variant == "valid":
+        pass
+    elif variant == "corrupt":
+        j = len(receiver.parts) // 2
+        receiver.parts[j] = secrets.token_bytes(len(receiver.parts[j]))
+    else:
+        raise ValueError(f"unknown corrupt-assemble variant: {variant!r}")
+
+    proof_calls = {"n": 0}
+    real_prove = receiver.prove
+
+    def _counting_prove():
+        proof_calls["n"] += 1
+        return real_prove()
+
+    receiver.prove = _counting_prove
+
+    try:
+        receiver.assemble()
+    except Exception:
+        pass
+
+    status = getattr(receiver, "status", None)
+    out = {
+        "variant": variant,
+        "status": int(status) if status is not None else None,
+        "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        "complete": status == RNS.Resource.COMPLETE,
+        "corrupt": status == RNS.Resource.CORRUPT,
+        "proof_calls": proof_calls["n"],
+        "proof_sent": proof_calls["n"] > 0,
+        "total_parts": len(receiver.parts),
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_inject_duplicate_resource_adv(params):
+    """Duplicate RESOURCE_ADV de-duplication (receiver side, Resource.accept ->
+    Link.has_incoming_resource, Resource.py:223 / Link.py:1308-1310).
+
+    When a resource advertisement arrives, Resource.accept registers the inbound
+    Resource on the link ONLY if the link does not already have an incoming
+    Resource with the same hash; a re-delivered (duplicate) advertisement for a
+    transfer already in progress is ignored (accept returns None) rather than
+    spawning a SECOND receiver for the same hash. An impl that built a new
+    receiver per advertisement would double-count parts and corrupt the transfer.
+
+    Self-contained: builds one real sender Resource, drives its genuine
+    advertisement through the real Resource.accept once (a receiver is created and
+    registered), then feeds the IDENTICAL advertisement packet a second time and
+    reports whether a second receiver appeared. incoming_count counts link
+    incoming Resources matching the hash.
+
+    Returns {first_accepted, second_created, incoming_count}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender = RNS.Resource(secrets.token_bytes(800), link, advertise=False)
+    adv_plaintext = RNS.ResourceAdvertisement(sender).pack()
+
+    def _make_adv_packet():
+        pkt = RNS.Packet(link, adv_plaintext, context=RNS.Packet.RESOURCE_ADV)
+        pkt.plaintext = adv_plaintext
+        pkt.link = link
+        return pkt
+
+    def _count_for_hash():
+        return sum(
+            1 for r in link.incoming_resources if getattr(r, "hash", None) == sender.hash
+        )
+
+    receiver1 = RNS.Resource.accept(_make_adv_packet())
+    first_accepted = receiver1 is not None
+    count_after_first = _count_for_hash()
+
+    receiver2 = RNS.Resource.accept(_make_adv_packet())
+    second_created = receiver2 is not None
+    incoming_count = _count_for_hash()
+
+    out = {
+        "first_accepted": first_accepted,
+        "second_created": second_created,
+        "incoming_count": incoming_count,
+        "incoming_count_after_first": count_after_first,
+    }
+    for r in (receiver1, receiver2):
+        if r is not None:
+            try:
+                r.cancel()
+            except Exception:
+                pass
+    return out
+
+
+def cmd_wire_inject_malformed_resource_adv(params):
+    """Malformed RESOURCE_ADV handling (receiver side, Resource.accept ->
+    ResourceAdvertisement.unpack, Resource.py:167-243).
+
+    Resource.accept unpacks the advertisement inside a try/except: an
+    advertisement whose plaintext is not decodable msgpack (`garbage`), or which
+    is valid msgpack but missing a required key (`missing_key`), is silently
+    dropped (accept returns None, no inbound Resource started) and MUST NOT crash
+    the receiver. An impl that started a transfer from, or threw on, a malformed
+    advertisement would be trivially DoS-able.
+
+    Self-contained: for `missing_key` it takes a GENUINE advertisement dict (real
+    ResourceAdvertisement.pack, real umsgpack round-trip), deletes one required
+    key, and repacks with the real umsgpack — no wire bytes are hand-built; for
+    `garbage` it uses random bytes that umsgpack cannot decode. The crafted
+    plaintext is fed through the real Resource.accept.
+
+    Returns {variant, inbound_started, crashed}.
+    """
+    RNS = _get_rns()
+    import umsgpack
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    if variant == "garbage":
+        # 0xC1 is umsgpack's "reserved/never-used" lead byte: guaranteed to make
+        # unpackb raise. (A single non-hex-derived constant byte, not a wire
+        # field; the rest is random.)
+        plaintext = b"\xc1" + secrets.token_bytes(40)
+    elif variant == "missing_key":
+        sender = RNS.Resource(secrets.token_bytes(400), link, advertise=False)
+        genuine = umsgpack.unpackb(RNS.ResourceAdvertisement(sender).pack())
+        del genuine["h"]  # drop the required resource-hash key
+        plaintext = umsgpack.packb(genuine)
+        try:
+            sender.cancel()
+        except Exception:
+            pass
+    else:
+        raise ValueError(f"unknown malformed-adv variant: {variant!r}")
+
+    pkt = RNS.Packet(link, plaintext, context=RNS.Packet.RESOURCE_ADV)
+    pkt.plaintext = plaintext
+    pkt.link = link
+
+    before = len(link.incoming_resources)
+    crashed = False
+    receiver = None
+    try:
+        receiver = RNS.Resource.accept(pkt)
+    except Exception:
+        crashed = True
+    after = len(link.incoming_resources)
+
+    if receiver is not None:
+        try:
+            receiver.cancel()
+        except Exception:
+            pass
+
+    return {
+        "variant": variant,
+        "inbound_started": (receiver is not None) or (after > before),
+        "crashed": crashed,
+    }
+
+
+def cmd_wire_inject_resource_adv_flags(params):
+    """Request/response advertisement accept logic (Link.receive RESOURCE_ADV
+    dispatch, Link.py:1070-1098).
+
+    A resource advertisement carrying a request id resolves via its q/u/p flags:
+      * is_request (q set, u flag)  -> Link.accept it UNCONDITIONALLY, BEFORE and
+        regardless of resource_strategy (Link.py:1070-1071) — even ACCEPT_NONE.
+      * is_response (q set, p flag) -> accepted ONLY if q matches a pending
+        request on the link (Link.py:1072-1076); with no matching pending
+        request it MUST NOT be accepted.
+      * plain (no q) -> gated by resource_strategy: ACCEPT_NONE drops it.
+
+    Self-contained: builds a real request / response / plain advertisement, wraps
+    it in a genuine encrypted inbound packet, and drives it through the REAL
+    Link.receive dispatcher (not a re-implementation of the branch). Acceptance is
+    observed as a new incoming Resource registered on the link. resource_strategy
+    is saved and restored. Variants:
+      request_autoaccept           — request adv under ACCEPT_NONE -> accepted.
+      response_no_pending_request  — response adv, no pending request -> NOT accepted.
+      plain_accept_none            — plain adv under ACCEPT_NONE -> NOT accepted.
+      plain_accept_all             — plain adv under ACCEPT_ALL  -> accepted (control).
+
+    Returns {variant, accepted, strategy}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    if variant == "request_autoaccept":
+        request_id, is_response, strategy = secrets.token_bytes(16), False, RNS.Link.ACCEPT_NONE
+    elif variant == "response_no_pending_request":
+        request_id, is_response, strategy = secrets.token_bytes(16), True, RNS.Link.ACCEPT_NONE
+    elif variant == "plain_accept_none":
+        request_id, is_response, strategy = None, False, RNS.Link.ACCEPT_NONE
+    elif variant == "plain_accept_all":
+        request_id, is_response, strategy = None, False, RNS.Link.ACCEPT_ALL
+    else:
+        raise ValueError(f"unknown adv-flags variant: {variant!r}")
+
+    sender = RNS.Resource(
+        secrets.token_bytes(600), link, advertise=False,
+        request_id=request_id, is_response=is_response,
+    )
+    adv_plaintext = RNS.ResourceAdvertisement(sender).pack()
+    rx = _link_rx_packet(RNS, link, adv_plaintext, RNS.Packet.RESOURCE_ADV)
+
+    def _count_for_hash():
+        return sum(
+            1 for r in link.incoming_resources if getattr(r, "hash", None) == sender.hash
+        )
+
+    saved_strategy = link.resource_strategy
+    before = _count_for_hash()
+    link.resource_strategy = strategy
+    try:
+        link.receive(rx)
+    finally:
+        link.resource_strategy = saved_strategy
+    after = _count_for_hash()
+    accepted = after > before
+
+    # Clean up any receiver that was registered.
+    for r in [r for r in link.incoming_resources if getattr(r, "hash", None) == sender.hash]:
+        try:
+            r.cancel()
+        except Exception:
+            pass
+
+    return {
+        "variant": variant,
+        "accepted": bool(accepted),
+        "strategy": int(strategy),
+    }
+
+
+def cmd_wire_resource_receiver_request_state(params):
+    """Inbound Resource window / consecutive-height read-back (receiver side,
+    Resource.accept + Resource.receive_part, Resource.py:167-243 / 828-926).
+
+    On accepting an advertisement a receiver starts with window == Resource.WINDOW
+    and consecutive_completed_height == -1 (nothing yet contiguous), and for a
+    single-segment transfer its full hashmap is loaded (hashmap_height ==
+    total_parts). Feeding parts strictly in order advances the consecutive
+    completed-height pointer one slot per part (Resource.py:876-882) while the
+    hashmap height stays put. An impl whose pointer/window bookkeeping diverged
+    would request the wrong missing parts.
+
+    Self-contained: builds a real sender + receiver (via Resource.accept), reads
+    the initial state, then feeds `n` GENUINE parts in order through the real
+    Resource.receive_part and reads the state again.
+
+    Returns {window, window_min, window_max, total_parts,
+    consecutive_height_initial, hashmap_height_initial, waiting_for_hmu_initial,
+    fed, received_count, consecutive_height_after, hashmap_height_after}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    n = int(params.get("n", 2))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # ~8 parts (single hashmap segment, < HASHMAP_MAX_LEN) so the whole hashmap
+    # arrives in the advertisement (hashmap_height == total_parts).
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=1500, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+
+    window = int(receiver.window)
+    window_min = int(receiver.window_min)
+    window_max = int(receiver.window_max)
+    consecutive_initial = int(receiver.consecutive_completed_height)
+    hashmap_height_initial = int(receiver.hashmap_height)
+    waiting_initial = bool(receiver.waiting_for_hmu)
+    total_parts = len(receiver.parts)
+
+    fed = min(n, total_parts)
+    for i in range(fed):
+        rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+        receiver.receive_part(rx)
+
+    out = {
+        "window": window,
+        "window_min": window_min,
+        "window_max": window_max,
+        "total_parts": total_parts,
+        "consecutive_height_initial": consecutive_initial,
+        "hashmap_height_initial": hashmap_height_initial,
+        "waiting_for_hmu_initial": waiting_initial,
+        "fed": fed,
+        "received_count": int(receiver.received_count),
+        "consecutive_height_after": int(receiver.consecutive_completed_height),
+        "hashmap_height_after": int(receiver.hashmap_height),
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_inject_hashmap_update(params):
+    """Hashmap-update (HMU) idempotence (receiver side, Resource.hashmap_update,
+    Resource.py:492-503).
+
+    A multi-segment transfer (>HASHMAP_MAX_LEN parts) advertises only the first
+    hashmap segment; the rest arrive as RESOURCE_HMU packets routed to
+    hashmap_update. hashmap_update only increments hashmap_height for slots that
+    were still None (Resource.py:498-499), so re-applying the SAME later segment
+    is idempotent — the height grows once (first delivery) and not at all on the
+    duplicate. An impl that double-counted a duplicate segment would over-report
+    progress and mis-drive the window.
+
+    Self-contained: builds a real >74-part sender + receiver (via Resource.accept,
+    which loads segment 0), then applies segment 1 — a slice of the SENDER'S OWN
+    genuine concatenated hashmap bytes — through the real Resource.hashmap_update
+    twice, comparing hashmap_height. No protocol bytes are assembled: the segment
+    is RNS-produced map-hash bytes and the method under test is 100% RNS.
+
+    Returns {total_parts, height_after_advert, height_after_first,
+    height_after_duplicate, grew_on_first, grew_on_duplicate}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Force >74 parts so the advertisement carries only hashmap segment 0 and a
+    # second segment must arrive via HMU. The SDU is kept large enough that the
+    # receiver's initial RESOURCE_REQ (fired by accept) still fits the link and
+    # does not cancel the transfer.
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=12000, force_sdu=150
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    seg_len = RNS.ResourceAdvertisement.HASHMAP_MAX_LEN
+    maphash_len = RNS.Resource.MAPHASH_LEN
+    if len(sender.parts) <= seg_len:
+        raise ValueError(f"need >{seg_len} parts for HMU test, got {len(sender.parts)}")
+
+    height_after_advert = int(receiver.hashmap_height)
+
+    # Segment 1 = parts [seg_len, 2*seg_len). Slice the sender's own genuine
+    # concatenated hashmap bytes (RNS-produced); the real hashmap_update places
+    # them at the segment-1 offset.
+    start = seg_len * maphash_len
+    end = min(2 * seg_len, len(sender.parts)) * maphash_len
+    segment1_bytes = sender.hashmap[start:end]
+
+    receiver.hashmap_update(1, segment1_bytes)
+    height_after_first = int(receiver.hashmap_height)
+
+    receiver.hashmap_update(1, segment1_bytes)
+    height_after_duplicate = int(receiver.hashmap_height)
+
+    out = {
+        "total_parts": len(sender.parts),
+        "height_after_advert": height_after_advert,
+        "height_after_first": height_after_first,
+        "height_after_duplicate": height_after_duplicate,
+        "grew_on_first": height_after_first > height_after_advert,
+        "grew_on_duplicate": height_after_duplicate > height_after_first,
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_resource_receiver_proof_count(params):
+    """Per-part proof suppression (receiver side, Resource.receive_part /
+    Resource.assemble / Resource.prove, Resource.py:828-926 / 672-758).
+
+    A Resource receiver sends NO proof for individual parts as they arrive; it
+    emits exactly ONE RESOURCE_PRF — and only after the full payload assembles to
+    the advertised hash (Resource.assemble -> Resource.prove). An impl that proved
+    per part would flood the link with proofs and break the sender's single
+    completion signal.
+
+    Self-contained: builds a real sender + receiver (via Resource.accept), wraps
+    the receiver's real prove() with a call counter (the real prove still runs),
+    feeds every GENUINE part except the last in order (counting proofs == 0), then
+    feeds the last part and waits for the real assemble thread, counting exactly
+    one proof and a COMPLETE status.
+
+    Returns {total_parts, proofs_before_final, proofs_after_assembly,
+    status_name, complete}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=1200, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    total = len(receiver.parts)
+    if total < 2:
+        raise ValueError(f"need a multi-part transfer, got {total}")
+
+    proof_calls = {"n": 0}
+    real_prove = receiver.prove
+
+    def _counting_prove():
+        proof_calls["n"] += 1
+        return real_prove()
+
+    receiver.prove = _counting_prove
+
+    # Feed every part except the last, in order — no assembly, no proof yet.
+    for i in range(total - 1):
+        rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+        receiver.receive_part(rx)
+    proofs_before_final = proof_calls["n"]
+
+    # Feed the last part: received_count reaches total_parts and assemble runs in
+    # a daemon thread (Resource.py:894-896). Wait for it to conclude.
+    rx = _link_rx_packet(RNS, link, sender.parts[total - 1].data, RNS.Packet.RESOURCE)
+    receiver.receive_part(rx)
+
+    terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
+    deadline = time.time() + 3.0
+    while getattr(receiver, "status", None) not in terminal and time.time() < deadline:
+        time.sleep(0.02)
+
+    status = getattr(receiver, "status", None)
+    out = {
+        "total_parts": total,
+        "proofs_before_final": proofs_before_final,
+        "proofs_after_assembly": proof_calls["n"],
+        "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        "complete": status == RNS.Resource.COMPLETE,
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
 
 
 def cmd_wire_resource_force_collision(params):
@@ -7407,6 +8077,13 @@ WIRE_COMMANDS = {
     "wire_inject_closed_link_data": cmd_wire_inject_closed_link_data,
     "wire_resource_constants": cmd_wire_resource_constants,
     "wire_inject_crafted_resource_request": cmd_wire_inject_crafted_resource_request,
+    "wire_inject_corrupt_assembled_resource": cmd_wire_inject_corrupt_assembled_resource,
+    "wire_inject_duplicate_resource_adv": cmd_wire_inject_duplicate_resource_adv,
+    "wire_inject_malformed_resource_adv": cmd_wire_inject_malformed_resource_adv,
+    "wire_inject_resource_adv_flags": cmd_wire_inject_resource_adv_flags,
+    "wire_resource_receiver_request_state": cmd_wire_resource_receiver_request_state,
+    "wire_inject_hashmap_update": cmd_wire_inject_hashmap_update,
+    "wire_resource_receiver_proof_count": cmd_wire_resource_receiver_proof_count,
     "wire_resource_force_collision": cmd_wire_resource_force_collision,
     "wire_resource_outgoing_queue_state": cmd_wire_resource_outgoing_queue_state,
     # IFAC issue-29 golden vector

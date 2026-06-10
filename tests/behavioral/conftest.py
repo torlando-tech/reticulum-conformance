@@ -72,10 +72,17 @@ class _BehavioralHarness:
 
     def start(self, identity_seed_hex=None, enable_transport=True,
               announce_rate_target=None, announce_rate_grace=None,
-              announce_rate_penalty=None, announce_cap=None, bitrate=None):
+              announce_rate_penalty=None, announce_cap=None, bitrate=None,
+              connected_to_shared_instance=False):
         if identity_seed_hex is None:
             identity_seed_hex = secrets.token_bytes(64).hex()
         kwargs = {}
+        # Flip the shared-instance predicate (Transport.owner.is_connected_to_
+        # shared_instance) so the packet_filter / add_packet_hash short-circuits
+        # at Transport.py:1337/:1376 are reachable. Default False keeps the
+        # standalone-master posture for every existing test.
+        if connected_to_shared_instance:
+            kwargs["connected_to_shared_instance"] = True
         # Only forward throttle knobs that were explicitly set, so the bridge
         # keeps its "off by default" posture for unset values.
         if announce_rate_target is not None:
@@ -143,6 +150,56 @@ class Instance:
             handle=self.handle, name=name, mode=mode, mtu=mtu, **kwargs,
         )
         return resp["iface_id"]
+
+    def attach_ifac_interface(self, name, ifac_netname=None, ifac_netkey=None,
+                              ifac_size=None, mode="FULL", mtu=500):
+        """Attach a MockInterface with IFAC (Interface Access Codes) configured
+        from a network name + passphrase, exactly as RNS._add_interface derives
+        ifac_identity/ifac_key/ifac_size for a real interface
+        (Reticulum.py:1060-1078). Returns the full {iface_id, interface_hash,
+        ifac_size} dict so the test can size the access-code field. See
+        behavioral_attach_mock_interface (ifac_netname/ifac_netkey/ifac_size)."""
+        kwargs = {"handle": self.handle, "name": name, "mode": mode, "mtu": mtu}
+        if ifac_netname is not None:
+            kwargs["ifac_netname"] = ifac_netname
+        if ifac_netkey is not None:
+            kwargs["ifac_netkey"] = ifac_netkey
+        if ifac_size is not None:
+            kwargs["ifac_size"] = ifac_size
+        return self.bridge.execute("behavioral_attach_mock_interface", **kwargs)
+
+    def ifac_mask(self, iface_id, raw):
+        """IFAC-mask `raw` (a genuine unmasked packet) for `iface_id` via real
+        RNS.Transport.transmit and return the on-wire masked bytes. See
+        behavioral_ifac_mask."""
+        resp = self.bridge.execute(
+            "behavioral_ifac_mask",
+            handle=self.handle, iface_id=iface_id, raw=raw.hex(),
+        )
+        return bytes.fromhex(resp["masked"])
+
+    def inbound_remembered(self, iface_id, raw):
+        """Run the FULL Transport.inbound on `raw` arriving at `iface_id` and
+        report {hashlist_before, hashlist_after, hashlist_grew, unpackable,
+        packet_hash, in_hashlist} — i.e. whether the packet's hash was recorded
+        in Transport.packet_hashlist (observing the IFAC gate + the link-table /
+        LRPROOF inbound deferrals). See behavioral_inbound_remembered."""
+        return self.bridge.execute(
+            "behavioral_inbound_remembered",
+            handle=self.handle, iface_id=iface_id, raw=raw.hex(),
+        )
+
+    def seed_link_table(self, dest, nh_iface_id, rcvd_iface_id,
+                        rem_hops=99, hops=99):
+        """Install a correctly-shaped Transport.link_table[dest] entry so the
+        inbound link-table deferral (Transport.py:1496-1498) can be exercised
+        on a single injected packet. See behavioral_seed_link_table."""
+        return self.bridge.execute(
+            "behavioral_seed_link_table",
+            handle=self.handle, dest=dest.hex(),
+            nh_iface_id=nh_iface_id, rcvd_iface_id=rcvd_iface_id,
+            rem_hops=rem_hops, hops=hops,
+        )
 
     def inject(self, iface_id, raw):
         self.bridge.execute(

@@ -270,6 +270,12 @@ def _reset_transport_state():
         T.local_client_interfaces.clear()
     if hasattr(T, "announce_rate_table"):
         T.announce_rate_table.clear()
+    # Restore the standalone-master posture: the shared-instance predicate is a
+    # plain attribute on Transport.owner that one handle may have flipped True
+    # (cmd_behavioral_start connected_to_shared_instance). Reset so the next
+    # handle starts as a normal filtering node (Transport.py:1337/:1376).
+    if getattr(T, "owner", None) is not None:
+        T.owner.is_connected_to_shared_instance = False
 
 
 _shared_enable_transport: bool | None = None
@@ -336,6 +342,7 @@ def cmd_behavioral_start(params):
 
     identity_seed_hex = params.get("identity_seed")
     enable_transport = bool(params.get("enable_transport", True))
+    connected_to_shared_instance = bool(params.get("connected_to_shared_instance", False))
 
     # Instance-level announce-throttle defaults. These flow down to every
     # interface attached after start unless that attach overrides them. They
@@ -358,6 +365,17 @@ def cmd_behavioral_start(params):
         else tempfile.mkdtemp(prefix="rns_behavioral_")
     )
     rns = _ensure_rns_started(config_dir, enable_transport)
+
+    # Shared-instance predicate (Transport.py:1337 short-circuit in packet_filter,
+    # and the add_packet_hash guard at :1376). On a real node this flips True only
+    # when RNS connects this process to a separate shared master over a
+    # LocalClientInterface; the behavioral harness always runs a standalone master
+    # (share_instance=No), so the flag is otherwise always False and the
+    # "shared instance handles filtering, so don't filter here" branch is never
+    # taken. Setting it on Transport.owner (the Reticulum instance, a plain bool
+    # attribute) lets a test exercise that branch. _reset_transport_state restores
+    # False so it never leaks into the next handle.
+    RNS.Transport.owner.is_connected_to_shared_instance = connected_to_shared_instance
 
     # Inject an identity from the seed if provided; otherwise use whatever RNS
     # generated during startup.
@@ -415,6 +433,9 @@ def cmd_behavioral_attach_mock_interface(params):
     mode = params.get("mode", "FULL")
     mtu = int(params.get("mtu", 500))
     local_client = bool(params.get("local_client", False))
+    ifac_netname = params.get("ifac_netname")
+    ifac_netkey = params.get("ifac_netkey")
+    ifac_size = params.get("ifac_size")
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -467,10 +488,45 @@ def cmd_behavioral_attach_mock_interface(params):
         if iface not in RNS.Transport.local_client_interfaces:
             RNS.Transport.local_client_interfaces.append(iface)
 
+    # Configure IFAC (Interface Access Codes) on this interface exactly as
+    # RNS.Reticulum._add_interface does (Reticulum.py:1060-1078) when an
+    # interface block carries network_name/passphrase. Everything is derived by
+    # real RNS primitives (Identity.full_hash, Cryptography.hkdf,
+    # Identity.from_bytes); we only assign the results onto the interface, which
+    # is exactly what RNS itself does. This arms the IFAC authentication branch
+    # in Transport.inbound (Transport.py:1399-1445) — the MockInterface defaults
+    # ifac_size=0/ifac_identity=None, so without this the branch is never taken.
+    computed_ifac_size = 0
+    if ifac_netname is not None or ifac_netkey is not None:
+        ifac_origin = b""
+        if ifac_netname is not None:
+            ifac_origin += RNS.Identity.full_hash(ifac_netname.encode("utf-8"))
+        if ifac_netkey is not None:
+            ifac_origin += RNS.Identity.full_hash(ifac_netkey.encode("utf-8"))
+        ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
+        iface.ifac_key = RNS.Cryptography.hkdf(
+            length=64,
+            derive_from=ifac_origin_hash,
+            salt=RNS.Reticulum.IFAC_SALT,
+            context=None,
+        )
+        iface.ifac_identity = RNS.Identity.from_bytes(iface.ifac_key)
+        iface.ifac_signature = iface.ifac_identity.sign(
+            RNS.Identity.full_hash(iface.ifac_key)
+        )
+        # ifac_size defaults to the TCP/UDP DEFAULT_IFAC_SIZE (16); RNS derives
+        # this per interface subclass (Reticulum.py:1049-1050). Allow override.
+        iface.ifac_size = int(ifac_size) if ifac_size is not None else 16
+        computed_ifac_size = iface.ifac_size
+
     inst["interfaces"][iface_id] = iface
     RNS.Transport.interfaces.append(iface)
 
-    return {"iface_id": iface_id, "interface_hash": iface.get_hash().hex()}
+    return {
+        "iface_id": iface_id,
+        "interface_hash": iface.get_hash().hex(),
+        "ifac_size": computed_ifac_size,
+    }
 
 
 def cmd_behavioral_inject(params):
@@ -976,6 +1032,175 @@ def cmd_behavioral_detach_interface(params):
     return {"detached": True}
 
 
+def cmd_behavioral_ifac_mask(params):
+    """IFAC-mask a genuine RNS packet for a given interface and return the
+    on-wire (masked) bytes.
+
+    Delegates entirely to RNS.Transport.transmit (Transport.py:1050-1085): the
+    interface must have an ifac_identity configured (via
+    behavioral_attach_mock_interface ifac_netname/ifac_netkey). transmit signs
+    the raw with the interface's ifac_identity, derives the HKDF mask, sets the
+    IFAC header flag, inserts the access code and masks the payload — the exact
+    bytes RNS would put on the wire. The MockInterface buffers them in its TX
+    queue; we drain and return them. No masking is reimplemented here.
+
+    The returned masked frame, injected back on the SAME interface, round-trips
+    through the inbound IFAC-authentication branch (Transport.py:1399-1432): RNS
+    unmasks it, recomputes the expected access code and accepts it. Truncating it
+    to <= 2+ifac_size exercises the "too short to contain the IFAC" silent drop
+    (Transport.py:1402, the `else: return`).
+
+    params: handle, iface_id, raw (hex of a genuine unmasked packet)
+    returns: {masked} (hex)
+    """
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    raw = bytes.fromhex(params["raw"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+    if getattr(iface, "ifac_identity", None) is None:
+        raise ValueError("interface has no IFAC identity configured")
+
+    RNS = _get_rns()
+    # Clear any pending TX so we return only the masked frame.
+    iface.drain_tx()
+    RNS.Transport.transmit(iface, raw)
+    emitted = iface.drain_tx()
+    if len(emitted) != 1:
+        raise RuntimeError(f"expected exactly one masked frame, got {len(emitted)}")
+    return {"masked": emitted[0].hex()}
+
+
+def cmd_behavioral_inbound_remembered(params):
+    """Run the FULL RNS.Transport.inbound on a raw frame and report whether the
+    packet's hash was recorded in Transport.packet_hashlist.
+
+    behavioral_packet_filter only runs the packet_filter gate + an unconditional
+    add_packet_hash; it CANNOT observe the inbound-side deferrals at
+    Transport.py:1496-1504, where remember_packet_hash is forced False when the
+    destination is in Transport.link_table, or when the packet is a PROOF with
+    context==LRPROOF. This command drives the real inbound() end to end and then
+    inspects packet_hashlist, so those deferrals (and the IFAC gate at
+    :1399-1445, which runs before any hashing) become observable.
+
+    Observables:
+      hashlist_before / hashlist_after — size of Transport.packet_hashlist around
+        the inbound() call. hashlist_grew == (after > before) is the
+        implementation-independent "this frame caused a packet to be remembered"
+        signal — robust even when the frame is dropped in the IFAC gate before a
+        packet_hash can be computed.
+      packet_hash / in_hashlist — when the frame is independently unpackable, the
+        precise hash and its membership (computed from the supplied raw, whose
+        hops field is excluded from the hash, so it matches the hash inbound
+        stores even though inbound increments hops).
+
+    All hashing/filtering is RNS's; this command never decides accept/remember.
+
+    params: handle, iface_id, raw (hex)
+    returns: {hashlist_before, hashlist_after, hashlist_grew, unpackable,
+              packet_hash, in_hashlist}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    raw = bytes.fromhex(params["raw"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    # Independently determine the packet hash (if the frame is a valid packet).
+    # Uses RNS.Packet.unpack — the same parse inbound runs. The packet hash
+    # excludes the hops byte (get_hashable_part), so it equals the hash inbound
+    # stores even though inbound bumps hops by one.
+    packet_hash = None
+    probe = RNS.Packet(None, raw)
+    try:
+        unpackable = bool(probe.unpack())
+    except Exception:
+        unpackable = False
+    if unpackable:
+        packet_hash = probe.packet_hash
+
+    before = len(RNS.Transport.packet_hashlist)
+    iface.inject(raw)
+    after = len(RNS.Transport.packet_hashlist)
+
+    in_hashlist = bool(packet_hash is not None and packet_hash in RNS.Transport.packet_hashlist)
+
+    return {
+        "hashlist_before": before,
+        "hashlist_after": after,
+        "hashlist_grew": after > before,
+        "unpackable": unpackable,
+        "packet_hash": packet_hash.hex() if packet_hash is not None else None,
+        "in_hashlist": in_hashlist,
+    }
+
+
+def cmd_behavioral_seed_link_table(params):
+    """Seed Transport.link_table[dest] so the inbound link-table deferral
+    (Transport.py:1496-1498) can be exercised on a single injected packet.
+
+    Transport.inbound forces remember_packet_hash=False when an inbound packet's
+    destination_hash is already a key in Transport.link_table — a relayed link
+    can be seen on a shared-medium interface "before it would normally reach us",
+    and remembering it early would break link transport. There is no single-packet
+    way to populate link_table without driving a full multi-hop LINKREQUEST relay,
+    so this command installs a correctly-shaped entry directly (mirroring the
+    RNS link_entry layout at Transport.py:1600-1620, IDX_LT_* at :3570-3578).
+
+    The entry's next-hop and received interfaces are real attached MockInterfaces.
+    REM_HOPS/HOPS default to a value that will NOT match the injected packet's
+    hops, so the later link-transport branch (:1644-1679) does not re-add the
+    hash either — isolating the deferral as the sole reason the packet is not
+    remembered. (Set matching hops to instead drive the relay re-add path.)
+
+    params: handle, dest (hex), nh_iface_id, rcvd_iface_id, rem_hops (default 99),
+            hops (default 99)
+    returns: {seeded, dest}
+    """
+    import time
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    nh_iface = inst["interfaces"].get(params["nh_iface_id"])
+    rcvd_iface = inst["interfaces"].get(params["rcvd_iface_id"])
+    if nh_iface is None or rcvd_iface is None:
+        raise ValueError("nh_iface_id / rcvd_iface_id must reference attached interfaces")
+
+    rem_hops = int(params.get("rem_hops", 99))
+    hops = int(params.get("hops", 99))
+    now = time.time()
+
+    # link_entry layout (Transport.py IDX_LT_*): [timestamp, next_hop_transport_id,
+    # next_hop_interface, remaining_hops, received_interface, hops, dest_hash,
+    # validated, proof_timeout].
+    link_entry = [now, None, nh_iface, rem_hops, rcvd_iface, hops, dest, True, now + 60.0]
+    with RNS.Transport.link_table_lock:
+        RNS.Transport.link_table[dest] = link_entry
+
+    return {"seeded": True, "dest": dest.hex()}
+
+
 BEHAVIORAL_COMMANDS = {
     "behavioral_start": cmd_behavioral_start,
     "behavioral_stop": cmd_behavioral_stop,
@@ -992,4 +1217,7 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_set_announce_timestamp": cmd_behavioral_set_announce_timestamp,
     "behavioral_force_cull": cmd_behavioral_force_cull,
     "behavioral_detach_interface": cmd_behavioral_detach_interface,
+    "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
+    "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
+    "behavioral_seed_link_table": cmd_behavioral_seed_link_table,
 }

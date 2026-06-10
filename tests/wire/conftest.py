@@ -1842,6 +1842,19 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
+    def inject_crafted_resource_proof(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial RESOURCE_PRF injector: build a real sender Resource on the
+        link and run a crafted proof of `variant` (valid / wrong_proof /
+        wrong_length_short / wrong_length_long) through the real
+        Resource.validate_proof, reporting {variant, concluded, status,
+        status_name, proof_len}. A valid 64-byte proof concludes the resource;
+        anything else does not."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_proof",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
     def inject_crafted_lrproof(self, variant: str) -> dict:
         """Adversarial LRPROOF injector: on this peer, create a self-contained
         initiator link to a fresh controlled destination, craft an LRPROOF of

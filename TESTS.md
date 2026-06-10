@@ -168,7 +168,7 @@ HDLC and KISS are byte-stuffing protocols for framing variable-length data on a 
 | 9.3 | `test_bz2_cross_decompress` | `bz2_compress`, `bz2_decompress` | Cross-impl: SUT-compressed bytes decompressed by reference recovers the original input |
 | 9.4 | `test_bz2_compressible_both_directions` | `bz2_compress`, `bz2_decompress` | On a highly-compressible payload the SUT compressor produces fewer bytes than its input, and the compressed bytes cross-decompress in both directions (reference-compressed->SUT-decompressed and SUT-compressed->reference-decompressed) recovering the original |
 
-## 10. Wire Interop (101 tests)
+## 10. Wire Interop (102 tests)
 
 ### `tests/wire/test_announce_burst_throttle.py` (1 test)
 
@@ -405,6 +405,12 @@ HDLC and KISS are byte-stuffing protocols for framing variable-length data on a 
 | 10.99 | `test_small_mdu_resource_exceeds_hashmap_advertisement_limit` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `poll_path`, `resource_create` | On a Link with a forced small per-part SDU a modest payload chunks into more than 74 parts (HASHMAP_MAX_LEN) — the HMU regime where the hashmap spans multiple advertisements — and the packed hashmap stays exactly num_parts x 4 bytes, while the same payload at the normal MDU stays under the threshold |
 | 10.100 | `test_exact_max_efficient_size_boundary_stays_single_segment` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `poll_path`, `resource_create` | A payload of exactly MAX_EFFICIENT_SIZE (1 MiB - 1) stays a single unsplit segment (total_segments==1, split=False), while one byte more splits into 2 — pinning the inclusive `<=` boundary in `total_size <= MAX_EFFICIENT_SIZE` (Resource.py:285), the exact equality case the existing over-threshold test does not touch |
 | 10.101 | `test_three_segment_transfer_reassembles_byte_exact` | `start_tcp_server`, `start_tcp_client`, `listen`, `link_open`, `poll_path`, `resource_create`, `resource_send`, `resource_poll` | A >2 MiB payload constructs as total_segments==3 with the first segment's original_hash == its own hash (chaining seed, Resource.py:446) and, when sent, reassembles byte-exact at the receiver — proving all three segments chain through the shared original_hash into one stream (Resource.py:299/:708/:769/:788) |
+
+### `tests/wire/test_resource_tamper.py` (1 test)
+
+| # | Test | Commands Used | What It Verifies |
+|---|------|--------------|-----------------|
+| 10.102 | `test_resource_proof_validation_rejects_forgeries` | `start_tcp_server`, `start_tcp_client`, `listen`, `announce`, `poll_path`, `link_open`, `inject_crafted_resource_proof` | A Resource SENDER concludes a transfer only on a valid RESOURCE_PRF: a 64-byte proof whose trailing 32 bytes != expected_proof, and any wrong-length proof (32 or 96 bytes), are all dropped (resource not COMPLETE), while the genuine proof (random(32)\|\|expected_proof) concludes it (positive control). A sender that accepts any 64-byte blob would treat a forged proof as a delivery confirmation |
 
 ## 11. Transport Behavior (29 tests)
 

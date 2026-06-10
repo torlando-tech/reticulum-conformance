@@ -4556,6 +4556,75 @@ def cmd_wire_inject_tampered_link_data(params):
     }
 
 
+def cmd_wire_inject_crafted_resource_proof(params):
+    """Adversarial RESOURCE_PRF injector (resource proof validation, sender side).
+
+    When a Resource transfer completes, the receiver returns a RESOURCE_PRF of
+    exactly hash(32)||proof(32) == 64 bytes, where proof == full_hash(data||hash)
+    (Resource.prove). The SENDER validates it (Resource.validate_proof): it
+    concludes the resource as COMPLETE ONLY if the proof is exactly 64 bytes and
+    its trailing 32 bytes equal the sender's expected_proof; anything else is
+    silently dropped. A sender that concludes on any 64-byte blob would accept a
+    forged delivery confirmation.
+
+    Self-contained: builds a real sender Resource on an established link
+    (exposing a real expected_proof), then calls the real
+    Resource.validate_proof with a crafted proof of `variant`, reporting whether
+    the resource concluded (status COMPLETE). One fresh Resource per call (a
+    valid proof mutates status). Variants:
+      valid              — random(32)||expected_proof; MUST conclude (COMPLETE).
+      wrong_proof        — random(32)||random(32); trailing 32 != expected_proof.
+      wrong_length_short — 32 bytes (!= 64); length gate.
+      wrong_length_long  — 96 bytes (!= 64); length gate.
+
+    Returns {variant, concluded, status, status_name, proof_len}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    resource = RNS.Resource(secrets.token_bytes(200), link, advertise=False)
+    expected_proof = resource.expected_proof
+    hash_len = RNS.Identity.HASHLENGTH // 8  # 32
+
+    if variant == "valid":
+        proof_data = secrets.token_bytes(hash_len) + expected_proof
+    elif variant == "wrong_proof":
+        proof_data = secrets.token_bytes(hash_len) + secrets.token_bytes(hash_len)
+    elif variant == "wrong_length_short":
+        proof_data = secrets.token_bytes(hash_len)            # 32B
+    elif variant == "wrong_length_long":
+        proof_data = secrets.token_bytes(hash_len * 3)        # 96B
+    else:
+        raise ValueError(f"unknown resource-proof variant: {variant!r}")
+
+    try:
+        resource.validate_proof(proof_data)
+    except Exception:
+        pass
+    status_after = getattr(resource, "status", None)
+    concluded = status_after == RNS.Resource.COMPLETE
+    try:
+        resource.cancel()
+    except Exception:
+        pass
+    return {
+        "variant": variant,
+        "concluded": concluded,
+        "status": int(status_after) if status_after is not None else None,
+        "status_name": _RESOURCE_STATUS_NAMES.get(status_after),
+        "proof_len": len(proof_data),
+    }
+
+
 def cmd_wire_inject_crafted_lrproof(params):
     """Adversarial LRPROOF injector (link-establishment proof validation).
 
@@ -4884,6 +4953,7 @@ WIRE_COMMANDS = {
     "wire_inject_tampered_link_data": cmd_wire_inject_tampered_link_data,
     "wire_inject_crafted_link_identify": cmd_wire_inject_crafted_link_identify,
     "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
+    "wire_inject_crafted_resource_proof": cmd_wire_inject_crafted_resource_proof,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

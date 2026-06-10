@@ -1022,20 +1022,115 @@ def cmd_ratchet_encrypt(params):
 
 
 def cmd_ratchet_decrypt(params):
-    """Decrypt a ratchet-encrypted ciphertext with the Identity's private key
-    and the matching ratchet private key.
+    """Decrypt a ratchet-encrypted ciphertext with the Identity's private key,
+    trialling one OR MORE candidate ratchet private keys.
 
-    Delegates to real RNS.Identity.decrypt(ciphertext, ratchets=[ratchet_private]).
+    Delegates to real RNS.Identity.decrypt. The multi-ratchet trial loop
+    (Identity.py:882-895) iterates the supplied ratchet list IN ORDER, first
+    success wins, swallowing per-ratchet failures; and on success it writes the
+    winning ratchet id onto the caller-supplied `ratchet_id_receiver`. We expose
+    that by passing a tiny receiver object straight through and surfacing its
+    `latest_ratchet_id` field — RNS computes the id (via Identity._get_ratchet_id),
+    we only read it back.
+
+    Params:
+      private_key (hex)             — 64-byte Identity private key.
+      ciphertext (hex)              — the ratchet-encrypted token.
+      ratchet_privates (list[hex])  — ordered trial list (preferred).
+      ratchet_private (hex)         — single-key back-compat shorthand.
+      enforce_ratchets (bool)       — if true, fall-back to the static X25519
+                                      key is forbidden (Identity returns None
+                                      when no ratchet matches).
     """
     RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
     ciphertext = hex_to_bytes(params['ciphertext'])
+    enforce = bool(params.get('enforce_ratchets', False))
+
+    if params.get('ratchet_privates') is not None:
+        ratchets = [hex_to_bytes(r) for r in params['ratchet_privates']]
+    elif params.get('ratchet_private') is not None:
+        ratchets = [hex_to_bytes(params['ratchet_private'])]
+    else:
+        ratchets = None
+
     identity = RNS.Identity.from_bytes(private_key)
     if identity is None:
         raise ValueError("RNS.Identity.from_bytes rejected the private key")
-    plaintext = identity.decrypt(ciphertext, ratchets=[ratchet_private])
-    return {'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None}
+
+    class _RatchetIdReceiver:
+        latest_ratchet_id = None
+
+    receiver = _RatchetIdReceiver()
+    plaintext = identity.decrypt(
+        ciphertext,
+        ratchets=ratchets,
+        enforce_ratchets=enforce,
+        ratchet_id_receiver=receiver,
+    )
+    return {
+        'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None,
+        'latest_ratchet_id': bytes_to_hex(receiver.latest_ratchet_id)
+                             if receiver.latest_ratchet_id is not None else None,
+    }
+
+
+def cmd_identity_remember(params):
+    """Plant a known destination via real RNS.Identity.remember, surfacing the
+    KEYSIZE//8 (64-byte) public-key length gate (Identity.py:101-102).
+
+    Delegates entirely to RNS.Identity.remember — RNS itself raises TypeError
+    when len(public_key) != Identity.KEYSIZE//8. We do not pre-check the length;
+    we let RNS enforce it and report whether it accepted the key.
+
+    Params: packet_hash(hex), destination_hash(hex), public_key(hex),
+            app_data(hex|null).
+    """
+    RNS = _get_full_rns()
+    packet_hash = hex_to_bytes(params['packet_hash'])
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    public_key = hex_to_bytes(params['public_key'])
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else None
+    try:
+        RNS.Identity.remember(packet_hash, destination_hash, public_key, app_data)
+    except TypeError as e:
+        return {'ok': False, 'error': 'TypeError', 'public_key_len': len(public_key)}
+    # Confirm the plant took by recalling through real RNS (_no_use avoids
+    # touching a running Reticulum instance's usage bookkeeping).
+    recalled = RNS.Identity.recall(destination_hash, _no_use=True)
+    return {
+        'ok': True,
+        'public_key_len': len(public_key),
+        'recalled': recalled is not None,
+    }
+
+
+def cmd_identity_keyless_op(params):
+    """Drive a crypto op on an Identity that holds NO key, pinning the KeyError
+    path (Identity.decrypt:921 / sign:939 / encrypt:852).
+
+    Delegates to real RNS: builds RNS.Identity(create_keys=False) and loads no
+    key, then invokes the requested op so RNS itself decides to raise. We report
+    the raised exception type rather than fabricating a result.
+
+    Params: op ('decrypt'|'sign'|'encrypt'), data(hex).
+    """
+    RNS = _get_full_rns()
+    op = params['op']
+    data = hex_to_bytes(params['data'])
+    identity = RNS.Identity(create_keys=False)
+    try:
+        if op == 'decrypt':
+            result = identity.decrypt(data)
+        elif op == 'sign':
+            result = identity.sign(data)
+        elif op == 'encrypt':
+            result = identity.encrypt(data)
+        else:
+            raise ValueError(f"unknown op {op!r}")
+    except KeyError as e:
+        return {'raised': 'KeyError', 'message': str(e)}
+    return {'raised': None, 'result': bytes_to_hex(result) if result is not None else None}
 
 
 
@@ -2559,6 +2654,8 @@ COMMANDS = {
     'ratchet_public_from_private': cmd_ratchet_public_from_private,
     'ratchet_encrypt': cmd_ratchet_encrypt,
     'ratchet_decrypt': cmd_ratchet_decrypt,
+    'identity_remember': cmd_identity_remember,
+    'identity_keyless_op': cmd_identity_keyless_op,
     # Announce operations
     'announce_build': cmd_announce_build,
     'announce_validate': cmd_announce_validate,

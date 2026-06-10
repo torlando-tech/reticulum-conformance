@@ -4556,6 +4556,91 @@ def cmd_wire_inject_tampered_link_data(params):
     }
 
 
+def cmd_wire_inject_crafted_lrproof(params):
+    """Adversarial LRPROOF injector (link-establishment proof validation).
+
+    A link INITIATOR, after sending its LINKREQUEST, sits PENDING until the
+    destination returns an LRPROOF: signature(64)||ephemeral_pub(32), where the
+    signature is the DESTINATION identity's over link_id||ephemeral_pub||
+    destination_signing_pub (Link.prove). The initiator validates it
+    (Link.validate_proof): the signature MUST verify against the destination's
+    identity, or the link is NOT activated. A forged LRPROOF that activated the
+    link would let any on-path attacker complete a link as the destination.
+
+    Self-contained: creates a destination from a fresh identity it controls,
+    opens an initiator link to it (PENDING), crafts an LRPROOF of `variant`, and
+    feeds it through the real Link.validate_proof — reporting whether the link
+    reached ACTIVE. Every byte is real RNS (the destination identity signs a
+    valid proof; a throwaway key forges one; the ephemeral key is a real X25519
+    keypair). Variants:
+      valid             — destination identity signs link_id||eph_pub||dest_sig_pub;
+                          MUST activate the link.
+      forged_signature  — a DIFFERENT (throwaway) identity signs; must NOT activate.
+      wrong_signed_data — the destination identity signs UNRELATED data; must NOT
+                          activate.
+
+    Returns {variant, activated, status, status_name}.
+    """
+    RNS = _get_rns()
+    from RNS.Cryptography import X25519
+
+    handle = params["handle"]
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    dest_identity = RNS.Identity()
+    out_destination = RNS.Destination(
+        dest_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "lrproof",
+    )
+    link = RNS.Link(out_destination)
+    link.status = RNS.Link.PENDING
+
+    ec_half = RNS.Link.ECPUBSIZE // 2
+    ephemeral = X25519.X25519PrivateKey.generate()
+    ephemeral_pub = ephemeral.public_key().public_bytes()
+    dest_sig_pub = dest_identity.get_public_key()[ec_half:RNS.Link.ECPUBSIZE]
+    signed_data = link.link_id + ephemeral_pub + dest_sig_pub
+
+    if variant == "valid":
+        signature = dest_identity.sign(signed_data)
+    elif variant == "forged_signature":
+        signature = RNS.Identity().sign(signed_data)  # signed by the WRONG key
+    elif variant == "wrong_signed_data":
+        signature = dest_identity.sign(secrets.token_bytes(96))  # sig over unrelated data
+    else:
+        raise ValueError(f"unknown lrproof variant: {variant!r}")
+
+    proof_data = signature + ephemeral_pub
+    out_packet = RNS.Packet(
+        link, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF,
+    )
+    out_packet.pack()
+    rx = RNS.Packet(None, out_packet.raw)
+    if rx.unpack():
+        rx.receiving_interface = None
+        try:
+            link.validate_proof(rx)
+        except Exception:
+            pass
+
+    status_after = getattr(link, "status", None)
+    activated = status_after == RNS.Link.ACTIVE
+    try:
+        link.teardown()
+    except Exception:
+        pass
+    return {
+        "variant": variant,
+        "activated": activated,
+        "status": int(status_after) if status_after is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status_after),
+    }
+
+
 def cmd_wire_inject_crafted_link_identify(params):
     """Adversarial LINKIDENTIFY injector.
 
@@ -4798,6 +4883,7 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_proof": cmd_wire_inject_crafted_proof,
     "wire_inject_tampered_link_data": cmd_wire_inject_tampered_link_data,
     "wire_inject_crafted_link_identify": cmd_wire_inject_crafted_link_identify,
+    "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

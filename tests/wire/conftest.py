@@ -1842,6 +1842,18 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
+    def inject_crafted_lrproof(self, variant: str) -> dict:
+        """Adversarial LRPROOF injector: on this peer, create a self-contained
+        initiator link to a fresh controlled destination, craft an LRPROOF of
+        `variant` (valid / forged_signature / wrong_signed_data) and feed it
+        through the real Link.validate_proof, reporting {variant, activated,
+        status, status_name}. A valid proof activates the link; a forged one
+        does not."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_lrproof", handle=self.handle, variant=variant,
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,

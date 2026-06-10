@@ -1157,6 +1157,167 @@ def cmd_kiss_deframe(params):
     return {'data': bytes_to_hex(payload)}
 
 
+# ============================================================================
+# Interface framing/deframing driven through the REAL RNS interface read/write
+# loops (not a bridge re-implementation).
+#
+# RNS does not expose its on-wire framing as standalone callables — the TX
+# framing is inline in TCPClientInterface.process_outgoing (TCPInterface.py:
+# 312-329) and the RX de-framing is inline in TCPClientInterface.read_loop
+# (TCPInterface.py:337-398). Rather than mirror those byte-replacements in the
+# bridge (which would be HANDROLLED), the two helpers below DRIVE the real RNS
+# methods directly: they build a minimal stand-in object carrying exactly the
+# attributes each method reads, hand it a capture/feed socket, and let RNS
+# produce/parse every protocol byte. The bridge assembles no wire bytes itself,
+# so these commands are honest live delegation to the implementation under test.
+
+
+def _capture_interface_tx(kiss_framing, data):
+    """Frame `data` exactly as RNS's TCPClientInterface.process_outgoing does.
+
+    Calls the real (unbound) RNS transmit method with a stand-in whose socket
+    captures the framed bytes RNS hands to sendall. All FLAG/FEND delimiting and
+    byte-stuffing is RNS's (TCPInterface.py:312-329); the bridge only reads back
+    what RNS produced."""
+    _get_full_rns()
+    from RNS.Interfaces.TCPInterface import TCPClientInterface
+    import types
+
+    class _CaptureSocket:
+        def __init__(self):
+            self.frames = []
+
+        def sendall(self, payload):
+            self.frames.append(payload)
+
+    sock = _CaptureSocket()
+    stand_in = types.SimpleNamespace(
+        online=True, detached=False, writing=False,
+        kiss_framing=kiss_framing, socket=sock, txb=0, parent_interface=None,
+    )
+    TCPClientInterface.process_outgoing(stand_in, data)
+    if not sock.frames:
+        raise RuntimeError("RNS process_outgoing produced no framed output")
+    return sock.frames[0]
+
+
+def _drive_interface_rx(kiss_framing, stream, hw_mtu):
+    """Run RNS's real TCPClientInterface.read_loop over `stream`, returning the
+    list of frames it delivers to process_incoming.
+
+    The entire de-framing — FLAG/FEND scan, byte-stuffing reversal, the
+    `len(frame) > HEADER_MINSIZE` runt drop, shared-FLAG buffer retention, KISS
+    port-nibble strip and non-CMD_DATA ignore (TCPInterface.py:337-398) — is run
+    by RNS. The bridge supplies only a feed socket (yields the stream once, then
+    an empty read to end the loop) and a capturing process_incoming; it parses
+    no protocol bytes itself."""
+    _get_full_rns()
+    from RNS.Interfaces.TCPInterface import TCPClientInterface
+    import types
+
+    delivered = []
+
+    class _FeedSocket:
+        def __init__(self, chunk):
+            self.pending = [chunk]
+
+        def recv(self, _n):
+            if self.pending:
+                return self.pending.pop(0)
+            return b""
+
+    stand_in = types.SimpleNamespace(
+        online=True, detached=False, initiator=False,
+        kiss_framing=kiss_framing, socket=_FeedSocket(stream), HW_MTU=hw_mtu,
+    )
+    stand_in.process_incoming = lambda frame: delivered.append(frame)
+    stand_in.teardown = lambda: None
+    TCPClientInterface.read_loop(stand_in)
+    return delivered
+
+
+def cmd_hdlc_frame(params):
+    """Frame a payload with RNS's HDLC transmit framing (FLAG + escape + FLAG).
+
+    Delegates to TCPClientInterface.process_outgoing (kiss_framing=False) and
+    returns the captured wire bytes, so tests can pin the FLAG-delimited output
+    and the ESC-before-FLAG escape order byte-for-byte."""
+    data = hex_to_bytes(params['data'])
+    return {'framed': bytes_to_hex(_capture_interface_tx(False, data))}
+
+
+def cmd_kiss_frame(params):
+    """Frame a payload with RNS's KISS transmit framing (FEND + CMD_DATA +
+    escape + FEND), via TCPClientInterface.process_outgoing (kiss_framing=True)."""
+    data = hex_to_bytes(params['data'])
+    return {'framed': bytes_to_hex(_capture_interface_tx(True, data))}
+
+
+def cmd_hdlc_deframe_stream(params):
+    """Deframe a TCP/HDLC byte stream through RNS's real read loop.
+
+    Returns every frame RNS delivers. Exercises the runt-drop rule
+    (frames <= RNS.Reticulum.HEADER_MINSIZE == 19 bytes are silently dropped),
+    multi-frame extraction and shared-FLAG buffer retention from one stream."""
+    _get_full_rns()
+    stream = hex_to_bytes(params['stream'])
+    hw_mtu = int(params.get('hw_mtu', 262144))
+    frames = _drive_interface_rx(False, stream, hw_mtu)
+    return {'frames': [bytes_to_hex(f) for f in frames]}
+
+
+def cmd_kiss_deframe_stream(params):
+    """Deframe a TCP/KISS byte stream through RNS's real read loop.
+
+    Mirrors the TCPInterface kiss_framing path: the leading byte's port nibble
+    is stripped (command = byte & 0x0F, so 0x10/0x20 with low nibble 0 are
+    accepted as CMD_DATA) and frames whose command != CMD_DATA are silently
+    ignored (no frame delivered)."""
+    _get_full_rns()
+    stream = hex_to_bytes(params['stream'])
+    hw_mtu = int(params.get('hw_mtu', 262144))
+    frames = _drive_interface_rx(True, stream, hw_mtu)
+    return {'frames': [bytes_to_hex(f) for f in frames]}
+
+
+def cmd_auto_discovery_token(params):
+    """Compute AutoInterface's peer-authentication token for a source address.
+
+    Delegates to RNS.Identity.full_hash exactly as AutoInterface.discovery_handler
+    does (AutoInterface.py:365): full_hash(group_id + ipv6_src.encode('utf-8')).
+    The bridge performs no hashing itself."""
+    RNS = _get_full_rns()
+    group_id = hex_to_bytes(params['group_id'])
+    addr = params['link_local_addr']
+    token = RNS.Identity.full_hash(group_id + addr.encode("utf-8"))
+    return {'token': bytes_to_hex(token)}
+
+
+# Interface classes that fix HW_MTU at class scope (readable without opening a
+# device). The serial-family interfaces (UDP/Pipe/Serial/KISS/RNode) set
+# self.HW_MTU per-instance inside __init__ and cannot be read this way.
+_CLASS_HW_MTU_INTERFACES = {
+    'TCPInterface': ('RNS.Interfaces.TCPInterface', 'TCPInterface'),
+    'AutoInterface': ('RNS.Interfaces.AutoInterface', 'AutoInterface'),
+    'BackboneInterface': ('RNS.Interfaces.BackboneInterface', 'BackboneInterface'),
+}
+
+
+def cmd_interface_hw_mtu(params):
+    """Read the class-level HW_MTU constant an RNS interface advertises.
+
+    Returns RNS's own declared HW_MTU for the named interface class (read off
+    the live class, not hardcoded in the bridge), letting tests pin the per-type
+    fixed MTUs against the documented spec values."""
+    _get_full_rns()
+    import importlib
+    itype = params['type']
+    if itype not in _CLASS_HW_MTU_INTERFACES:
+        return {'error': f"unsupported interface type {itype!r} "
+                f"(class-level HW_MTU only: {sorted(_CLASS_HW_MTU_INTERFACES)})"}
+    module_name, class_name = _CLASS_HW_MTU_INTERFACES[itype]
+    cls = getattr(importlib.import_module(module_name), class_name)
+    return {'hw_mtu': int(cls.HW_MTU)}
 
 
 # ============================================================================
@@ -2097,6 +2258,13 @@ COMMANDS = {
     # Interface framing (HDLC / KISS deframing)
     'hdlc_deframe': cmd_hdlc_deframe,
     'kiss_deframe': cmd_kiss_deframe,
+    # Interface framing driven through the real RNS read/write loops
+    'hdlc_frame': cmd_hdlc_frame,
+    'kiss_frame': cmd_kiss_frame,
+    'hdlc_deframe_stream': cmd_hdlc_deframe_stream,
+    'kiss_deframe_stream': cmd_kiss_deframe_stream,
+    'auto_discovery_token': cmd_auto_discovery_token,
+    'interface_hw_mtu': cmd_interface_hw_mtu,
     'rns_start': cmd_rns_start,
     'rns_stop': cmd_rns_stop,
     # Live RNS protocol operations (link, resource, ratchet)

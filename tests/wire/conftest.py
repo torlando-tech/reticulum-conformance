@@ -479,6 +479,31 @@ class _WirePeer:
         )
         return bool(resp.get("found"))
 
+    def inject_raw_frame(
+        self,
+        variant: str,
+        raw: bytes | None = None,
+        dest_hash: bytes | None = None,
+        trim_to: int | None = None,
+    ) -> dict:
+        """Push a genuine (optionally masked/trimmed) RNS frame through this
+        peer's live interface receive path (Transport.inbound) via
+        wire_inject_raw_frame, returning the bridge result dict.
+
+        Result keys: dest_hash (hex str), frame_len (int), learned (bool);
+        build_masked additionally returns raw (hex str) and ifac_size (int);
+        ifac_size is present whenever the frame hit the IFAC interface.
+        """
+        assert self.handle, "start_* must be called first"
+        kwargs: dict = {"handle": self.handle, "variant": variant}
+        if raw is not None:
+            kwargs["raw"] = raw.hex()
+        if dest_hash is not None:
+            kwargs["dest_hash"] = dest_hash.hex()
+        if trim_to is not None:
+            kwargs["trim_to"] = int(trim_to)
+        return self.bridge.execute("wire_inject_raw_frame", **kwargs)
+
     def register_request_handler(
         self,
         destination_hash: bytes,

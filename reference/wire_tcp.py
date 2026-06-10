@@ -7953,6 +7953,205 @@ def cmd_wire_packet_receipt_generation(params):
     }
 
 
+# ---------------------------------------------------------------------------
+# Raw-frame injector — drive the four pre-unpack drop guards in
+# RNS.Transport.inbound (Transport.py:1398-1447) on a LIVE interface.
+#
+# Every frame is a GENUINE announce that real RNS produced (Destination.announce
+# (send=False) -> Packet.pack), optionally IFAC-masked by real RNS
+# (Transport.transmit) and/or trimmed. Nothing reconstructs protocol bytes: the
+# announce, its signature, the IFAC sign+HKDF mask, and the inbound parse all
+# run inside RNS. The bridge only chooses WHICH live frame to feed Transport and
+# reads back whether a path was learned.
+# ---------------------------------------------------------------------------
+
+def _build_foreign_announce(inst, RNS, app_name, aspects, app_data):
+    """Build a genuine announce frame for a FRESH, FOREIGN destination.
+
+    Creates a real RNS.Destination (which Destination.__init__ registers in the
+    local Transport via register_destination), captures the genuine UNMASKED
+    announce frame via Destination.announce(send=False) -> Packet.pack, then
+    DEREGISTERS the destination so the local Transport treats it as foreign.
+    That is what lets the announce, when fed back through Transport.inbound,
+    actually learn a path (Transport.inbound's `local_destination == None` gate,
+    Transport.py:1709) — exactly as an announce arriving from a peer would.
+
+    Returns (destination, plain_raw). No protocol bytes are assembled here:
+    announce_packet.raw is whatever RNS packed.
+    """
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
+    )
+    announce_packet = destination.announce(app_data=app_data, send=False)
+    announce_packet.pack()
+    plain_raw = announce_packet.raw
+    # Make the destination foreign to the local Transport so its own announce is
+    # path-learnable on inbound rather than recognised as a local destination.
+    RNS.Transport.deregister_destination(destination)
+    # Retain identity+destination so they aren't GC'd before inbound runs.
+    inst.setdefault("destinations", []).append((identity, destination))
+    return destination, plain_raw
+
+
+def _mask_frame_via_interface(RNS, iface, plain_raw):
+    """Return the genuine IFAC-MASKED frame real RNS would emit for plain_raw.
+
+    Drives RNS.Transport.transmit (Transport.py:1050-1085) on the LIVE
+    IFAC-enabled interface and captures the bytes RNS hands to process_outgoing.
+    RNS performs the IFAC Ed25519 sign and the HKDF payload mask (and sets the
+    0x80 IFAC flag); the bridge only intercepts the output (the interface's real
+    socket send is suppressed for the duration, then restored). No protocol
+    bytes are assembled here.
+    """
+    captured = []
+    original = iface.process_outgoing
+
+    def _capture(data):
+        captured.append(bytes(data))
+
+    iface.process_outgoing = _capture
+    try:
+        RNS.Transport.transmit(iface, plain_raw)
+    finally:
+        iface.process_outgoing = original
+    if not captured:
+        raise RuntimeError(
+            "Transport.transmit emitted nothing — interface has no ifac_identity?"
+        )
+    return captured[0]
+
+
+def _split_ifac_open(ifaces):
+    """Partition this handle's live interfaces into (ifac_iface, open_iface).
+
+    An IFAC interface has a non-None ifac_identity (RNS derived it from
+    network_name+passphrase at config parse); an open interface has None.
+    """
+    ifac_iface = None
+    open_iface = None
+    for iface in ifaces:
+        if getattr(iface, "ifac_identity", None) is not None:
+            ifac_iface = ifac_iface or iface
+        else:
+            open_iface = open_iface or iface
+    return ifac_iface, open_iface
+
+
+def cmd_wire_inject_raw_frame(params):
+    """Push a genuine (optionally masked/trimmed) RNS frame through a live
+    interface's receive path (Transport.inbound) and report whether a path was
+    learned — driving the four pre-unpack drop guards in Transport.inbound
+    (Transport.py:1398-1447) on a LIVE instance:
+
+      masked_full    IFAC interface, full IFAC-masked announce (flag set, valid
+                     IFAC, len > 2+ifac_size) -> MUST be accepted (learned=True).
+                     Positive control proving the inject path works.
+      masked_short   IFAC interface, the same masked announce TRIMMED to
+                     2+ifac_size bytes -> dropped by the short-packet IFAC guard
+                     (Transport.py:1402/:1435). learned=False; frame_len and
+                     ifac_size are returned so the test can pin len<=2+ifac_size.
+      plain_on_ifac  IFAC interface, the UNMASKED announce (no 0x80 flag) ->
+                     dropped by the flag-missing guard (Transport.py:1437-1439).
+      plain_on_open  Open (non-IFAC) interface, the UNMASKED announce ->
+                     accepted (learned=True). Positive control for the open iface.
+      build_masked   IFAC interface: build+mask, but DO NOT inject; return the
+                     masked frame hex + dest_hash so an OPEN peer can inject it.
+      inject_external Open interface: inject a caller-supplied frame (the masked,
+                     flag-set frame from build_masked) -> dropped by the
+                     flag-on-open-interface guard (Transport.py:1442-1445).
+      min_short      Any interface, the UNMASKED announce TRIMMED to <=2 bytes
+                     (trim_to, default 2) -> dropped by the minimum-length guard
+                     (Transport.py:1398/:1447, before any IFAC logic).
+
+    Returns {dest_hash, frame_len, learned} (build_masked returns {dest_hash,
+    raw, frame_len, ifac_size} and does not inject). ifac_size is included
+    whenever the frame is injected on the IFAC interface.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    variant = params["variant"]
+    app_name = params.get("app_name", "rawframe")
+    aspects = list(params.get("aspects", ["inject"]))
+    app_data = bytes.fromhex(params["app_data"]) if params.get("app_data") else b"probe"
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    ifaces = _interfaces_matching_handle(inst["rns"], inst["role"])
+    if not ifaces:
+        raise RuntimeError(f"No live interfaces found for handle {handle}")
+    ifac_iface, open_iface = _split_ifac_open(ifaces)
+
+    if variant == "inject_external":
+        if open_iface is None:
+            raise RuntimeError("inject_external requires a non-IFAC (open) interface")
+        frame = bytes.fromhex(params["raw"])
+        dest_hash = bytes.fromhex(params["dest_hash"])
+        RNS.Transport.inbound(frame, open_iface)
+        return {
+            "dest_hash": dest_hash.hex(),
+            "frame_len": len(frame),
+            "learned": bool(RNS.Transport.has_path(dest_hash)),
+        }
+
+    if variant == "build_masked":
+        if ifac_iface is None:
+            raise RuntimeError("build_masked requires an IFAC-configured interface")
+        destination, plain_raw = _build_foreign_announce(inst, RNS, app_name, aspects, app_data)
+        masked_raw = _mask_frame_via_interface(RNS, ifac_iface, plain_raw)
+        return {
+            "dest_hash": destination.hash.hex(),
+            "raw": masked_raw.hex(),
+            "frame_len": len(masked_raw),
+            "ifac_size": int(ifac_iface.ifac_size),
+        }
+
+    target = None
+    frame = None
+    if variant in ("masked_full", "masked_short", "plain_on_ifac"):
+        if ifac_iface is None:
+            raise RuntimeError(f"variant {variant} requires an IFAC interface")
+        target = ifac_iface
+        destination, plain_raw = _build_foreign_announce(inst, RNS, app_name, aspects, app_data)
+        if variant == "plain_on_ifac":
+            frame = plain_raw
+        else:
+            masked_raw = _mask_frame_via_interface(RNS, ifac_iface, plain_raw)
+            if variant == "masked_full":
+                frame = masked_raw
+            else:  # masked_short: trim to the IFAC short-packet boundary
+                limit = 2 + int(ifac_iface.ifac_size)
+                frame = masked_raw[:limit]
+    elif variant == "plain_on_open":
+        if open_iface is None:
+            raise RuntimeError("plain_on_open requires an open interface")
+        target = open_iface
+        destination, plain_raw = _build_foreign_announce(inst, RNS, app_name, aspects, app_data)
+        frame = plain_raw
+    elif variant == "min_short":
+        target = open_iface or ifac_iface
+        if target is None:
+            raise RuntimeError("min_short requires any live interface")
+        trim_to = int(params.get("trim_to", 2))
+        destination, plain_raw = _build_foreign_announce(inst, RNS, app_name, aspects, app_data)
+        frame = plain_raw[:trim_to]
+    else:
+        raise ValueError(f"unknown variant: {variant!r}")
+
+    RNS.Transport.inbound(frame, target)
+    result = {
+        "dest_hash": destination.hash.hex(),
+        "frame_len": len(frame),
+        "learned": bool(RNS.Transport.has_path(destination.hash)),
+    }
+    if target is ifac_iface and ifac_iface is not None:
+        result["ifac_size"] = int(ifac_iface.ifac_size)
+    return result
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -8094,5 +8293,6 @@ WIRE_COMMANDS = {
     "wire_interface_bitrate": cmd_wire_interface_bitrate,
     "wire_rpc_authkey": cmd_wire_rpc_authkey,
     "wire_first_hop_timeout": cmd_wire_first_hop_timeout,
+    "wire_inject_raw_frame": cmd_wire_inject_raw_frame,
     "wire_stop": cmd_wire_stop,
 }

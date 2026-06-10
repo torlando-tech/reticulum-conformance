@@ -94,8 +94,20 @@ class _WirePeer:
         share_instance_type: str | None = None,
         enable_transport: bool = True,
         fixed_mtu: int | None = None,
+        ifac_size: int | None = None,
+        bitrate: int | None = None,
+        respond_to_probes: bool = False,
+        use_implicit_proof: bool | None = None,
+        enable_remote_management: bool = False,
+        remote_management_allowed: list | None = None,
     ) -> int:
         """Bring up a TCPServerInterface on this peer.
+
+        ifac_size (BITS), bitrate (bps), respond_to_probes, use_implicit_proof,
+        enable_remote_management, remote_management_allowed (list of hex hashes)
+        are optional reticulum_config knobs written into this peer's config so a
+        test can read the floored/derived/posture value back off the live RNS
+        objects. Omit a knob to keep RNS's own default.
 
         share_instance=True additionally publishes this peer as a shared
         Reticulum instance so other bridge processes (started via
@@ -139,6 +151,18 @@ class _WirePeer:
                 kwargs["share_instance_type"] = share_instance_type
         if not enable_transport:
             kwargs["enable_transport"] = False
+        if ifac_size is not None:
+            kwargs["ifac_size"] = int(ifac_size)
+        if bitrate is not None:
+            kwargs["bitrate"] = int(bitrate)
+        if respond_to_probes:
+            kwargs["respond_to_probes"] = True
+        if use_implicit_proof is not None:
+            kwargs["use_implicit_proof"] = bool(use_implicit_proof)
+        if enable_remote_management:
+            kwargs["enable_remote_management"] = True
+        if remote_management_allowed is not None:
+            kwargs["remote_management_allowed"] = list(remote_management_allowed)
         resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
@@ -1956,6 +1980,52 @@ class _WirePeer:
             "signature": bytes.fromhex(resp["signature"]),
             "ifac": bytes.fromhex(resp["ifac"]),
         }
+
+    # --- reticulum_config posture / config-derivation read-backs ----------
+
+    def ifac_signature(self) -> dict:
+        """Read this peer's live interface IFAC identifier signature. Returns
+        {ifac_signature: bytes, ifac_key: bytes, ifac_size: int,
+        default_ifac_size: int}. Peer must have network_name + passphrase."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_ifac_signature", handle=self.handle)
+        return {
+            "ifac_signature": bytes.fromhex(resp["ifac_signature"]),
+            "ifac_key": bytes.fromhex(resp["ifac_key"]),
+            "ifac_size": int(resp["ifac_size"]),
+            "default_ifac_size": int(resp["default_ifac_size"]),
+        }
+
+    def instance_posture(self) -> dict:
+        """Read the ground-truth process-wide posture flags RNS resolved."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_instance_posture", handle=self.handle)
+
+    def interface_bitrate(self) -> dict:
+        """Read this peer's effective interface bitrate + class guess +
+        MINIMUM_BITRATE. Returns {bitrate, bitrate_guess, minimum_bitrate}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_interface_bitrate", handle=self.handle)
+
+    def rpc_authkey(self) -> dict:
+        """Read the derived RPC authkey + transport private key. Returns
+        {rpc_key: bytes, transport_private_key: bytes}."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_rpc_authkey", handle=self.handle)
+        return {
+            "rpc_key": bytes.fromhex(resp["rpc_key"]),
+            "transport_private_key": bytes.fromhex(resp["transport_private_key"]),
+        }
+
+    def first_hop_timeout(self, destination_hash: bytes) -> dict:
+        """Read RNS.Transport.first_hop_timeout for a destination hash. Returns
+        {timeout, default_per_hop_timeout}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_first_hop_timeout",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
 
     def resource_poll(
         self, destination_hash: bytes, timeout_ms: int = 30000

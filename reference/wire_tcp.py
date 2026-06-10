@@ -221,6 +221,12 @@ def _write_ifac_ini(
     instance_control_port: int | None = None,
     rpc_key: str | None = None,
     enable_transport: bool = True,
+    ifac_size: int | None = None,
+    bitrate: int | None = None,
+    respond_to_probes: bool = False,
+    use_implicit_proof: bool | None = None,
+    enable_remote_management: bool = False,
+    remote_management_allowed: list | None = None,
 ):
     """Write a minimal RNS config.
 
@@ -254,6 +260,16 @@ def _write_ifac_ini(
         ifac_lines += f"    network_name = {network_name}\n"
     if passphrase:
         ifac_lines += f"    passphrase = {passphrase}\n"
+    # ifac_size (in BITS) and bitrate are per-interface options. RNS parses
+    # them in Reticulum._add_interface's config pass (Reticulum.py:719-723 for
+    # ifac_size -> //8 with the IFAC_MIN_SIZE*8 floor; :765-768 for bitrate
+    # with the MINIMUM_BITRATE floor). Writing them as plain ini text lets a
+    # test pin the floor/divide logic by reading the resulting
+    # interface.ifac_size / interface.bitrate back off the live interface.
+    if ifac_size is not None:
+        ifac_lines += f"    ifac_size = {int(ifac_size)}\n"
+    if bitrate is not None:
+        ifac_lines += f"    bitrate = {int(bitrate)}\n"
     if mode:
         # Python RNS's config reader at Reticulum.py:619-647 has a bug in
         # the `interface_mode` branch: inside `if "interface_mode" in c`,
@@ -315,6 +331,26 @@ def _write_ifac_ini(
     )
     transport_value = "Yes" if enable_transport else "No"
 
+    # [reticulum]-level posture knobs. RNS parses each in __apply_config
+    # (Reticulum.py:528-545, :555-558): respond_to_probes -> __allow_probes,
+    # enable_remote_management -> __remote_management_enabled,
+    # use_implicit_proof -> __use_implicit_proof. Default-omitting a knob keeps
+    # RNS's own default (probes off, remote-mgmt off, implicit-proof on), which
+    # is exactly the negative control a test wants.
+    probes_line = f"  respond_to_probes = {'Yes' if respond_to_probes else 'No'}\n"
+    remote_mgmt_line = (
+        "  enable_remote_management = Yes\n" if enable_remote_management else ""
+    )
+    remote_allowed_line = ""
+    if remote_management_allowed:
+        joined = ", ".join(str(h) for h in remote_management_allowed)
+        remote_allowed_line = f"  remote_management_allowed = {joined}\n"
+    implicit_proof_line = ""
+    if use_implicit_proof is not None:
+        implicit_proof_line = (
+            f"  use_implicit_proof = {'Yes' if use_implicit_proof else 'No'}\n"
+        )
+
     interfaces_section = ""
     if iface_name and iface_block:
         interfaces_section = (
@@ -334,7 +370,10 @@ def _write_ifac_ini(
             f"{port_line}"
             f"{control_port_line}"
             f"{rpc_key_line}"
-            "  respond_to_probes = No\n"
+            f"{probes_line}"
+            f"{remote_mgmt_line}"
+            f"{remote_allowed_line}"
+            f"{implicit_proof_line}"
             f"{interfaces_section}"
         )
 
@@ -408,6 +447,19 @@ def cmd_wire_start_tcp_server(params):
     # small on BOTH ends — the only way a modest Resource chunks into >74 parts
     # and drives the real on-wire HMU handshake. Must be >= Reticulum.MTU (500).
     fixed_mtu = params.get("fixed_mtu")
+    # Per-interface / per-instance config knobs (all optional). These let a
+    # test bring up a peer whose floored/derived config value is then read
+    # back off the live RNS objects (interface.ifac_size, interface.bitrate,
+    # RNS.Reticulum.probe_destination_enabled(), etc.) — see the read-back
+    # commands further down. None means "omit the knob, keep RNS's default".
+    ifac_size = params.get("ifac_size")
+    bitrate = params.get("bitrate")
+    respond_to_probes = bool(params.get("respond_to_probes", False))
+    use_implicit_proof = params.get("use_implicit_proof")
+    if use_implicit_proof is not None:
+        use_implicit_proof = bool(use_implicit_proof)
+    enable_remote_management = bool(params.get("enable_remote_management", False))
+    remote_management_allowed = params.get("remote_management_allowed")
     share_instance_type = params.get("share_instance_type")
     if share_instance_type is not None:
         share_instance_type = str(share_instance_type).lower()
@@ -468,6 +520,12 @@ def cmd_wire_start_tcp_server(params):
         instance_control_port=instance_control_port,
         rpc_key=rpc_key_hex,
         enable_transport=enable_transport,
+        ifac_size=ifac_size,
+        bitrate=bitrate,
+        respond_to_probes=respond_to_probes,
+        use_implicit_proof=use_implicit_proof,
+        enable_remote_management=enable_remote_management,
+        remote_management_allowed=remote_management_allowed,
     )
 
     RNS = _get_rns()
@@ -5028,6 +5086,165 @@ def cmd_wire_link_identify_pending(params):
     }
 
 
+# ---------------------------------------------------------------------------
+# reticulum_config read-backs: live-instance / live-interface observables for
+# config-driven posture & derivation. Every one of these DELEGATES to a real
+# RNS static method or reads an attribute RNS set during config parse —
+# nothing is recomputed here. They exist so a test can pin the FLOORED /
+# DERIVED / DEFAULTED value RNS landed on against an external spec literal.
+# ---------------------------------------------------------------------------
+
+def _primary_wire_interface(inst):
+    """Return this handle's single configured wire interface (not a spawned
+    child), or None. Mirrors the name match in _interfaces_matching_handle."""
+    for iface in _interfaces_matching_handle(inst["rns"], inst["role"]):
+        if getattr(iface, "name", "") in ("Wire TCP Server", "Wire TCP Client"):
+            return iface
+    return None
+
+
+def cmd_wire_ifac_signature(params):
+    """Return the live interface's IFAC identifier signature.
+
+    Reads `interface.ifac_signature` / `interface.ifac_key` / `interface.ifac_size`
+    straight off the IFAC-configured interface (the value RNS produced at
+    Reticulum.py:916: `interface.ifac_signature = interface.ifac_identity.sign(
+    RNS.Identity.full_hash(interface.ifac_key))`). Nothing is re-derived here —
+    a test independently re-signs full_hash(ifac_key) via wire_ifac_compute and
+    checks the two match. `default_ifac_size` is the interface CLASS default
+    (TCPServerInterface.DEFAULT_IFAC_SIZE == 16) so the per-type default and the
+    configured-floor logic can both be pinned against the RNS source.
+    """
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    ifac_iface = None
+    for iface in _interfaces_matching_handle(inst["rns"], inst["role"]):
+        if getattr(iface, "ifac_identity", None) is not None:
+            ifac_iface = iface
+            break
+    if ifac_iface is None:
+        raise RuntimeError(
+            "No IFAC-configured interface on this handle. Start the peer with "
+            "network_name + passphrase so RNS derives an ifac_identity."
+        )
+    return {
+        "ifac_signature": ifac_iface.ifac_signature.hex(),
+        "ifac_key": ifac_iface.ifac_key.hex(),
+        "ifac_size": int(ifac_iface.ifac_size),
+        "default_ifac_size": int(type(ifac_iface).DEFAULT_IFAC_SIZE),
+    }
+
+
+def cmd_wire_instance_posture(params):
+    """Return the GROUND-TRUTH process-wide posture flags RNS resolved at
+    Reticulum.__init__ / __apply_config time.
+
+    Every field is the return of an RNS static accessor (Reticulum.py:1707-1750)
+    or RNS.Transport.remote_management_allowed — the live config-derived state,
+    not the echoed config value. A shared-instance local CLIENT forces
+    transport/remote-management/probes all False (Reticulum.py:429-431); a
+    standalone node reflects its own config knobs. should_use_implicit_proof
+    defaults True; probe/remote-management default False.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    return {
+        "transport_enabled": bool(RNS.Reticulum.transport_enabled()),
+        "remote_management_enabled": bool(RNS.Reticulum.remote_management_enabled()),
+        "respond_to_probes": bool(RNS.Reticulum.probe_destination_enabled()),
+        "should_use_implicit_proof": bool(RNS.Reticulum.should_use_implicit_proof()),
+        "link_mtu_discovery": bool(RNS.Reticulum.link_mtu_discovery()),
+        "remote_management_allowed": [
+            h.hex() for h in RNS.Transport.remote_management_allowed
+        ],
+        "is_shared_instance": bool(
+            getattr(inst["rns"], "is_shared_instance", False)
+        ),
+        "is_connected_to_shared_instance": bool(
+            getattr(inst["rns"], "is_connected_to_shared_instance", False)
+        ),
+    }
+
+
+def cmd_wire_interface_bitrate(params):
+    """Return the live interface's effective bitrate after config parse.
+
+    Reads `interface.bitrate`. RNS only applies a configured `bitrate` when it
+    is >= Reticulum.MINIMUM_BITRATE (Reticulum.py:765-768); a sub-minimum value
+    is silently ignored and the interface keeps its class BITRATE_GUESS
+    (TCPServerInterface.BITRATE_GUESS == 10_000_000). Returning both the live
+    bitrate and the class guess + the MINIMUM_BITRATE constant lets a test pin
+    the floor without recomputing anything.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    iface = _primary_wire_interface(inst)
+    if iface is None:
+        raise RuntimeError("No configured wire interface on this handle.")
+    return {
+        "bitrate": int(iface.bitrate),
+        "bitrate_guess": int(type(iface).BITRATE_GUESS),
+        "minimum_bitrate": int(RNS.Reticulum.MINIMUM_BITRATE),
+    }
+
+
+def cmd_wire_rpc_authkey(params):
+    """Return the derived RPC authkey and the transport identity private key.
+
+    When no rpc_key is configured, RNS derives the multiprocessing RPC authkey
+    as RNS.Identity.full_hash(RNS.Transport.identity.get_private_key())
+    (Reticulum.py:347-348). This reads the resolved `rns.rpc_key` plus the live
+    transport private key so a test can independently recompute SHA-256 over the
+    private key (full_hash IS SHA-256) and confirm the derivation.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    rpc_key = inst["rns"].rpc_key
+    if rpc_key is None:
+        raise RuntimeError("rpc_key not yet derived on this instance.")
+    return {
+        "rpc_key": rpc_key.hex(),
+        "transport_private_key": RNS.Transport.identity.get_private_key().hex(),
+    }
+
+
+def cmd_wire_first_hop_timeout(params):
+    """Return RNS.Transport.first_hop_timeout(destination_hash) for this peer.
+
+    Delegates to the real static (Transport.py:2697-2701): with no known path
+    to the destination the per-byte latency is None and the function returns
+    exactly Reticulum.DEFAULT_PER_HOP_TIMEOUT (== 6). Returning the constant
+    alongside lets a test anchor the unknown-destination case on the spec
+    literal.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    return {
+        "timeout": RNS.Transport.first_hop_timeout(destination_hash),
+        "default_per_hop_timeout": RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT,
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
@@ -5121,5 +5338,11 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_resource_part": cmd_wire_inject_crafted_resource_part,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
+    # reticulum_config posture / config-derivation read-backs
+    "wire_ifac_signature": cmd_wire_ifac_signature,
+    "wire_instance_posture": cmd_wire_instance_posture,
+    "wire_interface_bitrate": cmd_wire_interface_bitrate,
+    "wire_rpc_authkey": cmd_wire_rpc_authkey,
+    "wire_first_hop_timeout": cmd_wire_first_hop_timeout,
     "wire_stop": cmd_wire_stop,
 }

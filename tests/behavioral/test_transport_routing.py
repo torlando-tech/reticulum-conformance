@@ -51,6 +51,7 @@ forced jobs() pass — leaving the entry in a stable, observable state.
 """
 
 import secrets
+import time
 
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
@@ -654,6 +655,70 @@ def test_path_request_tag_dedup(behavioral):
         assert ans3["found"] and ans3["block_rebroadcasts"] is True, (
             "a path request with a fresh tag was NOT acted on — dedup is keyed "
             "on destination only, ignoring the tag (Transport.py:2891)"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_read_path_table"],
+    verifies=(
+        "Transport.inbound gates an announce on its Ed25519 signature BEFORE any "
+        "state change: a genuine announce injected on an interface creates a "
+        "path-table entry (positive control), but a byte-for-byte identical "
+        "announce with a single tampered signature byte creates NO path-table "
+        "entry — validate_announce fails and the announce is dropped before the "
+        "path table is touched (Transport.py announce_signature gate). An impl "
+        "that learns paths from unverified announces is trivially route-poisoned"
+    ),
+)
+def test_announce_signature_gate_blocks_state_change(behavioral):
+    """Inject a valid announce -> path learned; inject the same announce with a
+    corrupted signature -> path NOT learned. Discriminating both ways: an impl
+    that skips the signature check learns the tampered path (fails the negative);
+    one that drops all announces never learns the valid path (fails the positive
+    control). Two fresh Transport instances so the negative starts from a clean
+    table and cannot inherit the positive control's entry."""
+    # Positive control: a genuine announce is admitted into the path table.
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface = inst.attach_mock_interface("a", mode="FULL")
+        valid, dest_hash, _pub = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["sig_gate"],
+            wire_hops=0,
+        )
+        inst.inject(iface, valid)
+        time.sleep(0.2)
+        assert inst.read_path_table(dest_hash)["found"] is True, (
+            "a valid announce did not create a path-table entry (positive control)"
+        )
+    finally:
+        behavioral.cleanup()
+
+    # Negative: the SAME announce with one tampered signature byte must be
+    # dropped before any path-table write. The signature is the last 64 bytes of
+    # an announce that carries no ratchet and no app_data.
+    inst2 = behavioral.start(enable_transport=True)
+    try:
+        iface2 = inst2.attach_mock_interface("a", mode="FULL")
+        valid2, dest_hash2, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["sig_gate"],
+            wire_hops=0,
+        )
+        tampered = bytearray(valid2)
+        tampered[-1] ^= 0x01  # flip a bit in the trailing Ed25519 signature
+        inst2.inject(iface2, bytes(tampered))
+        time.sleep(0.2)
+        assert inst2.read_path_table(dest_hash2)["found"] is False, (
+            "a tampered-signature announce created a path-table entry — the "
+            "inbound signature gate did not fire before the state change"
         )
     finally:
         behavioral.cleanup()

@@ -5101,6 +5101,321 @@ def cmd_wire_inject_crafted_resource_proof(params):
     }
 
 
+def cmd_wire_resource_constants(params):
+    """Read the Resource / ResourceAdvertisement protocol constants straight off
+    the real RNS classes (no reconstruction — every value is the class attribute
+    RNS itself uses to drive the transfer state machine).
+
+    These govern the windowed part-request handshake, the hashmap-advertisement
+    chunking (HASHMAP_MAX_LEN), the collision-guard scan width, the segmentation
+    threshold and the retry budgets. A cross-impl test pins each against its spec
+    literal; an impl with any divergent value windows/chunks/segments differently
+    and breaks interop. Returns the constant set.
+    """
+    RNS = _get_rns()
+    return {
+        "WINDOW": int(RNS.Resource.WINDOW),
+        "WINDOW_MIN": int(RNS.Resource.WINDOW_MIN),
+        "WINDOW_MAX": int(RNS.Resource.WINDOW_MAX),
+        "MAPHASH_LEN": int(RNS.Resource.MAPHASH_LEN),
+        "RANDOM_HASH_SIZE": int(RNS.Resource.RANDOM_HASH_SIZE),
+        "HASHMAP_MAX_LEN": int(RNS.ResourceAdvertisement.HASHMAP_MAX_LEN),
+        "COLLISION_GUARD_SIZE": int(RNS.ResourceAdvertisement.COLLISION_GUARD_SIZE),
+        "MAX_EFFICIENT_SIZE": int(RNS.Resource.MAX_EFFICIENT_SIZE),
+        "METADATA_MAX_SIZE": int(RNS.Resource.METADATA_MAX_SIZE),
+        "MAX_RETRIES": int(RNS.Resource.MAX_RETRIES),
+        "MAX_ADV_RETRIES": int(RNS.Resource.MAX_ADV_RETRIES),
+        "HASHMAP_IS_EXHAUSTED": int(RNS.Resource.HASHMAP_IS_EXHAUSTED),
+        "HASHMAP_IS_NOT_EXHAUSTED": int(RNS.Resource.HASHMAP_IS_NOT_EXHAUSTED),
+    }
+
+
+def cmd_wire_inject_crafted_resource_request(params):
+    """Adversarial RESOURCE_REQ injector (sender-side part-request handling).
+
+    A Resource SENDER, once advertised, serves parts in response to RESOURCE_REQ
+    packets the receiver emits (Resource.request, Resource.py:982). A request can
+    also carry the hashmap-exhausted flag (0xFF) with a last-known map hash,
+    asking the sender to emit the NEXT hashmap segment (HMU). The sender resolves
+    that last map hash to an absolute part index and REQUIRES the index to fall
+    on a HASHMAP_MAX_LEN (74) boundary; a misaligned index is a sequencing error
+    that cancels the transfer (Resource.py:1040-1042). An impl that skips that
+    gate would emit a desynchronised hashmap segment.
+
+    Self-contained: builds a real sender Resource on the established outbound link
+    (advertise=False, so __init__ runs the full hashmap build but nothing goes on
+    the wire), primes it as if advertised (status TRANSFERRING, adv_sent set), and
+    feeds a crafted RESOURCE_REQ plaintext — assembled ONLY from genuine
+    RNS-produced bytes (the sender's own .hash and real part .map_hash values,
+    prefixed with the RNS HASHMAP_IS_* marker constant) — straight into the real
+    Resource.request. Variants:
+
+      misaligned_hmu — exhausted flag + the map hash of part 0; resolves to
+                       part_index 1, 1 % 74 != 0 -> sequencing error -> CANCELLED.
+      aligned        — exhausted flag + the map hash of part 73; resolves to
+                       part_index 74, 74 % 74 == 0 -> NO cancel (HMU emitted).
+      serve_all      — a NOT_EXHAUSTED request naming EVERY part's map hash; the
+                       sender serves all parts and, once sent_parts == len(parts),
+                       transitions to AWAITING_PROOF (Resource.py:1066). Re-feeding
+                       the identical request resends byte-identical part bytes.
+
+    Returns (hmu variants): {variant, cancelled, status, status_name}.
+    Returns (serve_all): {variant, served_indices, sent_parts, total_parts,
+      identical_on_resend, status_name}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    if variant in ("misaligned_hmu", "aligned"):
+        # Need >=74 parts so part index 73 (the aligned 74th part) exists. Shrink
+        # the link MTU for the construction only (restored immediately after) so a
+        # modest payload chunks into many small parts (same trick as
+        # cmd_wire_resource_create's force_sdu).
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        link.mtu = 50 + overhead
+        try:
+            sender = RNS.Resource(secrets.token_bytes(6000), link, advertise=False)
+        finally:
+            link.mtu = saved_mtu
+        if len(sender.parts) < 74:
+            raise ValueError(
+                f"need >=74 parts for HMU alignment test, got {len(sender.parts)}"
+            )
+
+        # Prime the sender as if it had advertised: request() reads adv_sent and
+        # only spawns its watchdog when status != TRANSFERRING, so pre-setting
+        # TRANSFERRING keeps the call thread-clean.
+        sender.adv_sent = time.time()
+        sender.status = RNS.Resource.TRANSFERRING
+
+        exhausted = RNS.Resource.HASHMAP_IS_EXHAUSTED.to_bytes(1, "big")
+        part_index = 0 if variant == "misaligned_hmu" else 73
+        last_map_hash = sender.parts[part_index].map_hash  # genuine RNS bytes
+        # request_data layout mirrors Resource.request_next (Resource.py:965):
+        # [exhausted_flag(1)] [last_map_hash(4)] [resource hash(32)] [requested...]
+        request_data = exhausted + last_map_hash + sender.hash
+
+        try:
+            sender.request(request_data)
+        except Exception:
+            pass
+        status = getattr(sender, "status", None)
+        out = {
+            "variant": variant,
+            "cancelled": status == RNS.Resource.FAILED,
+            "status": int(status) if status is not None else None,
+            "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        }
+        try:
+            sender.cancel()
+        except Exception:
+            pass
+        return out
+
+    elif variant == "serve_all":
+        # A handful of parts so every one is served in a single request and the
+        # sender reaches AWAITING_PROOF. Shrink the link MTU for the construction
+        # only so a modest payload chunks into several small parts (a large
+        # negotiated TCP MDU would otherwise make it a single part).
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        link.mtu = 200 + overhead
+        try:
+            sender = RNS.Resource(secrets.token_bytes(1500), link, advertise=False)
+        finally:
+            link.mtu = saved_mtu
+        sender.adv_sent = time.time()
+        sender.status = RNS.Resource.TRANSFERRING
+
+        not_exhausted = RNS.Resource.HASHMAP_IS_NOT_EXHAUSTED.to_bytes(1, "big")
+        # sender.hashmap IS RNS's own concatenation of every part's map hash, in
+        # part order (Resource.py:471) — naming all of them requests all parts.
+        requested = sender.hashmap
+        request_data = not_exhausted + sender.hash + requested
+
+        sender.request(request_data)
+        served_indices = [i for i, p in enumerate(sender.parts) if getattr(p, "sent", False)]
+        sent_parts = int(getattr(sender, "sent_parts", 0))
+        status_after = getattr(sender, "status", None)
+
+        # Resend: feed the identical request again; already-sent parts go through
+        # part.resend(), which must transmit byte-identical raw bytes.
+        raws_before = [p.raw for p in sender.parts]
+        sender.status = RNS.Resource.TRANSFERRING  # avoid re-spawning the watchdog
+        sender.request(request_data)
+        raws_after = [p.raw for p in sender.parts]
+        identical_on_resend = raws_before == raws_after
+
+        out = {
+            "variant": variant,
+            "served_indices": served_indices,
+            "sent_parts": sent_parts,
+            "total_parts": len(sender.parts),
+            "identical_on_resend": bool(identical_on_resend),
+            "status_name": _RESOURCE_STATUS_NAMES.get(status_after),
+        }
+        try:
+            sender.cancel()
+        except Exception:
+            pass
+        return out
+
+    raise ValueError(f"unknown resource-request variant: {variant!r}")
+
+
+def cmd_wire_resource_force_collision(params):
+    """Drive the Resource hashmap collision-guard remap loop (Resource.py:436-472).
+
+    While building its hashmap, a sender appends each part's map hash to a
+    collision_guard_list; if a map hash repeats within COLLISION_GUARD_SIZE (224)
+    parts it abandons the whole hashmap, regenerates a fresh random_hash, and
+    rebuilds from scratch (the `while not hashmap_ok` loop). This guards against
+    two parts sharing a map hash (which would make the receiver unable to tell
+    them apart).
+
+    Forces that path by monkeypatching Resource.get_map_hash so the FIRST build
+    pass returns the same (genuine) map hash for parts 0 and 1 — a collision —
+    then passes through to the real get_map_hash on the rebuild pass. Every value
+    returned is RNS's own computed map hash; the patch only repeats one to trip
+    the guard, it does not fabricate bytes. Reports the random_hash before/after
+    the remap (they MUST differ — a fresh one is drawn) so a test can pin that the
+    guard actually regenerated and rebuilt. Returns {remapped, random_hash_before,
+    random_hash_after, hashmap_changed, num_parts}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    real_get_map_hash = RNS.Resource.get_map_hash
+    state = {"phase1_done": False, "call": 0, "rh_first": None,
+             "rh_second": None, "collide": None}
+
+    def _patched(self, data):
+        if not state["phase1_done"]:
+            state["rh_first"] = self.random_hash
+            state["call"] += 1
+            if state["call"] == 1:
+                # Genuine map hash of part 0 — reused below to force the collision.
+                state["collide"] = real_get_map_hash(self, data)
+                return state["collide"]
+            # Second part: return part 0's map hash -> collision -> remap.
+            state["phase1_done"] = True
+            return state["collide"]
+        state["rh_second"] = self.random_hash
+        return real_get_map_hash(self, data)
+
+    # Shrink the link MTU for the construction only so the payload chunks into
+    # several parts (a single-part resource cannot collide). Restored after.
+    overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+    saved_mtu = link.mtu
+    link.mtu = 200 + overhead
+    RNS.Resource.get_map_hash = _patched
+    try:
+        resource = RNS.Resource(secrets.token_bytes(4000), link, advertise=False)
+    finally:
+        RNS.Resource.get_map_hash = real_get_map_hash
+        link.mtu = saved_mtu
+
+    rh_before = state["rh_first"]
+    rh_after = state["rh_second"]
+    remapped = rh_before is not None and rh_after is not None and rh_before != rh_after
+    return {
+        "remapped": bool(remapped),
+        "random_hash_before": rh_before.hex() if rh_before else None,
+        "random_hash_after": rh_after.hex() if rh_after else None,
+        # The hashmap is derived from random_hash, so a fresh random_hash means a
+        # fresh hashmap; we also confirm the final object adopted rh_after.
+        "hashmap_changed": bool(remapped and resource.random_hash == rh_after),
+        "num_parts": len(resource.parts),
+    }
+
+
+def cmd_wire_resource_outgoing_queue_state(params):
+    """Pin the one-outgoing-resource-at-a-time rule (Link.ready_for_new_resource,
+    Link.py:1328-1329; Resource.__advertise_job QUEUED branch, Resource.py:522-524).
+
+    A Link admits a new outgoing Resource only when it has zero outgoing
+    resources in flight; a second Resource advertised while one is registered
+    spins in the QUEUED state until the first concludes. An impl that advertises
+    two concurrently would interleave two part streams on one link.
+
+    Self-contained and deterministic (no receiver race): builds a first Resource
+    inert (advertise=False) and registers it as the link's outgoing resource via
+    the real Link.register_outgoing_resource, then advertises a SECOND Resource
+    and polls its real status until it reaches QUEUED. Reports
+    ready_for_new_resource() with zero vs one outgoing (the positive/negative
+    control) and the second resource's status. Returns {ready_empty,
+    ready_with_one, first_status, first_status_name, second_status,
+    second_status_name, queued}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    timeout_ms = int(params.get("timeout_ms", 5000))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Positive control: an idle link with no outgoing resources admits a new one.
+    ready_empty = bool(link.ready_for_new_resource())
+
+    first = RNS.Resource(secrets.token_bytes(800), link, advertise=False)
+    link.register_outgoing_resource(first)  # genuine RNS registration
+    # Negative control: with one registered, the link refuses a new resource.
+    ready_with_one = bool(link.ready_for_new_resource())
+
+    second = RNS.Resource(secrets.token_bytes(800), link, advertise=True)
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if getattr(second, "status", None) == RNS.Resource.QUEUED:
+            break
+        time.sleep(0.02)
+
+    first_status = getattr(first, "status", None)
+    second_status = getattr(second, "status", None)
+    out = {
+        "ready_empty": ready_empty,
+        "ready_with_one": ready_with_one,
+        "first_status": int(first_status) if first_status is not None else None,
+        "first_status_name": _RESOURCE_STATUS_NAMES.get(first_status),
+        "second_status": int(second_status) if second_status is not None else None,
+        "second_status_name": _RESOURCE_STATUS_NAMES.get(second_status),
+        "queued": second_status == RNS.Resource.QUEUED,
+    }
+    # Cleanup: cancel the queued second (it loops in its advertise thread) and
+    # unregister the inert first.
+    try:
+        second.cancel()
+    except Exception:
+        pass
+    try:
+        link.cancel_outgoing_resource(first)
+    except Exception:
+        pass
+    return out
+
+
 def cmd_wire_inject_crafted_lrproof(params):
     """Adversarial LRPROOF injector (link-establishment proof validation).
 
@@ -5594,6 +5909,10 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_lrproof": cmd_wire_inject_crafted_lrproof,
     "wire_inject_crafted_resource_proof": cmd_wire_inject_crafted_resource_proof,
     "wire_inject_crafted_resource_part": cmd_wire_inject_crafted_resource_part,
+    "wire_resource_constants": cmd_wire_resource_constants,
+    "wire_inject_crafted_resource_request": cmd_wire_inject_crafted_resource_request,
+    "wire_resource_force_collision": cmd_wire_resource_force_collision,
+    "wire_resource_outgoing_queue_state": cmd_wire_resource_outgoing_queue_state,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     # reticulum_config posture / config-derivation read-backs

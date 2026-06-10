@@ -1946,6 +1946,46 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
+    def resource_constants(self) -> dict:
+        """Read the real Resource / ResourceAdvertisement protocol constants off
+        RNS (WINDOW/WINDOW_MIN/WINDOW_MAX/MAPHASH_LEN/HASHMAP_MAX_LEN/
+        COLLISION_GUARD_SIZE/MAX_EFFICIENT_SIZE/METADATA_MAX_SIZE/MAX_RETRIES/
+        MAX_ADV_RETRIES/...). For pinning each against its spec literal."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_resource_constants", handle=self.handle)
+
+    def inject_crafted_resource_request(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial RESOURCE_REQ injector: build a real sender Resource on the
+        link and feed a crafted request of `variant` (misaligned_hmu / aligned /
+        serve_all) into the real Resource.request, reporting the sequencing-error
+        cancel (misaligned), the aligned-HMU non-cancel, or the served-parts /
+        AWAITING_PROOF / byte-identical-resend behaviour (serve_all)."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_request",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_force_collision(self, link_id: bytes) -> dict:
+        """Drive the hashmap collision-guard remap: force a map-hash collision on
+        the first build pass and report {remapped, random_hash_before,
+        random_hash_after, hashmap_changed, num_parts}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_force_collision",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_outgoing_queue_state(self, link_id: bytes) -> dict:
+        """Pin one-outgoing-resource-at-a-time: register one outgoing resource,
+        advertise a second, and report {ready_empty, ready_with_one,
+        first_status*, second_status*, queued}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_outgoing_queue_state",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
     def inject_crafted_lrproof(self, variant: str) -> dict:
         """Adversarial LRPROOF injector: on this peer, create a self-contained
         initiator link to a fresh controlled destination, craft an LRPROOF of

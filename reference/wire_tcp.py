@@ -4459,6 +4459,103 @@ def cmd_wire_inject_crafted_proof(params):
     }
 
 
+def cmd_wire_inject_tampered_link_data(params):
+    """Adversarial tampered-token injector for an ACTIVE link.
+
+    Builds a real DATA packet encrypted to an established link (the same path
+    cmd_wire_send_forged_link_close uses for LINKCLOSE), optionally CORRUPTS it,
+    and feeds it through the link's real receive path (link.receive), reporting
+    whether the decrypted message reached the link's packet handler.
+
+    The link layer's RNS Token verifies its HMAC over IV||ciphertext BEFORE
+    decrypting (Token.decrypt), so any tamper makes link.decrypt return None and
+    the packet is silently dropped — no handler call, link stays ACTIVE. An
+    impl that decrypts without verifying the HMAC (or ignores the auth failure)
+    would deliver forged/garbage data.
+
+    corruption:
+      none       — a pristine packet; MUST be delivered (positive control).
+      ciphertext — flip a byte inside IV/ciphertext -> HMAC mismatch -> drop.
+      hmac       — flip the trailing HMAC byte -> mismatch -> drop.
+      truncate   — drop the last byte -> malformed token -> drop.
+
+    Run this on the RECEIVER peer (it owns the inbound link + its packet
+    handler). Returns {corruption, unpacked, delivered, link_active,
+    status_name}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+    corruption = params.get("corruption", "none")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Find the listener whose inbound link this is, so we can read its packet
+    # handler's delivery buffer (set_packet_callback -> recv_buffer in
+    # cmd_wire_listen) before and after the injection.
+    listener = None
+    for cand in inst.get("listeners", {}).values():
+        with cand["recv_lock"]:
+            ids = [getattr(x, "link_id", None) for x in cand.get("inbound_links", [])]
+        if link_id in ids:
+            listener = cand
+            break
+    if listener is None:
+        raise ValueError(
+            f"link_id {link_id.hex()} is not an inbound link of any listener on "
+            f"this peer (run the injector on the RECEIVER peer)"
+        )
+
+    with listener["recv_lock"]:
+        before = len(listener["recv_buffer"])
+
+    # Build a real DATA packet encrypted to the link, then corrupt it.
+    out_packet = RNS.Packet(link, payload, context=RNS.Packet.NONE)
+    out_packet.pack()
+    raw = bytearray(out_packet.raw)
+    # HEADER_1 link packet: flags(1)+hops(1)+link_id(16)+context(1) = 19, then
+    # the encrypted token (IV(16)||ciphertext||HMAC(32)).
+    # Damage one byte (arithmetic change, not protocol assembly) — enough to
+    # make the link's Token HMAC mismatch. The packet itself was produced by
+    # real RNS; we only corrupt it.
+    payload_off = 19
+    if corruption == "ciphertext":
+        raw[payload_off + 4] = (raw[payload_off + 4] + 1) % 256
+    elif corruption == "hmac":
+        raw[-1] = (raw[-1] + 1) % 256
+    elif corruption == "truncate":
+        raw = raw[:-1]
+    elif corruption != "none":
+        raise ValueError(f"unknown corruption: {corruption!r}")
+
+    rx = RNS.Packet(None, bytes(raw))
+    unpacked = rx.unpack()
+    if unpacked:
+        rx.receiving_interface = link.attached_interface
+        link.receive(rx)
+    # The packet handler runs synchronously in link.receive, but allow a tiny
+    # settle margin for any deferred dispatch.
+    time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        after = len(listener["recv_buffer"])
+    status_after = getattr(link, "status", None)
+    return {
+        "corruption": corruption,
+        "unpacked": bool(unpacked),
+        "delivered": after > before,
+        "link_active": status_after == RNS.Link.ACTIVE,
+        "status_name": _LINK_STATUS_NAMES.get(status_after),
+    }
+
+
 def cmd_wire_link_identify_pending(params):
     """Call RNS.Link.identify on a PENDING (pre-ACTIVE) link and assert it is a
     no-op that does not crash (Link.py:459-475/:468).
@@ -4622,6 +4719,7 @@ WIRE_COMMANDS = {
     # Deferred Link edges (forged LINKCLOSE / identify on PENDING link)
     "wire_send_forged_link_close": cmd_wire_send_forged_link_close,
     "wire_inject_crafted_proof": cmd_wire_inject_crafted_proof,
+    "wire_inject_tampered_link_data": cmd_wire_inject_tampered_link_data,
     # IFAC issue-29 golden vector
     "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,

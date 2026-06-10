@@ -1811,6 +1811,23 @@ class _WirePeer:
             handle=self.handle, receipt_id=receipt_id, variant=variant,
         )
 
+    def inject_tampered_link_data(
+        self, link_id: bytes, data: bytes, corruption: str = "none",
+    ) -> dict:
+        """Adversarial tampered-token injector: build a DATA packet encrypted to
+        an established link, optionally corrupt it (`corruption` ∈ none /
+        ciphertext / hmac / truncate), and feed it through the link's real
+        receive path, reporting {corruption, unpacked, delivered, link_active,
+        status_name}. Run on the RECEIVER peer (it owns the inbound link's
+        packet handler). A tampered packet must NOT be delivered and the link
+        must stay ACTIVE; `corruption='none'` is the positive control."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_tampered_link_data",
+            handle=self.handle, link_id=link_id.hex(),
+            data=data.hex(), corruption=corruption,
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,

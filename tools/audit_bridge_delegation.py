@@ -41,6 +41,14 @@ Classification (per bridge command handler, by AST analysis):
              dishonest. Anything reconstructing protocol bytes that is NOT pinned
              here is still HANDROLLED.
 
+  ADVERSARIAL Damages a GENUINE RNS-produced artifact (a real packed packet) and
+             feeds it back through a REAL RNS receive/validate path to prove that
+             path rejects the forgery. The byte-corruption uses buffer idioms the
+             heuristic scores asm:*, but no protocol is ASSEMBLED — every
+             protocol byte came from RNS, and the logic under test is RNS's.
+             Honest by exception, same bar as MIRRORED: tiny, documented
+             (ADVERSARIAL_CORRUPTORS), rot-guarded; NOT counted dishonest.
+
   DEAD       Defined but shadowed by a later def of the same name, or
              registered in no COMMANDS dict. Dead weight, not callable.
 
@@ -140,6 +148,29 @@ MIRRORS_RNS_RECEIVE: dict[str, str] = {
     "cmd_kiss_deframe": "RNS exposes no standalone KISS de-escape; mirrors "
                         "KISSInterface read-loop TFEND/TFESC un-transpose, "
                         "constants read off RNS; round-trip KAT vs RNS KISS.escape.",
+}
+
+# Adversarial corruptors: handlers that take a GENUINE RNS-produced artifact
+# (a packet packed by real RNS, encrypted with a real link key), DAMAGE it, and
+# feed it back through a REAL RNS receive/validate path — to prove that path
+# REJECTS the forgery. RNS exposes no "corrupt this packet" API, so the damage
+# (a one-byte change, a truncation) is necessarily expressed with byte-buffer
+# idioms the heuristic scores `asm:*`. But the bridge here is NOT reconstructing
+# protocol bytes — it destroys a few of them; every protocol-bearing byte was
+# produced by real RNS, and the logic UNDER TEST (decrypt / HMAC-verify /
+# signature-check / teardown decision) is 100% RNS. The tests are
+# known-discriminators: the pristine artifact is accepted (positive control) and
+# the damaged one is rejected, so they test real RNS rejection branches, not the
+# bridge's reimplementation (there is none). Held to the same bar as
+# MIRRORS_RNS_RECEIVE: tiny, documented per-entry, and rot-guarded
+# (build_command_index fails the audit if a name here stops backing a real
+# handler). Anything that ASSEMBLES protocol bytes is still HANDROLLED.
+ADVERSARIAL_CORRUPTORS: dict[str, str] = {
+    "cmd_wire_inject_tampered_link_data":
+        "Packs a real DATA packet to an established link via RNS.Packet.pack, "
+        "damages one byte (or truncates), and feeds it to the real link.receive; "
+        "asserts the genuine packet is delivered and the tampered one is dropped "
+        "by RNS's own token-HMAC-before-decrypt — no protocol assembled here.",
 }
 
 # Live-instance accessors / RNS loaders. A handler that *calls* one of these is
@@ -391,6 +422,8 @@ def classify_handler(
 
     if func.name in MIRRORS_RNS_RECEIVE:
         return "MIRRORED", signals | {"pinned:mirrors-rns-receive"}, called_cmds
+    if func.name in ADVERSARIAL_CORRUPTORS:
+        return "ADVERSARIAL", signals | {"pinned:adversarial-corruptor"}, called_cmds
     if func.name in HEURISTIC_MISS_HANDROLLED:
         return "HANDROLLED", signals | {"pinned:primitive-then-slice"}, called_cmds
     if any(s.startswith("asm:") for s in signals):
@@ -494,7 +527,8 @@ def build_command_index():
     # once KDF_PROTOCOL_REVIEW rotted), which is exactly how part of "0
     # dishonest" became vacuously true. Surface stale pins so main() can fail.
     override_rot = sorted(
-        (KDF_PROTOCOL_REVIEW | HEURISTIC_MISS_HANDROLLED | set(MIRRORS_RNS_RECEIVE))
+        (KDF_PROTOCOL_REVIEW | HEURISTIC_MISS_HANDROLLED
+         | set(MIRRORS_RNS_RECEIVE) | set(ADVERSARIAL_CORRUPTORS))
         - all_handlers
     )
     return commands, dead_handlers, override_rot
@@ -561,7 +595,7 @@ def main() -> int:
     print("=" * 78)
     print()
     total = len(commands)
-    for cls in ("GENUINE", "LIVE", "MIRRORED", "HANDROLLED", "REVIEW", "DEAD", "UNKNOWN"):
+    for cls in ("GENUINE", "LIVE", "MIRRORED", "ADVERSARIAL", "HANDROLLED", "REVIEW", "DEAD", "UNKNOWN"):
         n = len(by_class.get(cls, []))
         if n:
             print(f"  {cls:11s} {n:3d}  ({n / total * 100:4.1f}% of {total} registered commands)")
@@ -601,6 +635,22 @@ def main() -> int:
         for name in sorted(by_class["MIRRORED"]):
             funcname = commands[name][1]
             justification = MIRRORS_RNS_RECEIVE.get(funcname, "")
+            print(f"    - {name}  [{funcname}]")
+            if justification:
+                print(f"        {justification}")
+        print()
+
+    # --- ADVERSARIAL: corruptors that damage a genuine RNS artifact ---
+    if by_class.get("ADVERSARIAL"):
+        print("-" * 78)
+        print("ADVERSARIAL COMMANDS (damage a genuine RNS artifact to test a real")
+        print("                      RNS rejection path; assemble no protocol)")
+        print("-" * 78)
+        print("  Honest by exception: the packet is built + the receive path run by")
+        print("  real RNS; the bridge only corrupts a byte. Not counted as dishonest.")
+        for name in sorted(by_class["ADVERSARIAL"]):
+            funcname = commands[name][1]
+            justification = ADVERSARIAL_CORRUPTORS.get(funcname, "")
             print(f"    - {name}  [{funcname}]")
             if justification:
                 print(f"        {justification}")

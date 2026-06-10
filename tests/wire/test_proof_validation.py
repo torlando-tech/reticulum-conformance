@@ -107,3 +107,49 @@ def test_single_packet_proof_validation_rejects_forgeries(wire_link_setup):
     assert ok["delivered"] is True and ok["proved"] is True, (
         f"a genuine PROVE_ALL proof was not accepted (positive control): {ok!r}"
     )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path",
+        "link_open", "inject_tampered_link_data",
+    ],
+    verifies=(
+        "Link DATA is authenticated before delivery: a pristine DATA packet "
+        "encrypted to an established link is delivered to the receiver's packet "
+        "handler (positive control), but the same packet with ANY tamper — a "
+        "flipped ciphertext/IV byte, a flipped trailing HMAC byte, or a "
+        "truncated token — is silently dropped (not delivered) because the RNS "
+        "Token verifies its HMAC over IV||ciphertext before decrypting, and the "
+        "link stays ACTIVE through every attempt. An impl that decrypts without "
+        "verifying the HMAC would deliver forged link data"
+    ),
+)
+def test_link_data_tamper_silently_dropped(wire_link_setup):
+    # The client is the initiator; the server holds the inbound link and its
+    # packet handler, so the injector runs on the SERVER peer.
+    server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Positive control: a pristine packet IS delivered, link stays ACTIVE.
+    ok = server.inject_tampered_link_data(link_id, b"genuine-link-data", corruption="none")
+    assert ok["unpacked"] is True, f"pristine packet failed to unpack: {ok!r}"
+    assert ok["delivered"] is True, (
+        f"a pristine link DATA packet was not delivered to the handler "
+        f"(positive control): {ok!r}"
+    )
+    assert ok["link_active"] is True, f"link not ACTIVE after a valid packet: {ok!r}"
+
+    # Negatives: each tamper must be dropped (not delivered) and leave the link
+    # ACTIVE (silent drop, not teardown).
+    for corruption in ("ciphertext", "hmac", "truncate"):
+        res = server.inject_tampered_link_data(
+            link_id, b"genuine-link-data", corruption=corruption,
+        )
+        assert res["delivered"] is False, (
+            f"a {corruption}-tampered link DATA packet was DELIVERED — the link "
+            f"layer decrypted without verifying the token HMAC: {res!r}"
+        )
+        assert res["link_active"] is True, (
+            f"a {corruption} tamper tore the link down instead of silently "
+            f"dropping the packet: {res!r}"
+        )

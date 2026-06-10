@@ -2705,6 +2705,273 @@ def cmd_hdlc_escape(params):
     return {'escaped': bytes_to_hex(HDLC.escape(data))}
 
 
+# ---------------------------------------------------------------------------
+# Interface-discovery subsystem (RNS.Discovery) — pure-function KATs.
+#
+# These commands drive the REAL RNS.Discovery announce builder / receiver and
+# the REAL LXMF LXStamper proof-of-work used by on-network interface discovery.
+# Nothing about the msgpack info layout, the flag byte, the stamp, or the
+# address validation is reconstructed here: the announce bytes come straight
+# out of InterfaceAnnouncer.get_interface_announce_data, the receive decision
+# out of InterfaceAnnounceHandler.received_announce, and the stamp out of
+# LXMF.LXStamper. The commands only set up the environmental RNS state the real
+# code reads (Transport.identity, transport_enabled, network_identity,
+# interface_discovery_sources) and split/report the buffers the real code
+# returns.
+# ---------------------------------------------------------------------------
+
+def cmd_discovery_build_announce_appdata(params):
+    """Build interface-discovery announce app_data via the REAL
+    RNS.Discovery.InterfaceAnnouncer.get_interface_announce_data
+    (Discovery.py:96-186).
+
+    A lightweight stand-in interface object (a dynamically-named class so
+    ``type(iface).__name__ == interface_type`` — exactly what RNS keys on)
+    carries the ``discovery_*`` attributes RNS reads. The announce bytes, the
+    msgpack ``info`` dict, the LXStamper proof-of-work stamp and the flag byte
+    are ALL produced by real RNS / real LXMF. This command only splits the
+    returned buffer at ``LXStamper.STAMP_SIZE`` and reports the parts — it
+    assembles no protocol bytes itself.
+    """
+    # Bind to the EXACT RNS module object the announce builder reads through its
+    # own `import RNS` (Discovery.RNS). _get_full_rns() only guarantees the real
+    # (non-stub) RNS is loaded; across a long session its cached handle can
+    # diverge from the live sys.modules['RNS'] that `from RNS import Discovery`
+    # rebinds Discovery.RNS to, so setting transport_enabled / Transport.identity
+    # on the cached handle would be invisible to get_interface_announce_data.
+    _get_full_rns()
+    from RNS import Discovery
+    from LXMF import LXStamper
+    RNS = Discovery.RNS
+
+    interface_type = params['interface_type']
+    fields = params.get('fields') or {}
+    stamp_value = params.get('stamp_value', 14)
+    encrypt = bool(params.get('encrypt', False))
+
+    # Environmental RNS state the announce builder reads: the TRANSPORT field
+    # (Reticulum.transport_enabled()) and the TRANSPORT_ID field
+    # (Transport.identity.hash). Set on real RNS; not reconstructed.
+    transport_enabled = bool(params.get('transport_enabled', False))
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', transport_enabled)
+    if params.get('transport_identity_priv'):
+        RNS.Transport.identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['transport_identity_priv']))
+    elif RNS.Transport.identity is None:
+        RNS.Transport.identity = RNS.Identity()
+
+    net_identity = None
+    if params.get('network_identity_priv'):
+        net_identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['network_identity_priv']))
+
+    class _Owner:
+        def has_network_identity(self_o):
+            return net_identity is not None
+    owner = _Owner()
+    owner.network_identity = net_identity
+    owner.identity = None
+
+    # Real InterfaceAnnouncer, bypassing __init__ (which only builds the
+    # discovery Destination / starts networking we do not need here).
+    announcer = Discovery.InterfaceAnnouncer.__new__(Discovery.InterfaceAnnouncer)
+    announcer.owner = owner
+    announcer.stamp_cache = {}
+    announcer.stamper = LXStamper
+
+    iface = type(interface_type, (), {})()
+    iface.discovery_stamp_value = stamp_value
+    iface.discovery_name = fields.get('name')
+    iface.discovery_latitude = fields.get('latitude')
+    iface.discovery_longitude = fields.get('longitude')
+    iface.discovery_height = fields.get('height')
+    iface.discovery_publish_ifac = bool(fields.get('publish_ifac', False))
+    iface.ifac_netname = fields.get('ifac_netname')
+    iface.ifac_netkey = fields.get('ifac_netkey')
+    iface.discovery_encrypt = encrypt
+    iface.kiss_framing = bool(fields.get('kiss_framing', False))
+    iface.reachable_on = fields.get('reachable_on')
+    iface.bind_port = fields.get('port')
+    iface.connectable = bool(fields.get('connectable', False))
+    iface.b32 = fields.get('b32')
+    iface.frequency = fields.get('frequency')
+    iface.bandwidth = fields.get('bandwidth')
+    iface.sf = fields.get('sf')
+    iface.cr = fields.get('cr')
+    iface.discovery_frequency = fields.get('frequency')
+    iface.discovery_bandwidth = fields.get('bandwidth')
+    iface.discovery_channel = fields.get('channel')
+    iface.discovery_modulation = fields.get('modulation')
+
+    app_data = announcer.get_interface_announce_data(iface)
+    if app_data is None:
+        return {'aborted': True, 'app_data': None}
+
+    stamp_size = LXStamper.STAMP_SIZE
+    flags = app_data[0]
+    packed = app_data[1:-stamp_size]
+    stamp = app_data[-stamp_size:]
+    infohash = RNS.Identity.full_hash(packed)
+    return {
+        'aborted': False,
+        'app_data': bytes_to_hex(app_data),
+        'flags': flags,
+        'packed_info': bytes_to_hex(packed),
+        'stamp': bytes_to_hex(stamp),
+        'infohash': bytes_to_hex(infohash),
+        'stamp_size': stamp_size,
+        'transport_id': bytes_to_hex(RNS.Transport.identity.hash),
+        'transport_enabled': transport_enabled,
+    }
+
+
+def cmd_discovery_receive_announce(params):
+    """Feed an app_data buffer to the REAL
+    RNS.Discovery.InterfaceAnnounceHandler.received_announce
+    (Discovery.py:214-362) and report whether RNS accepted it (callback fired
+    with a populated ``info`` dict) or silently dropped it.
+
+    All the receive-path decisions — minimum length, source allowlist, stamp
+    validity / value threshold, FLAG_ENCRYPTED decrypt, field-type validation,
+    interface-type whitelist — are made by real RNS. This command only sets the
+    environmental state RNS reads and captures the callback.
+    """
+    # Bind to the EXACT RNS module object received_announce reads through its
+    # own `import RNS` (Discovery.RNS) — see cmd_discovery_build_announce_appdata
+    # for why the cached _get_full_rns() handle is not used directly here.
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+
+    app_data = hex_to_bytes(params['app_data'])
+    required_value = params.get('required_value', 14)
+
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled',
+            bool(params.get('transport_enabled', False)))
+
+    if params.get('network_identity_priv'):
+        RNS.Transport.network_identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['network_identity_priv']))
+    else:
+        RNS.Transport.network_identity = None
+
+    sources = params.get('discovery_sources')
+    if sources is None:
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources', [])
+    else:
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+                [hex_to_bytes(s) for s in sources])
+
+    if params.get('announce_identity_priv'):
+        announced = RNS.Identity.from_bytes(
+            hex_to_bytes(params['announce_identity_priv']))
+    else:
+        announced = RNS.Identity()
+
+    if params.get('destination_hash'):
+        dest_hash = hex_to_bytes(params['destination_hash'])
+    else:
+        dest_hash = announced.hash
+
+    captured = {}
+    invoked = {'n': 0, 'info_none': False}
+
+    def _cb(info):
+        invoked['n'] += 1
+        if info is None:
+            invoked['info_none'] = True
+        else:
+            captured.update(info)
+
+    handler = Discovery.InterfaceAnnounceHandler(
+        required_value=required_value, callback=_cb)
+    handler.received_announce(dest_hash, announced, app_data)
+
+    out = {
+        'callback_invoked': invoked['n'] > 0,
+        'callback_info_none': invoked['info_none'],
+        'info_present': bool(captured),
+        'accepted': bool(captured),
+        'announce_identity_hash': bytes_to_hex(announced.hash),
+    }
+    if captured:
+        safe = {}
+        for k, v in captured.items():
+            safe[k] = bytes_to_hex(v) if isinstance(v, bytes) else v
+        out['info'] = safe
+    return out
+
+
+def cmd_discovery_stamp(params):
+    """Expose the LXMF LXStamper proof-of-work primitives used by interface
+    discovery (Discovery.py:172,235-237): stamp_workblock / stamp_value /
+    stamp_valid / generate_stamp. Thin delegation to real LXMF.LXStamper.
+    """
+    from LXMF import LXStamper
+    op = params['op']
+    if op == 'workblock':
+        material = hex_to_bytes(params['material'])
+        rounds = params.get('expand_rounds', 20)
+        wb = LXStamper.stamp_workblock(material, expand_rounds=rounds)
+        return {'workblock': bytes_to_hex(wb), 'length': len(wb)}
+    elif op == 'value':
+        wb = hex_to_bytes(params['workblock'])
+        stamp = hex_to_bytes(params['stamp'])
+        return {'value': LXStamper.stamp_value(wb, stamp)}
+    elif op == 'valid':
+        wb = hex_to_bytes(params['workblock'])
+        stamp = hex_to_bytes(params['stamp'])
+        cost = params['cost']
+        return {'valid': bool(LXStamper.stamp_valid(stamp, cost, wb))}
+    elif op == 'generate':
+        material = hex_to_bytes(params['material'])
+        cost = params['cost']
+        rounds = params.get('expand_rounds', 20)
+        stamp, value = LXStamper.generate_stamp(
+            material, stamp_cost=cost, expand_rounds=rounds)
+        return {
+            'stamp': bytes_to_hex(stamp) if stamp else None,
+            'value': value,
+            'stamp_size': LXStamper.STAMP_SIZE,
+        }
+    else:
+        raise ValueError(f"unknown discovery_stamp op: {op}")
+
+
+def cmd_discovery_validate_address(params):
+    """Expose RNS.Discovery.is_ip_address / is_hostname / is_ygg_ipv6
+    (Discovery.py:769-785). Thin delegation to real RNS.
+    """
+    RNS = _get_full_rns()
+    from RNS import Discovery
+    addr = params['address']
+    out = {
+        'is_ip_address': bool(Discovery.is_ip_address(addr)),
+        'is_ygg_ipv6': bool(Discovery.is_ygg_ipv6(addr)),
+    }
+    try:
+        out['is_hostname'] = bool(Discovery.is_hostname(addr))
+    except Exception:
+        out['is_hostname'] = False
+    return out
+
+
+def cmd_discovery_sanitize_name(params):
+    """Expose RNS interface-name sanitization: the receiver-side
+    InterfaceAnnounceHandler.sanitize_name (Discovery.py:205-212) and the
+    sender-side InterfaceAnnouncer.sanitize newline/CR strip (Discovery.py:89-94).
+    Thin delegation to real RNS.
+    """
+    RNS = _get_full_rns()
+    from RNS import Discovery
+    name = params.get('name')
+    announcer = Discovery.InterfaceAnnouncer.__new__(Discovery.InterfaceAnnouncer)
+    return {
+        'sanitize_name': Discovery.InterfaceAnnounceHandler.sanitize_name(name),
+        'sanitize': announcer.sanitize(name),
+    }
+
+
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -2807,6 +3074,12 @@ COMMANDS = {
     'destination_default_app_data': cmd_destination_default_app_data,
     'destination_register_request_handler_validate': cmd_destination_register_request_handler_validate,
     'destination_path_response_cache': cmd_destination_path_response_cache,
+    # Interface-discovery subsystem (Discovery.py) — pure-function KATs
+    'discovery_build_announce_appdata': cmd_discovery_build_announce_appdata,
+    'discovery_receive_announce': cmd_discovery_receive_announce,
+    'discovery_stamp': cmd_discovery_stamp,
+    'discovery_validate_address': cmd_discovery_validate_address,
+    'discovery_sanitize_name': cmd_discovery_sanitize_name,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

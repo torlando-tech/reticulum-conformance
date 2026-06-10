@@ -2153,6 +2153,269 @@ def cmd_rns_set_proof_strategy(params):
     return {'set': True, 'strategy': strategy_name}
 
 
+# ─── Destination constructor / lifecycle (Destination.py) ────────────
+#
+# These commands drive RNS.Destination directly so the constructor guards,
+# announce()/encrypt()/set_proof_strategy()/rotate_ratchets() validation paths,
+# and the static name-helpers are observable. Everything delegates to real RNS:
+# no wire bytes are assembled here, RNS does all the hashing / signing / packing.
+
+def _resolve_dest_type(RNS, value):
+    """Map a friendly type keyword to the real RNS.Destination type constant,
+    or pass an integer straight through so RNS's own `type in types` guard can
+    reject an out-of-range value."""
+    mapping = {
+        'single': RNS.Destination.SINGLE,
+        'group': RNS.Destination.GROUP,
+        'plain': RNS.Destination.PLAIN,
+        'link': RNS.Destination.LINK,
+    }
+    if isinstance(value, str):
+        return mapping[value]
+    return value
+
+
+def _resolve_dest_direction(RNS, value):
+    """Map a friendly direction keyword to the real RNS.Destination direction
+    constant, or pass an integer through for RNS's own guard to reject."""
+    mapping = {'in': RNS.Destination.IN, 'out': RNS.Destination.OUT}
+    if isinstance(value, str):
+        return mapping[value]
+    return value
+
+
+def _coerce_aspects(value):
+    if isinstance(value, list):
+        return value
+    if value:
+        return value.split(',')
+    return []
+
+
+def _make_destination(RNS, params, default_direction='in', default_type='single'):
+    """Construct a real RNS.Destination from request params, reusing an
+    already-registered destination with the same address (RNS raises KeyError
+    on a duplicate Transport.register_destination, but the conformance bridge
+    is a long-lived process that may construct the same destination across
+    tests). Validation errors (ValueError/TypeError) propagate so the caller
+    surfaces them as a BridgeError."""
+    type_val = _resolve_dest_type(RNS, params.get('type', default_type))
+    dir_val = _resolve_dest_direction(RNS, params.get('direction', default_direction))
+    app_name = params['app_name']
+    aspects = _coerce_aspects(params.get('aspects', []))
+    pk = params.get('identity_private_key')
+    identity = RNS.Identity.from_bytes(hex_to_bytes(pk)) if pk else None
+    try:
+        return RNS.Destination(identity, dir_val, type_val, app_name, *aspects)
+    except KeyError:
+        # Duplicate registration — find and reuse the live destination.
+        if identity is not None and type_val != RNS.Destination.PLAIN:
+            expected = RNS.Destination.hash(identity, app_name, *aspects)
+        else:
+            expected = RNS.Destination.hash(None, app_name, *aspects)
+        for existing in RNS.Transport.destinations:
+            if existing.hash == expected:
+                return existing
+        raise
+
+
+def cmd_destination_construct(params):
+    """Construct a real RNS.Destination and report the address material RNS
+    derived, plus the auto-generated identity for the IN/non-PLAIN/no-identity
+    branch (Destination.__init__ appends `identity.hexhash` as an extra aspect
+    before computing name_hash). Drives the constructor guards directly:
+
+      * OUT + non-PLAIN + no identity -> ValueError
+      * PLAIN + identity -> TypeError
+      * out-of-range type/direction int -> ValueError
+
+    All such errors propagate to the bridge dispatcher as a BridgeError.
+    """
+    RNS = _ensure_minimal_rns()
+    had_identity = bool(params.get('identity_private_key'))
+    dest = _make_destination(RNS, params)
+    result = {
+        'destination_hash': bytes_to_hex(dest.hash),
+        'name': dest.name,
+        'name_hash': bytes_to_hex(dest.name_hash),
+        'proof_strategy': dest.proof_strategy,
+        'type': dest.type,
+        'direction': dest.direction,
+    }
+    # IN, non-PLAIN, no supplied identity: RNS generated one and folded its
+    # hexhash into the aspect list. Report it so a test can assert the auto
+    # aspect is part of the name_hash preimage.
+    if not had_identity and dest.identity is not None:
+        result['auto_identity_hexhash'] = dest.identity.hexhash
+    return result
+
+
+def cmd_destination_announce_attempt(params):
+    """Construct a destination and call announce(send=False). RNS raises
+    TypeError('Only SINGLE destination types can be announced') for
+    GROUP/PLAIN/LINK and TypeError('Only IN destination types can be
+    announced') for OUT — both surface as a BridgeError. A valid IN SINGLE
+    returns ok=True after RNS builds (but does not send) the announce packet.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    dest.announce(send=False)
+    return {'ok': True, 'destination_hash': bytes_to_hex(dest.hash)}
+
+
+def cmd_app_and_aspects_from_name(params):
+    """Delegate to RNS.Destination.app_and_aspects_from_name: split a dotted
+    full name into (app_name, [aspects...]) — the first component is the app
+    name, the rest are aspects."""
+    RNS = _get_full_rns()
+    app_name, aspects = RNS.Destination.app_and_aspects_from_name(params['full_name'])
+    return {'app_name': app_name, 'aspects': list(aspects)}
+
+
+def cmd_hash_from_name_and_identity(params):
+    """Delegate to RNS.Destination.hash_from_name_and_identity: derive the
+    16-byte destination address from a dotted full name + a 16-byte identity
+    hash (RNS splits the name and feeds it through Destination.hash)."""
+    RNS = _get_full_rns()
+    identity_hash = hex_to_bytes(params['identity_hash'])
+    dest_hash = RNS.Destination.hash_from_name_and_identity(
+        params['full_name'], identity_hash
+    )
+    return {'destination_hash': bytes_to_hex(dest_hash)}
+
+
+def cmd_destination_expand_name(params):
+    """Delegate to RNS.Destination.expand_name. With an identity, RNS appends
+    `'.' + identity.hexhash` to the dotted app/aspects join; without one it
+    returns the bare dotted join. Lets a test observe the trailing-identity
+    suffix form that no other command exposes."""
+    RNS = _get_full_rns()
+    app_name = params['app_name']
+    aspects = _coerce_aspects(params.get('aspects', []))
+    pk = params.get('identity_private_key')
+    identity = RNS.Identity.from_bytes(hex_to_bytes(pk)) if pk else None
+    name = RNS.Destination.expand_name(identity, app_name, *aspects)
+    out = {'name': name}
+    if identity is not None:
+        out['identity_hexhash'] = identity.hexhash
+    return out
+
+
+def cmd_destination_set_proof_strategy_raw(params):
+    """Construct a destination and call set_proof_strategy with the raw value
+    so RNS's own validation runs: a strategy not in Destination.proof_strategies
+    raises TypeError('Unsupported proof strategy') -> BridgeError. The three
+    valid strategy constants are accepted and reflected back."""
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    dest.set_proof_strategy(params['strategy_value'])
+    return {'set': True, 'proof_strategy': dest.proof_strategy}
+
+
+def cmd_destination_rotate_ratchets(params):
+    """Construct a destination and call rotate_ratchets(). Without
+    enable_ratchets first, self.ratchets is None and RNS raises
+    SystemError('Cannot rotate ratchet ... ratchets are not enabled') ->
+    BridgeError. With enable=True, RNS initialises a ratchet file and the
+    rotation succeeds."""
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    if params.get('enable'):
+        import tempfile
+        rdir = tempfile.mkdtemp(prefix='rns_dest_ratchets_')
+        dest.enable_ratchets(os.path.join(rdir, 'ratchets.bin'))
+        dest.ratchet_interval = 0
+    rotated = dest.rotate_ratchets()
+    return {'rotated': bool(rotated), 'has_ratchets': dest.ratchets is not None}
+
+
+def cmd_destination_group_encrypt(params):
+    """Construct a GROUP destination and call encrypt(). Without create_keys()
+    the GROUP path has no symmetric Token key and RNS raises ValueError('No
+    private key held by GROUP destination') -> BridgeError. With create_keys
+    RNS generates a key and the encryption succeeds (and round-trips through
+    decrypt)."""
+    RNS = _ensure_minimal_rns()
+    params = dict(params)
+    params['type'] = 'group'
+    params['direction'] = params.get('direction', 'in')
+    dest = _make_destination(RNS, params)
+    if params.get('create_keys'):
+        dest.create_keys()
+    plaintext = hex_to_bytes(params['plaintext'])
+    ciphertext = dest.encrypt(plaintext)
+    roundtrip = dest.decrypt(ciphertext)
+    return {
+        'ciphertext': bytes_to_hex(ciphertext),
+        'roundtrip': bytes_to_hex(roundtrip) if roundtrip is not None else None,
+        'has_key': hasattr(dest, 'prv') and dest.prv is not None,
+    }
+
+
+def cmd_destination_register_request_handler_validate(params):
+    """Construct a destination and call register_request_handler with
+    caller-controlled argument validity so RNS's own checks run:
+
+      * empty/None path -> ValueError('Invalid path specified')
+      * non-callable response_generator -> ValueError('Invalid response generator specified')
+      * allow policy not in request_policies -> ValueError('Invalid request policy')
+
+    All surface as a BridgeError; a fully-valid registration returns ok.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    path = params.get('path', '/test/echo')
+    if params.get('generator_valid', True):
+        def response_generator(p, data, request_id, link_id, remote_identity, requested_at):
+            return data
+        gen = response_generator
+    else:
+        gen = None
+    allow = params.get('allow', RNS.Destination.ALLOW_ALL)
+    dest.register_request_handler(path, response_generator=gen, allow=allow)
+    return {'registered': True, 'handler_count': len(dest.request_handlers)}
+
+
+def cmd_destination_path_response_cache(params):
+    """Drive Destination.announce(path_response=True, tag=...) twice and report
+    whether RNS reused the cached announce_data (path_responses[tag]) on the
+    second call. RNS evicts entries older than PR_TAG_WINDOW seconds at the top
+    of announce(), so pinning the wall-clock advance between the two calls lets
+    a test assert both the cache-hit branch (advance=0 -> identical data) and
+    the eviction branch (advance>PR_TAG_WINDOW -> fresh data rebuilt).
+
+    Time is pinned by patching time.time for the duration of each announce()
+    call, so RNS still does all the real signing/packing — it just sees the
+    wall-clock value we pin. No wire bytes are assembled here.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    tag = hex_to_bytes(params['tag'])
+    advance = float(params.get('advance_seconds', 0))
+    base = 1_000_000.0
+
+    import time as _time
+
+    def announce_at(ts):
+        orig = _time.time
+        _time.time = lambda: float(ts)
+        try:
+            return dest.announce(path_response=True, tag=tag, send=False)
+        finally:
+            _time.time = orig
+
+    p1 = announce_at(base)
+    p2 = announce_at(base + advance)
+    return {
+        'first_announce_data': bytes_to_hex(p1.data),
+        'second_announce_data': bytes_to_hex(p2.data),
+        'reused': p1.data == p2.data,
+        'cache_size': len(dest.path_responses),
+        'pr_tag_window': RNS.Destination.PR_TAG_WINDOW,
+        'first_is_path_response': p1.context == RNS.Packet.PATH_RESPONSE,
+    }
+
+
 def cmd_packet_constants(params):
     """Return the live RNS wire-size / header constants so tests can pin them
     against the spec literals (not against another read of the same value).
@@ -2292,6 +2555,17 @@ COMMANDS = {
     'rns_clear_request_responses': cmd_rns_clear_request_responses,
     # Proof strategy
     'rns_set_proof_strategy': cmd_rns_set_proof_strategy,
+    # Destination constructor / lifecycle (Destination.py)
+    'destination_construct': cmd_destination_construct,
+    'destination_announce_attempt': cmd_destination_announce_attempt,
+    'app_and_aspects_from_name': cmd_app_and_aspects_from_name,
+    'hash_from_name_and_identity': cmd_hash_from_name_and_identity,
+    'destination_expand_name': cmd_destination_expand_name,
+    'destination_set_proof_strategy_raw': cmd_destination_set_proof_strategy_raw,
+    'destination_rotate_ratchets': cmd_destination_rotate_ratchets,
+    'destination_group_encrypt': cmd_destination_group_encrypt,
+    'destination_register_request_handler_validate': cmd_destination_register_request_handler_validate,
+    'destination_path_response_cache': cmd_destination_path_response_cache,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

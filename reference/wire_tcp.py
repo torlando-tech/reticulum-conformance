@@ -4995,6 +4995,164 @@ def cmd_wire_ratchet_file_roundtrip(params):
     }
 
 
+def cmd_wire_identity_ratchet_persist(params):
+    """Persist + reload a RECEIVED ratchet through RNS's IDENTITY-side store
+    and exercise the _clean_ratchets not-in-use housekeeping
+    (Identity._remember_ratchet / get_ratchet / _clean_ratchets,
+    Identity.py:424-522).
+
+    Distinct from wire_ratchet_file_roundtrip, which round-trips a
+    DESTINATION's OWN *signed* ratchet store (Destination._persist_ratchets /
+    _reload_ratchets). This drives the path a RECEIVER uses for ratchets it
+    learned from a peer's announce:
+
+      * _remember_ratchet writes {ratchet, received} (RNS's vendored umsgpack)
+        to {storagepath}/ratchets/{hexhash}.out, then os.replace to the final
+        path — an ATOMIC temp-file write (Identity.py:445-449). The bridge does
+        NOT build or parse that msgpack; RNS writes it. The bridge only inspects
+        the FILE via os.path (final present, .out absent).
+      * get_ratchet loads it back (Identity.py:499-522). To force the on-disk
+        load path, the in-memory known_ratchets cache entry is dropped first
+        (mirroring wire_ratchet_file_roundtrip's `destination.ratchets = None`).
+        A byte-identical reload proves the persisted file round-trips through
+        RNS's OWN writer+reader; RATCHETSIZE//8 (32) is the accepted load size.
+      * _clean_ratchets (Identity.py:460-496) removes a ratchet file whose
+        destination is NOT in known_destinations (the not-in-use branch). The
+        random dest hash here is never announced/registered, so it is absent
+        from known_destinations and its file is removed.
+
+    The RATCHET_EXPIRY back-dating branch (received + 30d, Identity.py:508) is
+    NOT exercised here: RNS's only writer stamps received=time.time() and offers
+    no clock-injection API (documented in LIMITS.md). This command covers the
+    non-expiry persistence rules (atomic write, load round-trip, accepted size,
+    not-in-use cleanup).
+
+    Returns {dest_hash, ratchet_len, file_written, tmp_leftover, reload_match,
+    reloaded_len, accepted_size, cleaned_removed}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    Identity = RNS.Identity
+    # A random, never-announced destination hash: absent from known_destinations
+    # (so _clean_ratchets's not-in-use branch removes its file) AND from
+    # known_ratchets (so _remember_ratchet actually persists rather than skipping
+    # an already-known ratchet).
+    dest_hash = secrets.token_bytes(RNS.Reticulum.TRUNCATED_HASHLENGTH // 8)
+    ratchet = Identity._generate_ratchet()   # 32 genuine RNS ratchet bytes
+
+    ratchetdir = RNS.Reticulum.storagepath + "/ratchets"
+    hexhash = RNS.hexrep(dest_hash, delimit=False)
+    finalpath = f"{ratchetdir}/{hexhash}"
+    outpath = f"{finalpath}.out"
+
+    # RNS writes the file from a daemon thread; poll for it to land.
+    Identity._remember_ratchet(dest_hash, ratchet)
+    deadline = time.time() + 5.0
+    while not os.path.isfile(finalpath) and time.time() < deadline:
+        time.sleep(0.02)
+    file_written = os.path.isfile(finalpath)
+    tmp_leftover = os.path.exists(outpath)
+
+    # Force the on-disk LOAD path: drop the in-memory cache entry, then read back
+    # through RNS's own get_ratchet (which deserializes the file it wrote).
+    Identity.known_ratchets.pop(dest_hash, None)
+    reloaded = Identity.get_ratchet(dest_hash)
+    reload_match = reloaded == ratchet
+    reloaded_len = len(reloaded) if isinstance(reloaded, (bytes, bytearray)) else None
+    accepted_size = int(Identity.RATCHETSIZE // 8)
+
+    # Housekeeping: dest is not in known_destinations -> _clean_ratchets removes
+    # its file (the not-in-use branch, Identity.py:484-489).
+    Identity._clean_ratchets()
+    cleaned_removed = not os.path.isfile(finalpath)
+
+    # Drop the cache entry get_ratchet re-populated so this command leaves no
+    # residual ratchet state on the instance.
+    Identity.known_ratchets.pop(dest_hash, None)
+
+    return {
+        "dest_hash": dest_hash.hex(),
+        "ratchet_len": len(ratchet),
+        "file_written": file_written,
+        "tmp_leftover": tmp_leftover,
+        "reload_match": reload_match,
+        "reloaded_len": reloaded_len,
+        "accepted_size": accepted_size,
+        "cleaned_removed": cleaned_removed,
+    }
+
+
+def cmd_wire_known_destinations_roundtrip(params):
+    """Save -> clear -> reload the on-disk known_destinations table and confirm a
+    previously-known destination round-trips (RNS.Identity.save_known_destinations
+    / load_known_destinations, Identity.py:176-265).
+
+    save_known_destinations serializes the WHOLE known_destinations table (5-element
+    entries [time, packet_hash, public_key, app_data, used_marker]) to
+    {storagepath}/known_destinations via RNS's vendored umsgpack, recombining any
+    on-disk entries absent from memory; load_known_destinations reads it back. The
+    bridge does NOT build or parse that msgpack — RNS writes and reads it. The bridge
+    only delegates and inspects RNS state:
+
+      * snapshots whether `destination_hash` is present before the save,
+      * clears the in-memory table and confirms recall now MISSES (so the reload,
+        not residual memory, is what restores the entry),
+      * reloads from disk and confirms recall HITS again with byte-identical
+        app_data and a 5-element entry (the persisted record shape).
+
+    recall is called with _no_use=True so it neither mutates the used-marker nor
+    routes through Reticulum.get_instance() (avoiding the cached-handle divergence).
+
+    The 16-byte-key-skip and legacy 4->5-element upgrade load branches (Identity.py:
+    251-254) need a hand-built malformed file the delegation policy rejects and are
+    deferred (LIMITS.md).
+
+    Returns {present_before_save, recall_after_clear_found, recall_after_load_found,
+    app_data_after_load, entry_len_after_load, table_size_after_load}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    Identity = RNS.Identity
+    present_before = dest_hash in Identity.known_destinations
+
+    # Persist the whole table to disk through RNS's own serializer.
+    Identity.save_known_destinations()
+
+    # Clear the in-memory table; recall must now miss for this received dest (it is
+    # not locally registered on this peer, so the Transport.destinations fallback
+    # does not resolve it either) — proving the reload below is what restores it.
+    Identity.known_destinations = {}
+    after_clear = Identity.recall(dest_hash, _no_use=True)
+
+    # Reload from disk through RNS's own deserializer.
+    Identity.load_known_destinations()
+    reloaded = Identity.recall(dest_hash, _no_use=True)
+    entry = Identity.known_destinations.get(dest_hash)
+    app_data = reloaded.app_data if reloaded is not None else None
+
+    return {
+        "present_before_save": bool(present_before),
+        "recall_after_clear_found": after_clear is not None,
+        "recall_after_load_found": reloaded is not None,
+        "app_data_after_load": (
+            app_data.hex() if isinstance(app_data, (bytes, bytearray)) else None
+        ),
+        "entry_len_after_load": len(entry) if entry is not None else None,
+        "table_size_after_load": len(Identity.known_destinations),
+    }
+
+
 def cmd_wire_destination_latest_ratchet_id(params):
     """Drive a real Destination.encrypt + Destination.decrypt round-trip on a
     ratchet-enabled SINGLE destination and expose latest_ratchet_id
@@ -8328,6 +8486,8 @@ WIRE_COMMANDS = {
     "wire_rotate_ratchet": cmd_wire_rotate_ratchet,
     "wire_set_retained_ratchets": cmd_wire_set_retained_ratchets,
     "wire_ratchet_file_roundtrip": cmd_wire_ratchet_file_roundtrip,
+    "wire_identity_ratchet_persist": cmd_wire_identity_ratchet_persist,
+    "wire_known_destinations_roundtrip": cmd_wire_known_destinations_roundtrip,
     "wire_destination_latest_ratchet_id": cmd_wire_destination_latest_ratchet_id,
     # Receiver-side ratchet adoption + adoption-driven target-key selection
     "wire_get_adopted_ratchet": cmd_wire_get_adopted_ratchet,

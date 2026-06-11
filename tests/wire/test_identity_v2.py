@@ -1,8 +1,26 @@
-"""Identity known-destinations table semantics — V2 gap closure.
+"""Identity known-destinations / received-ratchet persistence — V2 gap closure.
 
-Two behaviours the prior recall suite leaves untested, both keyed on the
-receiver-side known_destinations table that RNS.Identity.recall reads
-(Identity.py:101-159):
+Four behaviours the prior recall/ratchet suites leave untested. The first two
+key on the receiver-side known_destinations table that RNS.Identity.recall reads
+(Identity.py:101-159); the last two on the IDENTITY-side on-disk stores
+(received-ratchet files and the known_destinations table) round-tripped through
+RNS's own serializer (no bridge-side msgpack):
+
+  * remember-update-refreshes-existing-entry — re-announce updates the recalled
+    app_data in place (test_reannounce_refreshes_recalled_app_data).
+  * recall-local-registered-destination-fallback — recall of a locally-registered
+    destination resolves via Transport.destinations
+    (test_recall_local_registered_destination_fallback).
+  * ratchet-persistence-format — the IDENTITY-side received-ratchet file
+    (_remember_ratchet atomic write -> cold-cache get_ratchet load -> _clean_ratchets
+    not-in-use cleanup); the RATCHET_EXPIRY/size-rejection sub-rules are deferred
+    (LIMITS.md) (test_identity_received_ratchet_persistence).
+  * known-destinations-persistence — the whole-table save/recombine/load round-trip
+    and 5-element record shape; the 16-byte-key-skip / legacy upgrade load branches
+    are deferred (LIMITS.md) (test_known_destinations_save_reload_roundtrip).
+
+The first two, keyed on the receiver-side known_destinations table that
+RNS.Identity.recall reads (Identity.py:101-159):
 
   * remember-update-refreshes-existing-entry — RNS.Identity.remember
     (Identity.py:106-113) UPDATES an existing entry in place when a SECOND
@@ -220,4 +238,174 @@ def test_recall_local_registered_destination_fallback(wire_peers):
     assert server.identity_recall(unknown_hash, timeout_ms=0) is None, (
         f"recall of never-registered {unknown_hash.hex()} returned non-None; the "
         f"fallback must only resolve hashes of actually-registered destinations."
+    )
+
+
+# RATCHETSIZE is 256 bits (RNS spec constant, Identity.py:64); the persisted /
+# accepted ratchet length is therefore exactly 32 bytes. Anchored here as an
+# external literal, independent of whatever the bridge echoes back.
+_RATCHET_BYTES = 32
+
+
+@conformance_case(
+    commands=["start_tcp_server", "identity_ratchet_persist"],
+    verifies=(
+        "IDENTITY-side received-ratchet persistence (RNS.Identity._remember_ratchet "
+        "/ get_ratchet / _clean_ratchets, Identity.py:424-522), the receiver path "
+        "distinct from the DESTINATION's own signed store: (1) _remember_ratchet "
+        "writes the ratchet to a temp '<hash>.out' then os.replace's it to the "
+        "final '<hash>' path (ATOMIC temp-file write, Identity.py:445-449) — the "
+        "final file exists and no '.out' temp is left behind; (2) get_ratchet "
+        "loads the on-disk {ratchet, received} msgpack back BYTE-IDENTICALLY when "
+        "the in-memory cache is cold, and the accepted ratchet length is "
+        "RATCHETSIZE//8 == 32 bytes (Identity.py:508); (3) _clean_ratchets removes "
+        "a ratchet file whose destination is NOT in known_destinations (the "
+        "not-in-use housekeeping branch, Identity.py:484-489). The bridge never "
+        "builds or parses the on-disk msgpack — RNS's own writer+reader round-trip "
+        "it. The RATCHET_EXPIRY (received+30d) back-dating branch needs a "
+        "clock-injection API RNS does not expose and is deferred (LIMITS.md)"
+    ),
+)
+def test_identity_received_ratchet_persistence(wire_peers):
+    """A received ratchet round-trips through RNS's IDENTITY-side on-disk store
+    (atomic write -> cold-cache reload, byte-identical, 32 bytes), and the
+    not-in-use file is cleaned. The bridge only inspects the file via os.path;
+    RNS writes and reads the msgpack.
+    """
+    server, _client = wire_peers
+    # A running instance gives RNS a real storagepath for the ratchets dir.
+    server.start_tcp_server(network_name="", passphrase="")
+
+    res = server.identity_ratchet_persist()
+
+    # (1) Atomic temp-file write: the final ratchet file landed and no '.out'
+    # temp survived the os.replace.
+    assert res["file_written"], (
+        f"_remember_ratchet did not produce the final ratchet file for "
+        f"{res['dest_hash']}; the IDENTITY-side received-ratchet store never "
+        f"persisted (atomic temp-file write path, Identity.py:445-449)."
+    )
+    assert not res["tmp_leftover"], (
+        f"a '.out' temp ratchet file for {res['dest_hash']} survived; the write "
+        f"must os.replace the temp to the final path, leaving no temp behind."
+    )
+
+    # The persisted material is genuine 32-byte (RATCHETSIZE//8) ratchet bytes.
+    assert res["ratchet_len"] == _RATCHET_BYTES, (
+        f"persisted ratchet length is {res['ratchet_len']}, expected "
+        f"{_RATCHET_BYTES} (RATCHETSIZE//8); a wrong size would be rejected on "
+        f"load (Identity.py:508 len==RATCHETSIZE//8 check)."
+    )
+    assert res["accepted_size"] == _RATCHET_BYTES, (
+        f"RNS's accepted-on-load ratchet size is {res['accepted_size']}, expected "
+        f"{_RATCHET_BYTES} (RATCHETSIZE//8)."
+    )
+
+    # (2) Cold-cache load round-trip: get_ratchet read the on-disk msgpack and
+    # returned the SAME 32 bytes _remember_ratchet wrote.
+    assert res["reload_match"], (
+        f"get_ratchet did not reload the persisted ratchet for {res['dest_hash']} "
+        f"byte-identically from disk; the IDENTITY-side {{ratchet, received}} "
+        f"on-disk format did not round-trip through RNS's own writer+reader."
+    )
+    assert res["reloaded_len"] == _RATCHET_BYTES, (
+        f"reloaded ratchet length is {res['reloaded_len']}, expected "
+        f"{_RATCHET_BYTES}."
+    )
+
+    # (3) _clean_ratchets not-in-use housekeeping: the random dest hash is absent
+    # from known_destinations, so its ratchet file is removed.
+    assert res["cleaned_removed"], (
+        f"_clean_ratchets left the ratchet file for {res['dest_hash']} in place; "
+        f"a file whose destination is not in known_destinations must be removed "
+        f"(not-in-use branch, Identity.py:484-489)."
+    )
+
+
+# known_destinations entries are 5-element records [time, packet_hash,
+# public_key, app_data, used_marker] (RNS spec, Identity.py:107). Anchored as an
+# external literal.
+_KNOWN_DEST_ENTRY_ELEMENTS = 5
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "announce", "poll_path",
+        "identity_recall", "known_destinations_roundtrip",
+    ],
+    verifies=(
+        "On-disk known_destinations persistence (RNS.Identity.save_known_destinations "
+        "/ load_known_destinations, Identity.py:176-265): after B receives an "
+        "announce carrying app_data, B saves the table to "
+        "{storagepath}/known_destinations (whole-table umsgpack, recombining disk "
+        "entries), CLEARS its in-memory table — recall then MISSES (the received "
+        "dest is not locally registered, so the Transport.destinations fallback "
+        "cannot resolve it) — and RELOADS from disk: recall HITS again with "
+        "byte-identical app_data and a 5-element entry [time, packet_hash, "
+        "public_key, app_data, used_marker]. The bridge never builds or parses the "
+        "on-disk msgpack — RNS's own writer+reader round-trip it. An impl whose "
+        "save/load drops or reshapes the record would fail the reload or the entry "
+        "shape. (The 16-byte-key-skip and legacy 4->5-element upgrade load branches "
+        "need a hand-built malformed file and are deferred, LIMITS.md.)"
+    ),
+)
+def test_known_destinations_save_reload_roundtrip(wire_peers):
+    """B persists, clears, and reloads its known_destinations table; a received
+    destination survives the disk round-trip byte-identically as a 5-element
+    record. The clear proving the reload (not residual memory) restores it.
+    """
+    server, client = wire_peers
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="", passphrase="",
+        target_host="127.0.0.1", target_port=port,
+    )
+
+    dest_hash = server.announce(
+        app_name=_APP, aspects=_ASPECTS, app_data=_APP_DATA_A,
+    )
+    assert client.poll_path(dest_hash, timeout_ms=_POLL_TIMEOUT_MS), (
+        f"{client.role_label} never learned a path to {dest_hash.hex()} — the "
+        f"announce was not received, so there is nothing to persist."
+    )
+    # Make sure the entry is genuinely in B's known_destinations before saving.
+    pre = client.identity_recall(dest_hash, timeout_ms=_POLL_TIMEOUT_MS)
+    assert pre is not None and pre["app_data"] == _APP_DATA_A, (
+        f"{client.role_label} did not learn the announced app_data for "
+        f"{dest_hash.hex()} before the persistence round-trip: {pre!r}."
+    )
+
+    rt = client.known_destinations_roundtrip(dest_hash)
+
+    assert rt["present_before_save"], (
+        f"{dest_hash.hex()} was not in {client.role_label}'s known_destinations "
+        f"before the save — the received announce never populated the table."
+    )
+    # The clear must actually empty the entry: recall misses on the cleared table.
+    # This proves the reload (not leftover memory) is what restores it below.
+    assert not rt["recall_after_clear_found"], (
+        f"after clearing the in-memory table, recall of {dest_hash.hex()} still "
+        f"found an entry — the clear did not take, so the reload assertion would "
+        f"not prove on-disk persistence."
+    )
+    # The reload from disk restores the entry.
+    assert rt["recall_after_load_found"], (
+        f"after reloading known_destinations from disk, recall of {dest_hash.hex()} "
+        f"missed — save/load did not persist the received destination."
+    )
+    # Byte-identical app_data survived the umsgpack round-trip.
+    app_after = (
+        bytes.fromhex(rt["app_data_after_load"])
+        if rt["app_data_after_load"] is not None else None
+    )
+    assert app_after == _APP_DATA_A, (
+        f"reloaded app_data for {dest_hash.hex()} is {app_after!r}, expected "
+        f"{_APP_DATA_A!r}; the on-disk record garbled the app_data field."
+    )
+    # The persisted record is the canonical 5-element shape.
+    assert rt["entry_len_after_load"] == _KNOWN_DEST_ENTRY_ELEMENTS, (
+        f"reloaded known_destinations entry for {dest_hash.hex()} has "
+        f"{rt['entry_len_after_load']} elements, expected "
+        f"{_KNOWN_DEST_ENTRY_ELEMENTS} [time, packet_hash, public_key, app_data, "
+        f"used_marker]."
     )

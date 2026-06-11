@@ -1946,6 +1946,46 @@ class _WirePeer:
             destination_hash=destination_hash.hex(),
         )
 
+    def identity_ratchet_persist(self) -> dict:
+        """Persist + reload a RECEIVED ratchet through RNS's IDENTITY-side
+        store, then run the _clean_ratchets not-in-use housekeeping
+        (wire_identity_ratchet_persist -> RNS.Identity._remember_ratchet /
+        get_ratchet / _clean_ratchets, Identity.py:424-522).
+
+        Distinct from ratchet_file_roundtrip (the DESTINATION-side signed store).
+        The bridge generates a genuine 32-byte ratchet, lets RNS persist it as
+        {ratchet, received} via the atomic temp-file write, drops the in-memory
+        cache to force the on-disk load, reads it back through get_ratchet, then
+        cleans it (the random dest hash is not in known_destinations). Returns
+        {dest_hash, ratchet_len, file_written, tmp_leftover, reload_match,
+        reloaded_len, accepted_size, cleaned_removed}. The bridge never builds or
+        parses the on-disk msgpack — RNS's own writer+reader round-trip it.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_identity_ratchet_persist",
+            handle=self.handle,
+        )
+
+    def known_destinations_roundtrip(self, destination_hash: bytes) -> dict:
+        """Save -> clear -> reload this peer's on-disk known_destinations table
+        and report whether `destination_hash` round-trips
+        (wire_known_destinations_roundtrip -> RNS.Identity.save_known_destinations
+        / load_known_destinations, Identity.py:176-265).
+
+        The bridge persists the whole table via RNS's own serializer, clears the
+        in-memory table (recall then misses), reloads from disk (recall hits
+        again). The bridge never builds or parses the on-disk msgpack. Returns
+        {present_before_save, recall_after_clear_found, recall_after_load_found,
+        app_data_after_load, entry_len_after_load, table_size_after_load}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_known_destinations_roundtrip",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
     # --- PROOF emission for a single (non-link) packet --------------------
 
     def send_packet_with_proof_request(

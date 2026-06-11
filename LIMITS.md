@@ -41,6 +41,19 @@ interface instance):
 
 - **channel_buffer**: `receiver-proves-channel-packets`, `tx-window-enforcement`, `window-rate-upgrade-fast`
 - **discovery_resolver**: `discovery-record-persistence-format`
+- **identity**: `ratchet-expiry-30d` (the `RATCHET_EXPIRY` received+30d discard needs a
+  back-dated received-ratchet file; RNS's only writer, `Identity._remember_ratchet`,
+  stamps `received = time.time()` and exposes no clock-injection API — the real-timing
+  ceiling). The *non-expiry* IDENTITY-side ratchet persistence (atomic temp-file write,
+  cold-cache `get_ratchet` load round-trip, `_clean_ratchets` not-in-use cleanup) and the
+  whole-table `known_destinations` save/recombine/load round-trip + 5-element record shape
+  ARE covered (`test_identity_received_ratchet_persistence`,
+  `test_known_destinations_save_reload_roundtrip`); only these load-time *rejection* sub-rules
+  remain deferred for the same reason: `ratchet-persistence-format`'s expiry + malformed-size
+  (`len != RATCHETSIZE//8`) branches and `known-destinations-persistence`'s 16-byte-key-skip /
+  legacy 4->5-element upgrade branches each require a hand-built malformed on-disk file, which
+  the delegation policy rejects. `known-destinations-pruning` is in-memory `_retain`/`_used`
+  table hygiene — local-only, no wire-observable hook.
 - **interfaces**: `announce-queue-ordering`, `auto-discovery-token-format-validation-reject`, `auto-mcast-group-derivation`, `backbone-wire-equivalence`, `ingress-limit-path-requests`, `local-client-ingress-exempt`, `local-origin-announce-bypass`, `spawned-announce-cap-default`
 - **link**: `mtu-clamp-in-transport`, `proof-hops-check`, `rtt-packet-handling`, `transport-lrproof-relay-validation`
 - **reticulum_config**: `announce-cap-default-and-queueing`, `announce-rate-limiting`, `hw-mtu-autoconfigure-tiers`, `ifac-recompute-per-hop`, `ingress-control-announce-hold`, `shared-instance-defaults`

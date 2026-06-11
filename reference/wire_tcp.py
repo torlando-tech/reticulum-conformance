@@ -3722,6 +3722,15 @@ def cmd_wire_channel_window(params):
         # The uncapped outlet (link) MDU the ME_TOO_BIG guard actually compares
         # against (Channel.send checks len(raw) > outlet.mdu, NOT channel.mdu).
         "outlet_mdu": int(ch._outlet.mdu),
+        # Number of registered message handlers (Channel._message_callbacks) —
+        # observable for the post-shutdown "handlers cleared" rule (Channel.
+        # _shutdown clears the callback list, Channel.py:374-377).
+        "message_handlers": len(ch._message_callbacks),
+        # Rate-promotion round counters (Channel._packet_tx_op, Channel.py:511-
+        # 530) — the medium/fast-rate window upgrade fires when one reaches
+        # FAST_RATE_THRESHOLD while the matching RTT band holds.
+        "medium_rate_rounds": int(ch.medium_rate_rounds),
+        "fast_rate_rounds": int(ch.fast_rate_rounds),
     }
 
 
@@ -4055,6 +4064,299 @@ def cmd_wire_channel_envelope_pack(params):
     envelope = Envelope(outlet=None, message=_PackMessage(data), sequence=sequence)
     raw = envelope.pack()
     return {"raw": raw.hex(), "sequence": int(envelope.sequence)}
+
+
+def cmd_wire_link_set_rtt(params):
+    """Set a live RNS.Link's measured `rtt` to a chosen value.
+
+    LinkChannelOutlet.rtt is a property returning `self.link.rtt`
+    (Channel.py:686-688), and Channel._packet_tx_op reads `self._outlet.rtt`
+    live on every delivered envelope to drive the medium/fast rate-promotion
+    bands (Channel.py:511-530). Loopback RTT is ~1 ms (far below RTT_FAST), so
+    the medium band (RTT_FAST < rtt <= RTT_MEDIUM) is otherwise unreachable;
+    setting link.rtt into that band lets a sequence of real, genuinely-delivered
+    channel_send calls exercise RNS's OWN promotion logic. Only the rate
+    arithmetic is affected — proofs still round-trip in ~1 ms on loopback. The
+    value is a real RNS attribute, not a reconstructed quantity. Returns the new
+    and previous rtt.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    rtt = float(params["rtt"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    previous = link.rtt
+    link.rtt = rtt
+    return {
+        "rtt": float(link.rtt),
+        "previous": (float(previous) if previous is not None else None),
+    }
+
+
+def cmd_wire_channel_profile(params):
+    """Report the initial flow-control window a REAL RNS.Channel selects for a
+    given link RTT (Channel.__init__ profile gate, Channel.py:297-308).
+
+    Constructs a THROWAWAY real `RNS.Channel` over a real `LinkChannelOutlet`
+    wrapping the established link, with `link.rtt` temporarily set to the
+    requested value (restored before returning, so the live channel is
+    untouched). The window profile is chosen entirely by RNS: rtt > RTT_SLOW
+    (1.45) yields the degenerate all-1 profile (window/min/max/flexibility all
+    1), otherwise the standard profile (2 / WINDOW_MIN 2 / WINDOW_MAX_SLOW 5 /
+    WINDOW_FLEXIBILITY 4). Loopback RTT can never exceed RTT_SLOW, so the
+    degenerate branch is unreachable without this hook. Returns the live
+    RNS.Channel.RTT_SLOW for an external-literal cross-check.
+    """
+    RNS = _get_rns()
+    from RNS.Channel import Channel, LinkChannelOutlet
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    rtt = float(params["rtt"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    saved_rtt = link.rtt
+    try:
+        link.rtt = rtt
+        outlet = LinkChannelOutlet(link)
+        channel = Channel(outlet)
+        return {
+            "rtt": float(outlet.rtt),
+            "window": int(channel.window),
+            "window_min": int(channel.window_min),
+            "window_max": int(channel.window_max),
+            "window_flexibility": int(channel.window_flexibility),
+            "rtt_slow": float(Channel.RTT_SLOW),
+        }
+    finally:
+        link.rtt = saved_rtt
+
+
+def cmd_wire_channel_timeout_formula(params):
+    """Compute a REAL RNS.Channel retransmit timeout via Channel.
+    _get_packet_timeout_time (Channel.py:545-547) for chosen inputs.
+
+    Builds a THROWAWAY real `RNS.Channel` over a real `LinkChannelOutlet`, sets
+    the link's rtt to the requested value (restored after), and pads the
+    channel's tx ring with `ring_depth` real `Envelope` placeholders so
+    `len(self._tx_ring)` matches. Then returns the value RNS's own
+    `_get_packet_timeout_time(tries)` produces — i.e.
+    `pow(1.5, tries-1) * max(rtt*2.5, 0.025) * (ring_depth + 1.5)`, computed
+    INSIDE RNS. The test re-derives that expression independently and asserts
+    equality (the exponential 1.5^(tries-1) backoff, the 25 ms floor, and the
+    tx-ring scaling), with no wall-clock scheduling involved.
+    """
+    RNS = _get_rns()
+    from RNS.Channel import Channel, LinkChannelOutlet, Envelope
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    rtt = float(params["rtt"])
+    tries = int(params["tries"])
+    ring_depth = int(params.get("ring_depth", 0))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    saved_rtt = link.rtt
+    try:
+        link.rtt = rtt
+        outlet = LinkChannelOutlet(link)
+        channel = Channel(outlet)
+        for i in range(ring_depth):
+            channel._tx_ring.append(Envelope(outlet=outlet, sequence=i))
+        timeout = channel._get_packet_timeout_time(tries)
+        return {
+            "timeout": float(timeout),
+            "rtt": float(outlet.rtt),
+            "tries": tries,
+            "ring_depth": len(channel._tx_ring),
+        }
+    finally:
+        link.rtt = saved_rtt
+
+
+def cmd_wire_channel_handler_chain(params):
+    """Drive RNS.Channel._run_callbacks over an ORDERED, observable handler chain
+    (Channel._run_callbacks, Channel.py:415-422).
+
+    Registers, in order, one handler per entry of `handlers` (each "false",
+    "true", or "raise") onto a THROWAWAY real `RNS.Channel`; every handler
+    appends its registration index to a shared log when invoked, then returns
+    True/False or raises. A single real `Envelope` (sequence 0) is fed to the
+    live `Channel._receive`, so RNS's own dispatch loop runs the chain. Returns
+    the fire log (which handlers ran, in order) — pinning: handlers run in
+    registration order; a handler returning True STOPS the chain (later handlers
+    do not fire); a handler that RAISES is caught and dispatch CONTINUES to the
+    next handler. The throwaway channel carries only these handlers (no recording
+    handler shadows them).
+    """
+    RNS = _get_rns()
+    from RNS.Channel import Channel, LinkChannelOutlet, Envelope, MessageBase
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    specs = list(params["handlers"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    outlet = LinkChannelOutlet(link)
+    channel = Channel(outlet)
+
+    class _ChainMessage(MessageBase):
+        MSGTYPE = 0x0707
+
+        def __init__(self, data=b""):
+            self.data = bytes(data)
+
+        def pack(self):
+            return self.data
+
+        def unpack(self, raw):
+            self.data = bytes(raw)
+
+    channel.register_message_type(_ChainMessage)
+
+    log = []
+
+    def _make(index, behavior):
+        def _handler(message):
+            log.append(index)
+            if behavior == "raise":
+                raise RuntimeError(f"handler {index} deliberate error")
+            return behavior == "true"
+
+        return _handler
+
+    for index, behavior in enumerate(specs):
+        channel.add_message_handler(_make(index, behavior))
+
+    message = _ChainMessage(b"chain-probe")
+    envelope = Envelope(outlet=outlet, message=message, sequence=0)
+    raw = envelope.pack()
+    channel._receive(raw)
+
+    return {
+        "log": list(log),
+        "next_rx_sequence": int(channel._next_rx_sequence),
+        "handler_count": len(channel._message_callbacks),
+    }
+
+
+def cmd_wire_channel_spurious_proof(params):
+    """Re-fire a delivered packet's proof/timeout callbacks to exercise RNS's
+    spurious-message and stale-timeout guards (Channel._packet_tx_op /
+    _packet_timeout, Channel.py:490-568).
+
+    Performs a GENUINE delivered channel send over the established link, waits
+    for the proof to remove the envelope from the tx ring (and grow the window),
+    then:
+      (a) re-invokes channel._packet_delivered(packet) for the already-delivered
+          (ring-removed) packet — _packet_tx_op finds no matching envelope and
+          logs "Spurious message received"; the window must NOT grow;
+      (b) re-invokes channel._packet_timeout(packet) on the same DELIVERED packet
+          — the MSGSTATE_DELIVERED guard early-returns, no teardown;
+      (c) invokes channel._packet_timeout / _packet_delivered for a genuine
+          never-tracked RNS.Packet — the envelope-is-None early return, no
+          teardown, no crash.
+    Every callback is a real RNS method on a real Channel; the bridge only
+    re-delivers a genuine packet. Returns window snapshots, link status, and any
+    raised exceptions (must be empty).
+    """
+    RNS = _get_rns()
+    from RNS.Channel import MessageState
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    timeout_ms = int(params.get("timeout_ms", 12000))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+    msgclass = _get_channel_message_class()
+
+    deadline = time.time() + timeout_ms / 1000.0
+    while not channel.is_ready_to_send() and time.time() < deadline:
+        time.sleep(0.02)
+    envelope = channel.send(msgclass(b"genuine-proof"))
+
+    def _delivered():
+        pkt = getattr(envelope, "packet", None)
+        if pkt is None:
+            return False
+        try:
+            return channel._outlet.get_packet_state(pkt) == MessageState.MSGSTATE_DELIVERED
+        except Exception:
+            return False
+
+    while time.time() < deadline and not _delivered():
+        time.sleep(0.02)
+    # Wait for the delivery callback to remove the envelope (and grow window).
+    settle = time.time() + 3.0
+    while time.time() < settle and envelope in channel._tx_ring:
+        time.sleep(0.02)
+
+    window_before = int(channel.window)
+    tx_ring_before = len(channel._tx_ring)
+    errors = []
+
+    # (a) duplicate/late proof on the already-delivered packet.
+    try:
+        channel._packet_delivered(envelope.packet)
+    except Exception as e:
+        errors.append(f"duplicate_proof: {e}")
+    window_after_duplicate = int(channel.window)
+
+    # (b) late timeout on the DELIVERED packet (MSGSTATE_DELIVERED guard).
+    try:
+        channel._packet_timeout(envelope.packet)
+    except Exception as e:
+        errors.append(f"timeout_delivered: {e}")
+
+    # (c) timeout/proof for a never-tracked packet (envelope-is-None branch).
+    untracked = RNS.Packet(link, b"untracked-probe", context=RNS.Packet.CHANNEL)
+    try:
+        channel._packet_timeout(untracked)
+    except Exception as e:
+        errors.append(f"timeout_untracked: {e}")
+    try:
+        channel._packet_delivered(untracked)
+    except Exception as e:
+        errors.append(f"proof_untracked: {e}")
+
+    return {
+        "delivered": _delivered(),
+        "window_before": window_before,
+        "window_after_duplicate": window_after_duplicate,
+        "window_final": int(channel.window),
+        "tx_ring_before": tx_ring_before,
+        "tx_ring_final": len(channel._tx_ring),
+        "link_status": int(getattr(link, "status", -1)),
+        "link_closed": getattr(link, "status", None) == RNS.Link.CLOSED,
+        "errors": errors,
+    }
 
 
 def cmd_wire_buffer_pack(params):
@@ -8466,6 +8768,13 @@ WIRE_COMMANDS = {
     "wire_listener_proof_log": cmd_wire_listener_proof_log,
     "wire_listener_channel_rx": cmd_wire_listener_channel_rx,
     "wire_channel_envelope_pack": cmd_wire_channel_envelope_pack,
+    # Channel window-profile / timeout-formula / handler-chain / spurious-proof
+    # observation (V2 gap closure)
+    "wire_link_set_rtt": cmd_wire_link_set_rtt,
+    "wire_channel_profile": cmd_wire_channel_profile,
+    "wire_channel_timeout_formula": cmd_wire_channel_timeout_formula,
+    "wire_channel_handler_chain": cmd_wire_channel_handler_chain,
+    "wire_channel_spurious_proof": cmd_wire_channel_spurious_proof,
     "wire_buffer_pack": cmd_wire_buffer_pack,
     # Buffer (RawChannelReader/Writer) streaming
     "wire_buffer_stream": cmd_wire_buffer_stream,

@@ -1395,6 +1395,79 @@ class _WirePeer:
             params["msgtype"] = int(msgtype)
         return self.bridge.execute("wire_channel_send", **params)
 
+    def link_set_rtt(self, link_id: bytes, rtt: float) -> dict:
+        """Set a live RNS.Link's measured rtt (LinkChannelOutlet.rtt reads it
+        live). Lets a sequence of real delivered channel_send calls drive the
+        Channel medium/fast rate-promotion bands that loopback RTT can't reach.
+        Returns {rtt, previous}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_set_rtt",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+        )
+
+    def channel_profile(self, link_id: bytes, rtt: float) -> dict:
+        """Report the initial window a REAL RNS.Channel selects for `rtt`
+        (Channel.__init__ profile gate). Returns {rtt, window, window_min,
+        window_max, window_flexibility, rtt_slow} read off a throwaway real
+        Channel; the live channel is untouched (link.rtt restored).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_profile",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+        )
+
+    def channel_timeout_formula(
+        self, link_id: bytes, rtt: float, tries: int, ring_depth: int = 0
+    ) -> dict:
+        """Compute Channel._get_packet_timeout_time(tries) on a throwaway real
+        Channel with the given rtt and tx-ring depth. Returns {timeout, rtt,
+        tries, ring_depth} — the value RNS's own formula produced.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_timeout_formula",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+            tries=int(tries),
+            ring_depth=int(ring_depth),
+        )
+
+    def channel_handler_chain(self, link_id: bytes, handlers: list) -> dict:
+        """Drive Channel._run_callbacks over an ordered handler chain. `handlers`
+        is a list of "true"/"false"/"raise" describing each registered handler's
+        behaviour. Returns {log, next_rx_sequence, handler_count} — `log` is the
+        registration index of every handler that fired, in fire order.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_handler_chain",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            handlers=list(handlers),
+        )
+
+    def channel_spurious_proof(self, link_id: bytes, timeout_ms: int = 12000) -> dict:
+        """Perform a genuine delivered channel send, then re-fire the delivered
+        packet's proof/timeout callbacks (and a never-tracked packet's) to
+        exercise RNS's spurious-message / stale-timeout guards. Returns window
+        snapshots, link status, and any raised exceptions.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_spurious_proof",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+
     # --- Buffer / RawChannelReader / RawChannelWriter streaming -----------
 
     def buffer_stream(

@@ -2868,6 +2868,27 @@ def cmd_packet_context_constants(params):
     }
 
 
+def cmd_announce_queue_constants(params):
+    """Return the live RNS announce-bandwidth / per-interface egress-queue
+    constants so a test can pin them against the documented spec literals (not
+    against another read of the same value).
+
+    Every field is read straight off real RNS.Reticulum.* — no value is
+    reconstructed here. These govern the 2% default announce bandwidth cap
+    (ANNOUNCE_CAP), the per-interface queue depth ceiling before announces are
+    dropped (MAX_QUEUED_ANNOUNCES, Transport.py:1262 / Interface.process_announce_queue),
+    and how long a queued announce survives before it is purged as stale
+    (QUEUED_ANNOUNCE_LIFE, Interface.py:332). The conformance test asserts each
+    against its documented literal (16384, 86400 == 24h, 2)."""
+    RNS = _get_full_rns()
+    R = RNS.Reticulum
+    return {
+        'announce_cap': int(R.ANNOUNCE_CAP),
+        'max_queued_announces': int(R.MAX_QUEUED_ANNOUNCES),
+        'queued_announce_life': int(R.QUEUED_ANNOUNCE_LIFE),
+    }
+
+
 def cmd_identity_random_hash(params):
     """Return one RNS.Identity.get_random_hash() value (hex).
 
@@ -3135,6 +3156,26 @@ def cmd_discovery_stamp(params):
             'stamp': bytes_to_hex(stamp) if stamp else None,
             'value': value,
             'stamp_size': LXStamper.STAMP_SIZE,
+        }
+    elif op == 'default_cost':
+        # Read the impl's OWN documented default proof-of-work cost for
+        # interface-discovery announce stamps straight off real RNS
+        # (Discovery.py:34, InterfaceAnnouncer.DEFAULT_STAMP_VALUE). The
+        # receiver-side InterfaceAnnounceHandler defaults its required_value to
+        # the SAME constant (Discovery.py:192), so we surface both — read
+        # directly off the class attribute and off the real constructor
+        # signature default — so a test can pin that the cost the receiver
+        # enforces by default == the cost the sender targets by default,
+        # against the documented literal 14.
+        import inspect as _inspect
+        from RNS import Discovery
+        ia_default = int(Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE)
+        handler_default = _inspect.signature(
+            Discovery.InterfaceAnnounceHandler.__init__
+        ).parameters['required_value'].default
+        return {
+            'default_stamp_value': ia_default,
+            'handler_default_required_value': int(handler_default),
         }
     else:
         raise ValueError(f"unknown discovery_stamp op: {op}")
@@ -3817,6 +3858,7 @@ COMMANDS = {
     'packet_hash': cmd_packet_hash,
     'packet_constants': cmd_packet_constants,
     'packet_context_constants': cmd_packet_context_constants,
+    'announce_queue_constants': cmd_announce_queue_constants,
     'packet_build_raw_header2': cmd_packet_build_raw_header2,
     'packet_resend_observe': cmd_packet_resend_observe,
     'identity_random_hash': cmd_identity_random_hash,

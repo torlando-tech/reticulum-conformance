@@ -2815,6 +2815,45 @@ def cmd_packet_constants(params):
     }
 
 
+def cmd_packet_context_constants(params):
+    """Return the live RNS.Packet context-byte code points so a test can pin each
+    named context against its spec literal (not against another read of the same
+    value).
+
+    Every value is read straight off real RNS.Packet.* — no byte is reconstructed.
+    These are the assignments at RNS/Packet.py:72-92; the conformance test asserts
+    each against its documented literal (e.g. COMMAND == 0x0C), which together with
+    a packet_build that places the byte on the wire byte-pins the whole context
+    code-point table — including the link-control (LINKIDENTIFY/LINKCLOSE/LINKPROOF)
+    and resource (RESOURCE_HMU/ICL/RCL) and command (COMMAND/COMMAND_STATUS) codes
+    that the protocol otherwise only implies through interop.
+    """
+    RNS = _get_full_rns()
+    P = RNS.Packet
+    return {
+        'NONE': int(P.NONE),
+        'RESOURCE': int(P.RESOURCE),
+        'RESOURCE_ADV': int(P.RESOURCE_ADV),
+        'RESOURCE_REQ': int(P.RESOURCE_REQ),
+        'RESOURCE_HMU': int(P.RESOURCE_HMU),
+        'RESOURCE_PRF': int(P.RESOURCE_PRF),
+        'RESOURCE_ICL': int(P.RESOURCE_ICL),
+        'RESOURCE_RCL': int(P.RESOURCE_RCL),
+        'CACHE_REQUEST': int(P.CACHE_REQUEST),
+        'RESPONSE': int(P.RESPONSE),
+        'PATH_RESPONSE': int(P.PATH_RESPONSE),
+        'COMMAND': int(P.COMMAND),
+        'COMMAND_STATUS': int(P.COMMAND_STATUS),
+        'CHANNEL': int(P.CHANNEL),
+        'KEEPALIVE': int(P.KEEPALIVE),
+        'LINKIDENTIFY': int(P.LINKIDENTIFY),
+        'LINKCLOSE': int(P.LINKCLOSE),
+        'LINKPROOF': int(P.LINKPROOF),
+        'LRRTT': int(P.LRRTT),
+        'LRPROOF': int(P.LRPROOF),
+    }
+
+
 def cmd_identity_random_hash(params):
     """Return one RNS.Identity.get_random_hash() value (hex).
 
@@ -3519,6 +3558,7 @@ COMMANDS = {
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
     'packet_constants': cmd_packet_constants,
+    'packet_context_constants': cmd_packet_context_constants,
     'packet_build_raw_header2': cmd_packet_build_raw_header2,
     'packet_resend_observe': cmd_packet_resend_observe,
     'identity_random_hash': cmd_identity_random_hash,

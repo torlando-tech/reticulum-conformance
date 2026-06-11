@@ -7923,12 +7923,19 @@ def cmd_wire_packet_receipt_generation(params):
     the 0xFA-0xFF band is exercised here via its non-link-only packable members
     (e.g. KEEPALIVE 0xFA, LRRTT 0xFE).
 
-    Returns {dest_type, context, sent, has_receipt, create_receipt_flag}.
+    packet_type: int (default DATA). The gate's FIRST clause requires the packet
+    to be DATA (Transport.py:1097); pass ANNOUNCE / LINKREQUEST / PROOF to confirm
+    a non-DATA packet gets no receipt even on a SINGLE destination with a
+    non-special context and a real transmit.
+
+    Returns {dest_type, context, packet_type, sent, has_receipt,
+    create_receipt_flag}.
     """
     RNS = _get_rns()
     handle = params["handle"]
     dest_type = str(params.get("dest_type", "single")).lower()
     context = int(params.get("context", RNS.Packet.NONE))
+    packet_type = int(params.get("packet_type", RNS.Packet.DATA))
     with _instances_lock:
         inst = _instances.get(handle)
     if inst is None:
@@ -7949,7 +7956,8 @@ def cmd_wire_packet_receipt_generation(params):
         raise ValueError(f"dest_type must be 'single' or 'plain' (got {dest_type!r})")
 
     packet = RNS.Packet(
-        destination, secrets.token_bytes(12), context=context, create_receipt=True,
+        destination, secrets.token_bytes(12), packet_type=packet_type,
+        context=context, create_receipt=True,
     )
     packet.send()
     # Give Transport.outbound's packet_sent a moment to run on the live instance.
@@ -7959,10 +7967,81 @@ def cmd_wire_packet_receipt_generation(params):
     return {
         "dest_type": dest_type,
         "context": context,
+        "packet_type": packet_type,
         "sent": bool(getattr(packet, "sent", False)),
         "has_receipt": getattr(packet, "receipt", None) is not None,
         "create_receipt_flag": bool(getattr(packet, "create_receipt", False)),
     }
+
+
+def cmd_wire_packet_receipt_timeout(params):
+    """Build a real RNS.PacketReceipt for a SINGLE (non-link) destination on a
+    live instance and report its computed .timeout plus the constituents RNS
+    derived it from, then optionally drive check_timeout after forcing the
+    timeout so the CULLED(timeout==-1)/FAILED transition can be pinned.
+
+    The non-link receipt timeout is RNS.Reticulum.get_instance().
+    get_first_hop_timeout(dest) + Packet.TIMEOUT_PER_HOP * Transport.hops_to(dest)
+    (Packet.py:433-434). For a fresh, path-less destination on a standalone
+    instance that is get_first_hop_timeout == DEFAULT_PER_HOP_TIMEOUT (no learned
+    latency) and hops_to == PATHFINDER_M (path unknown), so the test can pin the
+    whole value against the spec literals DEFAULT_PER_HOP_TIMEOUT(6) +
+    TIMEOUT_PER_HOP(6) * PATHFINDER_M(128). Nothing is recomputed in the bridge:
+    timeout / status / the constituents are read straight off real RNS.
+
+    force_timeout (optional): if present, the receipt's timeout is set to this
+    value via PacketReceipt.set_timeout, its sent_at is back-dated so it is
+    already timed out, and check_timeout() is run — surfacing the resulting status
+    (CULLED for -1, FAILED otherwise) so the timeout==-1 branch is pinned.
+
+    Returns {timeout, status, is_link, default_per_hop_timeout, timeout_per_hop,
+    pathfinder_m, hops_to, first_hop_timeout, is_connected_to_shared,
+    status_sent, ...} plus (when forced) {forced_timeout, forced_status,
+    status_culled, status_failed}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "receipt-timeout",
+    )
+    packet = RNS.Packet(destination, secrets.token_bytes(12), create_receipt=True)
+    packet.pack()
+    receipt = RNS.PacketReceipt(packet)
+
+    instance = RNS.Reticulum.get_instance()
+    result = {
+        "timeout": receipt.timeout,
+        "status": int(receipt.status),
+        "is_link": destination.type == RNS.Destination.LINK,
+        "default_per_hop_timeout": int(RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT),
+        "timeout_per_hop": int(RNS.Packet.TIMEOUT_PER_HOP),
+        "pathfinder_m": int(RNS.Transport.PATHFINDER_M),
+        "hops_to": int(RNS.Transport.hops_to(destination.hash)),
+        "first_hop_timeout": instance.get_first_hop_timeout(destination.hash),
+        "is_connected_to_shared": bool(instance.is_connected_to_shared_instance),
+        "status_sent": int(RNS.PacketReceipt.SENT),
+    }
+
+    if "force_timeout" in params and params["force_timeout"] is not None:
+        receipt.set_timeout(float(params["force_timeout"]))
+        # Back-date sent_at well into the past so is_timed_out() is True for any
+        # finite/sentinel timeout, isolating the CULLED-vs-FAILED branch from any
+        # real wall-clock wait.
+        receipt.sent_at = receipt.sent_at - 100000.0
+        receipt.check_timeout()
+        result["forced_timeout"] = receipt.timeout
+        result["forced_status"] = int(receipt.status)
+        result["status_culled"] = int(RNS.PacketReceipt.CULLED)
+        result["status_failed"] = int(RNS.PacketReceipt.FAILED)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -8277,6 +8356,7 @@ WIRE_COMMANDS = {
     "wire_inject_crafted_link_proof": cmd_wire_inject_crafted_link_proof,
     "wire_inject_single_proof_format": cmd_wire_inject_single_proof_format,
     "wire_packet_receipt_generation": cmd_wire_packet_receipt_generation,
+    "wire_packet_receipt_timeout": cmd_wire_packet_receipt_timeout,
     # Link establishment internals (request-payload layout / signalling-byte
     # encoding / LINKREQUEST size+mode validation / accept gate / key purge /
     # closed-link drop)

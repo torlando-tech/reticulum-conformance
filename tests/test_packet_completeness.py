@@ -180,7 +180,10 @@ def test_packet_destination_type_codes(sut, reference):
         "returns unpacked=True with context echoed back, and mutating ONLY the context "
         "byte of a real frame leaves every other decoded field unchanged — proving the "
         "context lives at exactly that offset and an impl that rejects unknown contexts "
-        "at parse time fails"
+        "at parse time fails. The unknown-context acceptance is checked on BOTH impls' "
+        "parsers (the forward-compatibility behavior is symmetric), so an impl that "
+        "rejects an unassigned context byte at parse time fails regardless of which "
+        "side built the frame"
     ),
 )
 def test_packet_context_byte_offset_and_unknown_acceptance(sut, reference):
@@ -209,40 +212,45 @@ def test_packet_context_byte_offset_and_unknown_acceptance(sut, reference):
         assert raw[_HEADER_1_SIZE - 1] == context, (
             f"context byte not at wire offset {_HEADER_1_SIZE - 1} for 0x{context:02x}"
         )
-        # The OTHER impl structurally accepts the (possibly unassigned) context.
-        parsed = reference.execute("packet_unpack", raw=raw.hex())
-        assert parsed["unpacked"] is True, (
-            f"unpack REJECTED context=0x{context:02x} — unknown context codes must "
-            f"be accepted structurally, got {parsed}"
-        )
-        assert parsed["context"] == context, (
-            f"unpack echoed context {parsed['context']} != 0x{context:02x}"
-        )
+        # BOTH parsers structurally accept the (possibly unassigned) context — the
+        # forward-compatibility behavior is symmetric, so feed the same frame to the
+        # SUT's parser AND the reference's, not just the other side.
+        for parser, who in ((sut, "sut"), (reference, "reference")):
+            parsed = parser.execute("packet_unpack", raw=raw.hex())
+            assert parsed["unpacked"] is True, (
+                f"{who} unpack REJECTED context=0x{context:02x} — unknown context "
+                f"codes must be accepted structurally, got {parsed}"
+            )
+            assert parsed["context"] == context, (
+                f"{who} unpack echoed context {parsed['context']} != 0x{context:02x}"
+            )
 
     # Discriminating offset check: starting from a real frame, mutating ONLY the
-    # context byte changes the decoded context and nothing else.
+    # context byte changes the decoded context and nothing else — checked on BOTH
+    # parsers.
     base = sut.execute(
         "packet_build",
         dest_type="plain", packet_type=_PTYPE_DATA,
         context=0x00, context_flag=0, hops=1, data=payload,
     )
-    pristine = reference.execute("packet_unpack", raw=base["raw"])
-    # Both an unassigned mid value and the reserved 0xFF (LRPROOF) code point are
-    # accepted structurally by unpack and touch only the context field.
-    for ctx in (0x7E, 0xFF):
-        raw = bytearray(bytes.fromhex(base["raw"]))
-        raw[_HEADER_1_SIZE - 1] = ctx
-        mutated = reference.execute("packet_unpack", raw=bytes(raw).hex())
-        assert mutated["unpacked"] is True and mutated["context"] == ctx, (
-            f"unpack rejected/garbled context 0x{ctx:02x}: {mutated}"
-        )
-        for field in ("flags", "hops", "destination_hash", "data",
-                      "destination_type", "packet_type", "header_type"):
-            assert mutated[field] == pristine[field], (
-                f"flipping the context byte to 0x{ctx:02x} also changed decoded "
-                f"field {field!r} ({mutated[field]!r} != {pristine[field]!r}) — "
-                f"context offset wrong"
+    for parser, who in ((sut, "sut"), (reference, "reference")):
+        pristine = parser.execute("packet_unpack", raw=base["raw"])
+        # Both an unassigned mid value and the reserved 0xFF (LRPROOF) code point are
+        # accepted structurally by unpack and touch only the context field.
+        for ctx in (0x7E, 0xFF):
+            raw = bytearray(bytes.fromhex(base["raw"]))
+            raw[_HEADER_1_SIZE - 1] = ctx
+            mutated = parser.execute("packet_unpack", raw=bytes(raw).hex())
+            assert mutated["unpacked"] is True and mutated["context"] == ctx, (
+                f"{who} unpack rejected/garbled context 0x{ctx:02x}: {mutated}"
             )
+            for field in ("flags", "hops", "destination_hash", "data",
+                          "destination_type", "packet_type", "header_type"):
+                assert mutated[field] == pristine[field], (
+                    f"{who}: flipping the context byte to 0x{ctx:02x} also changed "
+                    f"decoded field {field!r} ({mutated[field]!r} != "
+                    f"{pristine[field]!r}) — context offset wrong"
+                )
 
 
 @conformance_case(

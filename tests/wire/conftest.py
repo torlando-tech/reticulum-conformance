@@ -2404,17 +2404,37 @@ class _WirePeer:
 
     def packet_receipt_generation(
         self, dest_type: str = "single", context: int = 0,
+        packet_type: int | None = None,
     ) -> dict:
         """Report whether RNS actually creates a PacketReceipt for a packet of the
-        given dest_type ('single'|'plain') / context, with create_receipt=True
-        (the Transport.outbound generate_receipt gate). Sends a real packet out
-        this peer's interface and reads packet.receipt straight off RNS. Returns
-        {dest_type, context, sent, has_receipt, create_receipt_flag}."""
+        given dest_type ('single'|'plain') / context / packet_type, with
+        create_receipt=True (the Transport.outbound generate_receipt gate). Sends a
+        real packet out this peer's interface and reads packet.receipt straight off
+        RNS. packet_type (int, default DATA) lets a test drive the gate's first
+        clause (only DATA packets get receipts) by passing ANNOUNCE/LINKREQUEST/
+        PROOF. Returns {dest_type, context, packet_type, sent, has_receipt,
+        create_receipt_flag}."""
         assert self.handle, "start_* must be called first"
-        return self.bridge.execute(
-            "wire_packet_receipt_generation",
+        params = dict(
             handle=self.handle, dest_type=dest_type, context=int(context),
         )
+        if packet_type is not None:
+            params["packet_type"] = int(packet_type)
+        return self.bridge.execute("wire_packet_receipt_generation", **params)
+
+    def packet_receipt_timeout(self, force_timeout: float | None = None) -> dict:
+        """Build a real PacketReceipt for a fresh SINGLE (non-link) destination on
+        this peer's live instance and read back its computed .timeout plus the
+        constituents RNS derived it from (get_first_hop_timeout, hops_to,
+        DEFAULT_PER_HOP_TIMEOUT, TIMEOUT_PER_HOP, PATHFINDER_M). With force_timeout
+        set, the receipt's timeout is overridden and check_timeout() run so the
+        CULLED(timeout==-1)/FAILED transition is observable. Returns the bridge
+        dict verbatim."""
+        assert self.handle, "start_* must be called first"
+        params = dict(handle=self.handle)
+        if force_timeout is not None:
+            params["force_timeout"] = float(force_timeout)
+        return self.bridge.execute("wire_packet_receipt_timeout", **params)
 
     def link_request_payload(
         self, app_name: str = "conformance", aspects: list | None = None,

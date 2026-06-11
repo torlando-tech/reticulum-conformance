@@ -2427,6 +2427,72 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(),
         )
 
+    def resource_request_next_content(self, link_id: bytes, variant: str) -> dict:
+        """Receiver-side RESOURCE_REQ content: drive the real
+        Resource.request_next and capture the genuine request plaintext (variant
+        initial / after_parts / exhausted), reporting {window, requested,
+        expected, exhausted, waiting_for_hmu, second_request_emitted}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_request_next_content",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_late_after_cancel(self, link_id: bytes) -> dict:
+        """FAILED-resource late-packet guard: cancel a real receiver and sender,
+        then feed late genuine part/HMU (receiver) and request/proof (sender)
+        through the real entry points, reporting the before/after observations
+        plus a pre-cancel positive control."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_late_after_cancel",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_part_count_derivation(self, link_id: bytes) -> dict:
+        """Part-count derivation: feed an advertisement with a TAMPERED adv.n to
+        the real Resource.accept and report {receiver_total_parts,
+        derived_expected, adv_n_genuine, adv_n_tampered, sender_parts,
+        transfer_size, receiver_sdu} — the receiver must derive ceil(t/sdu) and
+        ignore the bogus n."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_part_count_derivation",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_decompress_limit(self, link_id: bytes) -> dict:
+        """Decompression-bomb ceiling: read a live Resource's
+        max_decompressed_size / auto_compress_limit and the class
+        AUTO_COMPRESS_MAX_SIZE off real RNS."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_decompress_limit",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_window_inheritance(self, link_id: bytes) -> dict:
+        """Window inheritance: drive a first inbound transfer to COMPLETE, then a
+        second Resource.accept on the same link; report {default_window,
+        window_after_complete, link_last_window, window2_initial, completed_1,
+        total_parts_1} — the second receiver must inherit the recorded window."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_window_inheritance",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_progress(self, link_id: bytes) -> dict:
+        """Transfer-progress contract: feed half a transfer's in-order parts to a
+        real receiver and report {total_parts, fed, received_count,
+        progress_initial, progress_mid, progress_callback_calls} from the real
+        Resource.get_progress / progress callback."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_progress",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
     def resource_receiver_proof_count(self, link_id: bytes) -> dict:
         """Per-part proof suppression: count proofs as parts arrive and assert
         exactly one is emitted after assembly. Reports {proofs_before_final,

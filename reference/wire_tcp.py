@@ -6217,8 +6217,18 @@ def cmd_wire_inject_crafted_resource_part(params):
                         hashmap, so it MUST be accepted (positive control).
       forged_map_hash — random part data, whose map hash is not in the hashmap;
                         must be DROPPED (not inserted).
+      beyond_window   — a GENUINE part whose index lies OUTSIDE the current
+                        request window hashmap[cch:cch+window] (Resource.py:
+                        863-872 only scans that slice). Even though its map hash
+                        IS in the hashmap, it falls beyond the scanned window and
+                        MUST be dropped — a receiver that scanned the whole
+                        hashmap would wrongly accept it out of order.
+      duplicate_filled— the sender's own first part fed TWICE: the second
+                        delivery hits an already-filled slot (parts[i] != None,
+                        Resource.py:873) and MUST NOT re-insert / double-count.
 
     Returns {variant, accepted, parts_before, parts_after, total_parts}.
+    For beyond_window/duplicate_filled also: {window, received_count_after}.
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -6232,6 +6242,61 @@ def cmd_wire_inject_crafted_resource_part(params):
     if link is None:
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
 
+    def _received(resource):
+        return sum(1 for part in resource.parts if part is not None)
+
+    if variant in ("beyond_window", "duplicate_filled"):
+        # Build a multi-part (>window) single-segment receiver so the window
+        # boundary is well inside the part list. The watchdog is disabled during
+        # accept (and per-instance below) so the inbound state stays inspectable.
+        sender, receiver, _adv = _build_resource_receiver(
+            RNS, link, payload_len=1500, force_sdu=200
+        )
+        if receiver is None:
+            raise ValueError("Resource.accept did not produce a receiver")
+        receiver.watchdog_job = lambda: None
+        window = int(receiver.window)
+        if len(receiver.parts) <= window + 1:
+            raise ValueError(
+                f"need >{window+1} parts for window-bound test, got {len(receiver.parts)}"
+            )
+        parts_before = _received(receiver)
+
+        if variant == "beyond_window":
+            # cch == -1 -> the scan window is hashmap[0:window]. Part index
+            # `window` (the first part PAST that window) has a genuine map hash
+            # in the hashmap but outside the scanned slice -> must be ignored.
+            rx = _link_rx_packet(
+                RNS, link, sender.parts[window].data, RNS.Packet.RESOURCE
+            )
+            receiver.receive_part(rx)
+        else:  # duplicate_filled
+            rx0 = _link_rx_packet(
+                RNS, link, sender.parts[0].data, RNS.Packet.RESOURCE
+            )
+            receiver.receive_part(rx0)  # fills slot 0
+            parts_before = _received(receiver)  # baseline AFTER the first insert
+            rx0b = _link_rx_packet(
+                RNS, link, sender.parts[0].data, RNS.Packet.RESOURCE
+            )
+            receiver.receive_part(rx0b)  # duplicate into the filled slot
+
+        parts_after = _received(receiver)
+        out = {
+            "variant": variant,
+            "accepted": parts_after > parts_before,
+            "parts_before": parts_before,
+            "parts_after": parts_after,
+            "total_parts": len(receiver.parts),
+            "window": window,
+            "received_count_after": int(receiver.received_count),
+        }
+        try:
+            receiver.cancel()
+        except Exception:
+            pass
+        return out
+
     sender = RNS.Resource(secrets.token_bytes(2000), link, advertise=False)
     advertisement = RNS.ResourceAdvertisement(sender)
     adv_plaintext = advertisement.pack()
@@ -6242,9 +6307,6 @@ def cmd_wire_inject_crafted_resource_part(params):
     adv_packet.plaintext = adv_plaintext
     adv_packet.link = link
     receiver = RNS.Resource.accept(adv_packet)
-
-    def _received(resource):
-        return sum(1 for part in resource.parts if part is not None)
 
     parts_before = _received(receiver)
 
@@ -6370,6 +6432,25 @@ def cmd_wire_resource_constants(params):
         "MAX_ADV_RETRIES": int(RNS.Resource.MAX_ADV_RETRIES),
         "HASHMAP_IS_EXHAUSTED": int(RNS.Resource.HASHMAP_IS_EXHAUSTED),
         "HASHMAP_IS_NOT_EXHAUSTED": int(RNS.Resource.HASHMAP_IS_NOT_EXHAUSTED),
+        # Window-adaptation profile: the inbound start cap (WINDOW_MAX_SLOW),
+        # the very-slow and fast caps the rate logic promotes/demotes to, the
+        # flexibility band, and the rate thresholds + round budgets that gate
+        # those promotions (Resource.py:64-99 / 850-924). Every value is the
+        # class attribute the live state machine reads.
+        "WINDOW_MAX_SLOW": int(RNS.Resource.WINDOW_MAX_SLOW),
+        "WINDOW_MAX_VERY_SLOW": int(RNS.Resource.WINDOW_MAX_VERY_SLOW),
+        "WINDOW_MAX_FAST": int(RNS.Resource.WINDOW_MAX_FAST),
+        "WINDOW_FLEXIBILITY": int(RNS.Resource.WINDOW_FLEXIBILITY),
+        "FAST_RATE_THRESHOLD": int(RNS.Resource.FAST_RATE_THRESHOLD),
+        "VERY_SLOW_RATE_THRESHOLD": int(RNS.Resource.VERY_SLOW_RATE_THRESHOLD),
+        "RATE_FAST": float(RNS.Resource.RATE_FAST),
+        "RATE_VERY_SLOW": float(RNS.Resource.RATE_VERY_SLOW),
+        "PART_TIMEOUT_FACTOR": int(RNS.Resource.PART_TIMEOUT_FACTOR),
+        "PART_TIMEOUT_FACTOR_AFTER_RTT": int(RNS.Resource.PART_TIMEOUT_FACTOR_AFTER_RTT),
+        "PROOF_TIMEOUT_FACTOR": int(RNS.Resource.PROOF_TIMEOUT_FACTOR),
+        # Decompression-bomb guard ceiling: the bounded BZ2Decompressor.decompress
+        # max_length default (Resource.py:124/364-365). 64 MiB.
+        "AUTO_COMPRESS_MAX_SIZE": int(RNS.Resource.AUTO_COMPRESS_MAX_SIZE),
     }
 
 
@@ -6457,6 +6538,53 @@ def cmd_wire_inject_crafted_resource_request(params):
             "variant": variant,
             "cancelled": status == RNS.Resource.FAILED,
             "status": int(status) if status is not None else None,
+            "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        }
+        try:
+            sender.cancel()
+        except Exception:
+            pass
+        return out
+
+    elif variant == "aligned_scope":
+        # Scope-advance read-back: a sender serving an aligned HMU request whose
+        # resolved part index is the segment-2 boundary (148 = 2*HASHMAP_MAX_LEN)
+        # advances its search scope: receiver_min_consecutive_height =
+        # max(part_index-1-WINDOW_MAX, 0) (Resource.py:1038). For part_index 148
+        # that is max(148-1-75, 0) = 72 — a NON-zero advance, so very large
+        # transfers keep resolving requests against a sliding scope instead of
+        # rescanning from 0. An impl that never advanced the scope (stuck at 0)
+        # would still pass every small-transfer test; pin the formula here.
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        link.mtu = 50 + overhead
+        try:
+            sender = RNS.Resource(secrets.token_bytes(9000), link, advertise=False)
+        finally:
+            link.mtu = saved_mtu
+        if len(sender.parts) < 148:
+            raise ValueError(
+                f"need >=148 parts for scope-advance test, got {len(sender.parts)}"
+            )
+        sender.adv_sent = time.time()
+        sender.status = RNS.Resource.TRANSFERRING
+
+        scope_before = int(sender.receiver_min_consecutive_height)
+        exhausted = RNS.Resource.HASHMAP_IS_EXHAUSTED.to_bytes(1, "big")
+        # part 147 is the last part of segment 2's hashmap -> resolves to
+        # part_index 148, a 74-aligned boundary (no sequencing-error cancel).
+        last_map_hash = sender.parts[147].map_hash  # genuine RNS bytes
+        request_data = exhausted + last_map_hash + sender.hash
+
+        sender.request(request_data)
+        status = getattr(sender, "status", None)
+        out = {
+            "variant": variant,
+            "part_index": 148,
+            "window_max": int(RNS.Resource.WINDOW_MAX),
+            "scope_before": scope_before,
+            "scope_after": int(sender.receiver_min_consecutive_height),
+            "cancelled": status == RNS.Resource.FAILED,
             "status_name": _RESOURCE_STATUS_NAMES.get(status),
         }
         try:
@@ -7154,6 +7282,528 @@ def cmd_wire_resource_receiver_proof_count(params):
         "proofs_after_assembly": proof_calls["n"],
         "status_name": _RESOURCE_STATUS_NAMES.get(status),
         "complete": status == RNS.Resource.COMPLETE,
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_resource_request_next_content(params):
+    """Receiver-side RESOURCE_REQ CONTENT (Resource.request_next, Resource.py:
+    931-980).
+
+    A receiver requesting more parts emits a RESOURCE_REQ whose plaintext is
+    [exhausted_flag(1)] [last_map_hash(4) iff exhausted] [resource hash(32)]
+    [requested map hashes...]. request_next scans parts[cch+1 : cch+1+window] for
+    still-missing slots, appends self.hashmap[pn] for each (so the requested
+    hashes are EXACTLY the genuine hashmap entries starting at cch+1), requests at
+    most `window` of them, and — the moment it reaches a slot whose hashmap entry
+    is still None (an un-arrived hashmap segment) — sets the EXHAUSTED flag,
+    appends hashmap[hashmap_height-1] as the last-known map hash, flips
+    waiting_for_hmu True and stops. While waiting_for_hmu a further request_next
+    emits NOTHING (Resource.py:937). An impl that requested the wrong hashes, more
+    than window, started off cch+1, or kept requesting past the segment edge would
+    desynchronise the windowed handshake.
+
+    Self-contained: builds a real sender + receiver (via Resource.accept), drives
+    the REAL request_next, and captures the genuine request plaintext by reading
+    each outbound RESOURCE_REQ packet's own .data attribute (RNS's own bytes) via
+    a temporary wrapper around RNS.Packet.send (the real send still runs). No
+    request bytes are hand-assembled. Variants:
+
+      initial   — fresh receiver (cch == -1): the first request asks for
+                  hashmap[0:window], NOT exhausted, waiting_for_hmu False.
+      after_parts — feed 2 in-order parts first (cch advances to 1): the request
+                  starts at hashmap[2], proving the scan anchors on cch+1.
+      exhausted — a multi-segment receiver fed up to the loaded-segment edge: the
+                  request hits the first None hashmap slot, sets the EXHAUSTED
+                  flag + waiting_for_hmu, and a follow-up request_next emits
+                  nothing.
+
+    Returns {variant, window, total_parts, hashmap_height, requested,
+    expected, exhausted, waiting_for_hmu, second_request_emitted}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    variant = params["variant"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    hashlen = RNS.Identity.HASHLENGTH // 8
+    maphash_len = RNS.Resource.MAPHASH_LEN
+    exhausted_marker = RNS.Resource.HASHMAP_IS_EXHAUSTED
+
+    def _parse_request(req_data):
+        # Split a genuine request plaintext into its requested map-hash list.
+        flag = req_data[0]
+        is_exhausted = flag == exhausted_marker
+        pad = 1 + (maphash_len if is_exhausted else 0) + hashlen
+        body = req_data[pad:]
+        hashes = [body[i * maphash_len:(i + 1) * maphash_len].hex()
+                  for i in range(len(body) // maphash_len)]
+        return is_exhausted, hashes
+
+    if variant == "exhausted":
+        sender, receiver, _adv = _build_resource_receiver(
+            RNS, link, payload_len=14000, force_sdu=150
+        )
+    else:
+        sender, receiver, _adv = _build_resource_receiver(
+            RNS, link, payload_len=1500, force_sdu=200
+        )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    receiver.watchdog_job = lambda: None  # keep the inbound state inspectable
+
+    seg_len = RNS.ResourceAdvertisement.HASHMAP_MAX_LEN
+
+    # Feed in-order parts to position the consecutive-completed pointer. accept
+    # already fired one request_next (via hashmap_update), so receive_part would
+    # itself re-request whenever a window drains; suppress the INTERNAL re-request
+    # during the feed (instance no-op, mirrors the watchdog disable) so the feed
+    # only POSITIONS the pointer — the REAL request_next is restored and driven
+    # explicitly afterwards, and the capture below sees only that one.
+    if variant == "after_parts":
+        feed = 2
+    elif variant == "exhausted":
+        # Advance cch to seg_len-2 so the next window straddles the loaded-segment
+        # edge (hashmap[seg_len-1] present, hashmap[seg_len] still None).
+        feed = seg_len - 1
+    else:
+        feed = 0
+    if variant == "exhausted" and len(receiver.parts) <= seg_len:
+        raise ValueError(
+            f"need a multi-segment transfer (>{seg_len} parts), got {len(receiver.parts)}"
+        )
+    receiver.request_next = lambda: None  # suppress internal re-request only
+    for i in range(feed):
+        rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+        receiver.receive_part(rx)
+    del receiver.request_next  # restore the REAL Resource.request_next
+
+    window = int(receiver.window)
+    cch = int(receiver.consecutive_completed_height)
+    # Genuine expected hashes: the hashmap entries the scan should request,
+    # starting at cch+1, skipping any None (un-arrived) slot.
+    expected = []
+    pn = cch + 1
+    while pn < len(receiver.hashmap) and len(expected) < window:
+        h = receiver.hashmap[pn]
+        if h is None:
+            break
+        expected.append(h.hex())
+        pn += 1
+
+    captured = []
+    orig_send = RNS.Packet.send
+
+    def _capturing_send(self):
+        if getattr(self, "context", None) == RNS.Packet.RESOURCE_REQ:
+            captured.append(self.data)
+        return orig_send(self)
+
+    RNS.Packet.send = _capturing_send
+    try:
+        receiver.request_next()
+        first_count = len(captured)
+        waiting = bool(receiver.waiting_for_hmu)
+        # A follow-up request must emit nothing while waiting_for_hmu is set.
+        receiver.request_next()
+        second_emitted = len(captured) > first_count
+    finally:
+        RNS.Packet.send = orig_send
+
+    if not captured:
+        raise ValueError("request_next emitted no RESOURCE_REQ packet")
+    is_exhausted, requested = _parse_request(captured[0])
+
+    out = {
+        "variant": variant,
+        "window": window,
+        "total_parts": len(receiver.parts),
+        "hashmap_height": int(receiver.hashmap_height),
+        "consecutive_height": cch,
+        "requested": requested,
+        "expected": expected,
+        "exhausted": bool(is_exhausted),
+        "waiting_for_hmu": waiting,
+        "second_request_emitted": bool(second_emitted),
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_resource_late_after_cancel(params):
+    """A FAILED (cancelled) Resource ignores every late packet (Resource.py:
+    492/783/857/984 — each entry point is guarded by `if not self.status ==
+    Resource.FAILED`).
+
+    After Resource.cancel sets status FAILED, a stale in-flight part, hashmap
+    update, part-request or proof that arrives late must be a no-op: a receiver
+    must not resurrect and insert a part or grow its hashmap; a sender must not
+    serve parts or conclude COMPLETE on a late proof. An impl missing those guards
+    would conclude or mutate a transfer the application already abandoned.
+
+    Self-contained, all real RNS:
+      RECEIVER — build a real >74-part receiver (via Resource.accept), cancel it,
+        then feed (a) a genuine RESOURCE part via receive_part and (b) a genuine
+        later hashmap segment via hashmap_update; assert received_count and
+        hashmap_height are unchanged.
+      SENDER — build a real multi-part sender, prime it TRANSFERRING, cancel it,
+        then feed (a) a genuine serve-all RESOURCE_REQ via request and (b) a
+        genuine valid proof via validate_proof; assert sent_parts unchanged and
+        status stays FAILED (never COMPLETE). A separate fresh sender validates
+        the SAME proof shape pre-cancel as a positive control (proves the proof
+        WOULD have concluded an un-cancelled sender).
+
+    Returns a dict of the before/after observations for each path.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    seg_len = RNS.ResourceAdvertisement.HASHMAP_MAX_LEN
+    maphash_len = RNS.Resource.MAPHASH_LEN
+
+    # ---- RECEIVER path ----
+    rsender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=12000, force_sdu=150
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    receiver.watchdog_job = lambda: None
+    if len(receiver.parts) <= seg_len:
+        raise ValueError(f"need >{seg_len} parts, got {len(receiver.parts)}")
+
+    receiver.cancel()
+    recv_status = _RESOURCE_STATUS_NAMES.get(getattr(receiver, "status", None))
+    recv_received_before = int(receiver.received_count)
+    recv_height_before = int(receiver.hashmap_height)
+
+    # Late genuine part.
+    rx = _link_rx_packet(RNS, link, rsender.parts[0].data, RNS.Packet.RESOURCE)
+    receiver.receive_part(rx)
+    recv_received_after_part = int(receiver.received_count)
+
+    # Late genuine hashmap segment (segment 1 slice of the sender's own hashmap).
+    start = seg_len * maphash_len
+    end = min(2 * seg_len, len(rsender.parts)) * maphash_len
+    receiver.hashmap_update(1, rsender.hashmap[start:end])
+    recv_height_after_hmu = int(receiver.hashmap_height)
+
+    # ---- SENDER path ----
+    overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+    saved_mtu = link.mtu
+    link.mtu = 200 + overhead
+    try:
+        sender = RNS.Resource(secrets.token_bytes(1500), link, advertise=False)
+    finally:
+        link.mtu = saved_mtu
+    sender.adv_sent = time.time()
+    sender.status = RNS.Resource.TRANSFERRING
+    sender.cancel()
+    send_status = _RESOURCE_STATUS_NAMES.get(getattr(sender, "status", None))
+    send_sent_before = int(getattr(sender, "sent_parts", 0))
+
+    # Late serve-all request.
+    not_exhausted = RNS.Resource.HASHMAP_IS_NOT_EXHAUSTED.to_bytes(1, "big")
+    request_data = not_exhausted + sender.hash + sender.hashmap
+    sender.request(request_data)
+    send_sent_after_request = int(getattr(sender, "sent_parts", 0))
+
+    # Late valid proof: second half must equal expected_proof (Resource.py:785).
+    # Build it from genuine RNS bytes (random prefix + the resource's own
+    # expected_proof); arithmetic concat keeps it a real artifact, not assembly.
+    proof_data = secrets.token_bytes(RNS.Identity.HASHLENGTH // 8) + sender.expected_proof
+    sender.validate_proof(proof_data)
+    send_status_after_proof = _RESOURCE_STATUS_NAMES.get(getattr(sender, "status", None))
+
+    # Positive control: a FRESH sender accepts the same proof shape pre-cancel.
+    link.mtu = 200 + overhead
+    try:
+        ctl = RNS.Resource(secrets.token_bytes(1500), link, advertise=False)
+    finally:
+        link.mtu = saved_mtu
+    ctl.adv_sent = time.time()
+    ctl.status = RNS.Resource.AWAITING_PROOF
+    ctl_proof = secrets.token_bytes(RNS.Identity.HASHLENGTH // 8) + ctl.expected_proof
+    ctl.validate_proof(ctl_proof)
+    ctl_status = _RESOURCE_STATUS_NAMES.get(getattr(ctl, "status", None))
+
+    for r in (receiver, sender, ctl):
+        try:
+            r.cancel()
+        except Exception:
+            pass
+
+    return {
+        "receiver_status": recv_status,
+        "receiver_received_before": recv_received_before,
+        "receiver_received_after_late_part": recv_received_after_part,
+        "receiver_height_before": recv_height_before,
+        "receiver_height_after_late_hmu": recv_height_after_hmu,
+        "sender_status": send_status,
+        "sender_sent_before": send_sent_before,
+        "sender_sent_after_late_request": send_sent_after_request,
+        "sender_status_after_late_proof": send_status_after_proof,
+        "control_status_after_proof": ctl_status,
+    }
+
+
+def cmd_wire_resource_part_count_derivation(params):
+    """A receiver DERIVES the part count from the transfer size, not from any
+    advertised part-count field (Resource.accept, Resource.py:187):
+    total_parts = ceil(adv.t / sdu), where sdu is the receiver's OWN link SDU.
+    The advertisement also carries n = len(parts) (Resource.py:301), but accept
+    never reads it. An impl that trusted adv.n could be handed a wrong count and
+    build a mis-sized parts list, desynchronising indexing.
+
+    Self-contained: build a real sender (force_sdu so the two ends agree on the
+    SDU), produce its GENUINE ResourceAdvertisement, then TAMPER only the adv.n
+    field on the advertisement object and re-pack with the REAL
+    ResourceAdvertisement.pack(). Drive the tampered advertisement through the
+    real Resource.accept and read the receiver's total_parts: it must equal
+    ceil(t/sdu) == the sender's true part count, and must IGNORE the bogus n.
+
+    Returns {sender_parts, adv_n_genuine, adv_n_tampered, transfer_size,
+    receiver_sdu, receiver_total_parts, derived_expected}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+    saved_mtu = link.mtu
+    link.mtu = 200 + overhead
+    saved_watchdog = RNS.Resource.watchdog_job
+    RNS.Resource.watchdog_job = lambda self: None
+    try:
+        sender = RNS.Resource(secrets.token_bytes(1500), link, advertise=False)
+        adv = RNS.ResourceAdvertisement(sender)
+        adv_n_genuine = int(adv.n)
+        transfer_size = int(adv.t)
+        # Tamper ONLY the part-count field, then let RNS pack the advertisement.
+        adv.n = adv_n_genuine + 5
+        adv_plaintext = adv.pack()
+        adv_packet = RNS.Packet(link, adv_plaintext, context=RNS.Packet.RESOURCE_ADV)
+        adv_packet.plaintext = adv_plaintext
+        adv_packet.link = link
+        receiver = RNS.Resource.accept(adv_packet)
+        if receiver is None:
+            raise ValueError("Resource.accept did not produce a receiver")
+        receiver_sdu = int(receiver.sdu)
+        receiver_total_parts = int(receiver.total_parts)
+        sender_parts = len(sender.parts)
+    finally:
+        RNS.Resource.watchdog_job = saved_watchdog
+        link.mtu = saved_mtu
+
+    derived_expected = -(-transfer_size // receiver_sdu)  # ceil(t/sdu)
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return {
+        "sender_parts": sender_parts,
+        "adv_n_genuine": adv_n_genuine,
+        "adv_n_tampered": adv_n_genuine + 5,
+        "transfer_size": transfer_size,
+        "receiver_sdu": receiver_sdu,
+        "receiver_total_parts": receiver_total_parts,
+        "derived_expected": derived_expected,
+    }
+
+
+def cmd_wire_resource_decompress_limit(params):
+    """A live Resource wires its decompression-bomb ceiling to the spec default
+    (Resource.__init__, Resource.py:364-365): max_decompressed_size ==
+    auto_compress_limit == Resource.AUTO_COMPRESS_MAX_SIZE (64 MiB). This is the
+    bound the receiver's bounded BZ2Decompressor.decompress(max_length=...) stops
+    at before declaring a CORRUPT decompression bomb. Reads the instance fields
+    straight off a real Resource — no reconstruction.
+
+    Returns {max_decompressed_size, auto_compress_limit, constant}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender = RNS.Resource(secrets.token_bytes(500), link, advertise=False)
+    out = {
+        "max_decompressed_size": int(sender.max_decompressed_size),
+        "auto_compress_limit": int(sender.auto_compress_limit),
+        "constant": int(RNS.Resource.AUTO_COMPRESS_MAX_SIZE),
+    }
+    try:
+        sender.cancel()
+    except Exception:
+        pass
+    return out
+
+
+def cmd_wire_resource_window_inheritance(params):
+    """A second inbound transfer on a link INHERITS the previous transfer's final
+    window (Resource.accept, Resource.py:216-219 reads link.get_last_resource_
+    window(); Link.resource_concluded, Link.py:1284 records it on conclusion).
+
+    Drive a FIRST inbound transfer to natural COMPLETE: feeding in-order parts
+    drains successive request windows and grows the window past the WINDOW=4
+    default (receive_part, Resource.py:899-901), and the real assemble path calls
+    link.resource_concluded which stores last_resource_window = resource.window.
+    A SECOND Resource.accept on the same link then starts at that inherited
+    window, not the default. An impl that always restarted at 4 would silently
+    degrade multi-resource throughput (the LXMF multi-attachment case).
+
+    Self-contained, all real RNS. Returns {default_window, total_parts_1,
+    completed_1, window_after_complete, link_last_window, window2_initial}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # First inbound transfer -> COMPLETE.
+    sender1, receiver1, _adv1 = _build_resource_receiver(
+        RNS, link, payload_len=1500, force_sdu=150
+    )
+    if receiver1 is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    receiver1.watchdog_job = lambda: None
+    total1 = len(receiver1.parts)
+    if total1 <= RNS.Resource.WINDOW + 1:
+        raise ValueError(f"need >{RNS.Resource.WINDOW+1} parts, got {total1}")
+    for i in range(total1):
+        rx = _link_rx_packet(RNS, link, sender1.parts[i].data, RNS.Packet.RESOURCE)
+        receiver1.receive_part(rx)
+    terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
+    deadline = time.time() + 3.0
+    while getattr(receiver1, "status", None) not in terminal and time.time() < deadline:
+        time.sleep(0.02)
+    window_after_complete = int(receiver1.window)
+    completed1 = receiver1.status == RNS.Resource.COMPLETE
+    link_last_window = link.get_last_resource_window()
+
+    # Second inbound transfer on the SAME link inherits the recorded window.
+    sender2, receiver2, _adv2 = _build_resource_receiver(
+        RNS, link, payload_len=1500, force_sdu=150
+    )
+    if receiver2 is None:
+        raise ValueError("Resource.accept did not produce a second receiver")
+    receiver2.watchdog_job = lambda: None
+    window2_initial = int(receiver2.window)
+
+    for r in (receiver1, receiver2):
+        try:
+            r.cancel()
+        except Exception:
+            pass
+    return {
+        "default_window": int(RNS.Resource.WINDOW),
+        "total_parts_1": total1,
+        "completed_1": bool(completed1),
+        "window_after_complete": window_after_complete,
+        "link_last_window": int(link_last_window) if link_last_window else None,
+        "window2_initial": window2_initial,
+    }
+
+
+def cmd_wire_resource_progress(params):
+    """Receiver-side transfer-progress contract (Resource.get_progress /
+    receive_part progress callback, Resource.py:1126-1180 / 884-887).
+
+    A non-split receiver reports get_progress() == received_count / total_parts,
+    and fires its progress callback exactly once per accepted part. Feeding `feed`
+    of `total` in-order parts must yield progress == feed/total and exactly `feed`
+    callback invocations. An impl reporting arbitrary progress, or never firing
+    the callback, breaks the user-visible progress LXMF clients rely on.
+
+    Self-contained, all real RNS. The internal re-request is suppressed during the
+    feed (instance no-op) purely to keep the feed clean; the progress callback
+    fires from receive_part independently. Returns {total_parts, fed,
+    received_count, progress_initial, progress_mid, progress_callback_calls}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=1500, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    receiver.watchdog_job = lambda: None
+    total = len(receiver.parts)
+    if total < 4:
+        raise ValueError(f"need a multi-part transfer, got {total}")
+
+    progress_calls = {"n": 0}
+
+    def _record_progress(_resource):
+        progress_calls["n"] += 1
+
+    # Register through the real Resource.progress_callback setter.
+    receiver.progress_callback(_record_progress)
+    progress_initial = float(receiver.get_progress())
+
+    feed = total // 2
+    receiver.request_next = lambda: None  # suppress internal re-request
+    for i in range(feed):
+        rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+        receiver.receive_part(rx)
+    del receiver.request_next
+
+    out = {
+        "total_parts": total,
+        "fed": feed,
+        "received_count": int(receiver.received_count),
+        "progress_initial": progress_initial,
+        "progress_mid": float(receiver.get_progress()),
+        "progress_callback_calls": progress_calls["n"],
     }
     try:
         receiver.cancel()
@@ -8844,6 +9494,12 @@ WIRE_COMMANDS = {
     "wire_resource_receiver_request_state": cmd_wire_resource_receiver_request_state,
     "wire_inject_hashmap_update": cmd_wire_inject_hashmap_update,
     "wire_resource_receiver_proof_count": cmd_wire_resource_receiver_proof_count,
+    "wire_resource_request_next_content": cmd_wire_resource_request_next_content,
+    "wire_resource_late_after_cancel": cmd_wire_resource_late_after_cancel,
+    "wire_resource_part_count_derivation": cmd_wire_resource_part_count_derivation,
+    "wire_resource_decompress_limit": cmd_wire_resource_decompress_limit,
+    "wire_resource_window_inheritance": cmd_wire_resource_window_inheritance,
+    "wire_resource_progress": cmd_wire_resource_progress,
     "wire_resource_force_collision": cmd_wire_resource_force_collision,
     "wire_resource_outgoing_queue_state": cmd_wire_resource_outgoing_queue_state,
     # IFAC issue-29 golden vector

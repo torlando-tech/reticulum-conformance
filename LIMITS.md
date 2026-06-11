@@ -15,9 +15,11 @@ CONFORMANCE_COMPLETENESS.md §2 for the architectural analysis.)
   keepalive/stale watchdog cadence, announce-cap pacing, ingress/egress rate
   limiters, path/tunnel/record staleness culling. The harness uses backdating
   hooks for the *decision logic*, but the wall-clock schedule itself is unobserved.
-- **Multi-hop (>1 transport hop)**: the `remaining_hops > 1` mid-path HEADER_2
-  rewrite, per-hop MTU signalling across heterogeneous next-hop interface types,
-  recursive path discovery beyond one relay. Topologies max out at one transport hop.
+- **Multi-hop (>1 transport hop)**: per-hop MTU signalling across heterogeneous
+  next-hop interface types and recursive path discovery beyond one relay.
+  Topologies max out at one transport hop. (The `remaining_hops > 1` mid-path
+  HEADER_2-rewrite *decision* is KAT-tested at the rule level — only its actual
+  execution on a >1-hop wire path is out of scope.)
 - **Packet loss / reorder / duplication on the wire**: loopback TCP is lossless
   and ordered; re-request-after-loss and reorder tolerance are only inject-simulated.
 - **Persistence across restart**: transport/known-destination/blackhole tables and
@@ -39,7 +41,7 @@ interface instance):
 
 - **channel_buffer**: `receiver-proves-channel-packets`, `tx-window-enforcement`, `window-rate-upgrade-fast`
 - **discovery_resolver**: `discovery-record-persistence-format`
-- **interfaces**: `announce-queue-ordering`, `auto-discovery-token-format-validation-reject`, `auto-mcast-group-derivation`, `backbone-wire-equivalence`, `config-bitrate-announce-cap-bounds`, `ingress-limit-path-requests`, `local-client-ingress-exempt`, `local-origin-announce-bypass`, `spawned-announce-cap-default`
+- **interfaces**: `announce-queue-ordering`, `auto-discovery-token-format-validation-reject`, `auto-mcast-group-derivation`, `backbone-wire-equivalence`, `ingress-limit-path-requests`, `local-client-ingress-exempt`, `local-origin-announce-bypass`, `spawned-announce-cap-default`
 - **link**: `mtu-clamp-in-transport`, `proof-hops-check`, `rtt-packet-handling`, `transport-lrproof-relay-validation`
 - **reticulum_config**: `announce-cap-default-and-queueing`, `announce-rate-limiting`, `hw-mtu-autoconfigure-tiers`, `ifac-recompute-per-hop`, `ingress-control-announce-hold`, `shared-instance-defaults`
-- **transport_announce**: `announce-bandwidth-cap`, `announce-ingress-limiting`, `non-transport-no-rebroadcast-no-answer`, `path-response-transport-rebroadcast`, `path-table-persistence-format`, `pr-ingress-egress-frequency-limits`, `tunnel-path-tracking-and-restore`
+- **transport_announce**: `announce-bandwidth-cap`, `announce-ingress-limiting`, `path-table-persistence-format`, `pr-ingress-egress-frequency-limits`, `tunnel-path-tracking-and-restore`

@@ -59,7 +59,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install pytest
+        # `cryptography` is required by the pyca-provider equivalence tests
+        # (crypto_provider_op imports RNS.Cryptography.Proxies, the OpenSSL/PyCA
+        # backend). Without it the reference leg errors on those tests. It is
+        # also a hard RNS runtime dependency, so installing it makes the
+        # reference bridge's `import RNS` exercise the same provider real
+        # deployments use, rather than only the pure-Python fallback.
+        run: pip install pytest cryptography
 
       - name: Assert RNS/LXMF versions match audited ground truth (1.3.1 / 0.9.9)
         # Reads __version__ from the pinned checkouts' _version.py — the

@@ -201,6 +201,17 @@ class Instance:
             rem_hops=rem_hops, hops=hops,
         )
 
+    def read_link_table(self, link_id=None):
+        """Read Transport.link_table. With `link_id` (bytes) return that single
+        entry's decomposed dict {found, timestamp, next_hop_transport_id,
+        next_hop_if, remaining_hops, received_if, hops, destination_hash,
+        validated, proof_timeout}; without it return {entries: [...]} listing
+        every link entry. See behavioral_read_link_table."""
+        kwargs = {"handle": self.handle}
+        if link_id is not None:
+            kwargs["link_id"] = link_id.hex()
+        return self.bridge.execute("behavioral_read_link_table", **kwargs)
+
     def hold_and_release_announce(self, iface_id, announces):
         """Hold a set of real announce packets on the interface's ingress-control
         queue and run ONE release pass; returns {held_before, held_after,

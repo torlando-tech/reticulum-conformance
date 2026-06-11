@@ -446,6 +446,54 @@ def build_data_packet(
     return raw
 
 
+def build_link_transport_packet(
+    bridge,
+    link_id: bytes,
+    *,
+    hops: int = 0,
+    context: int = CONTEXT_NONE,
+    payload: bytes = b"",
+) -> bytes:
+    """Build a HEADER_1 DATA packet of destination_type LINK addressed to a
+    `link_id` (the key Transport.link_table is keyed by).
+
+    Real link traffic carries destination_type == LINK; the link-transport
+    routing branch (Transport.py:1644-1679) keys on destination_hash membership
+    in link_table together with packet_type == DATA and context != LRPROOF — it
+    does NOT re-encrypt or inspect the body, so the payload is opaque to the
+    relay. We build a SINGLE DATA packet honestly via packet_build
+    (RNS.Packet.pack), overwrite the 16-byte destination address with `link_id`
+    (a header-only field) and flip the 2-bit destination_type subfield
+    SINGLE -> LINK in the unsigned flags byte (no signature covers a DATA
+    packet's header). The final layout is validated through real
+    RNS.Packet.unpack, which confirms RNS reads destination_type == LINK and the
+    patched address back.
+    """
+    if len(link_id) != TRUNCATED_HASH_BYTES:
+        raise ValueError(
+            f"link_id must be {TRUNCATED_HASH_BYTES} bytes, got {len(link_id)}"
+        )
+    raw = bytearray(
+        build_data_packet(
+            bridge, link_id, destination_type="single",
+            context=context, hops=hops, payload=payload,
+        )
+    )
+    # flags low nibble = (destination_type << 2) | packet_type. SINGLE==0 -> LINK==3.
+    raw[0] = (raw[0] & ~(0b11 << 2)) | (DESTINATION_TYPE_LINK << 2)
+    out = bytes(raw)
+    parsed = _unpack(bridge, out)
+    assert parsed["destination_type"] == DESTINATION_TYPE_LINK, (
+        "destination_type was not patched to LINK"
+    )
+    assert parsed["packet_type"] == PACKET_TYPE_DATA
+    assert parsed["header_type"] == HEADER_1
+    assert parsed["destination_hash"] == link_id.hex()
+    assert parsed["hops"] == int(hops)
+    assert parsed["context"] == context
+    return out
+
+
 def build_path_request(
     bridge,
     dest_hash: bytes,

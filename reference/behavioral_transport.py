@@ -732,6 +732,11 @@ _IDX_AT_FALLBACK = {
 _IDX_TT_FALLBACK = {
     "IDX_TT_TUNNEL_ID": 0, "IDX_TT_IF": 1, "IDX_TT_PATHS": 2, "IDX_TT_EXPIRES": 3,
 }
+_IDX_LT_FALLBACK = {
+    "IDX_LT_TIMESTAMP": 0, "IDX_LT_NH_TRID": 1, "IDX_LT_NH_IF": 2,
+    "IDX_LT_REM_HOPS": 3, "IDX_LT_RCVD_IF": 4, "IDX_LT_HOPS": 5,
+    "IDX_LT_DSTHASH": 6, "IDX_LT_VALIDATED": 7, "IDX_LT_PROOF_TMO": 8,
+}
 
 
 def _idx(fallback):
@@ -1241,6 +1246,74 @@ def cmd_behavioral_seed_link_table(params):
         RNS.Transport.link_table[dest] = link_entry
 
     return {"seeded": True, "dest": dest.hex()}
+
+
+def cmd_behavioral_read_link_table(params):
+    """Read RNS.Transport.link_table[link_id] decomposed into its fields.
+
+    The link table is otherwise observable only through what the relay emits;
+    exposing it directly lets a test assert the link_entry an impl actually holds
+    after relaying a LINKREQUEST (next-hop transport id / interface, taken vs
+    remaining hops, validated flag, proof-timeout) and that the timestamp is
+    refreshed when a link-transport DATA packet is repeated (Transport.py:1679).
+
+    Entry layout (IDX_LT_*, Transport.py:3569-3578; insert at :1612-1623):
+      [timestamp, next_hop_transport_id, next_hop_interface, remaining_hops,
+       received_interface, taken_hops, destination_hash, validated, proof_timeout]
+    IDX_LT_NH_IF / IDX_LT_RCVD_IF are interface objects (mapped back to the
+    iface_id the test attached); the rest are surfaced verbatim. Pure read of
+    RNS's own table — nothing is reconstructed here.
+
+    params: handle, link_id (optional hex). With link_id, returns that single
+            entry's {found, ...}; without, returns {entries: [...]} (so a test can
+            discover the link_id key a real relay computed).
+    returns: {found, timestamp, next_hop_transport_id, next_hop_if,
+              next_hop_if_hash, remaining_hops, received_if, received_if_hash,
+              hops, destination_hash, validated, proof_timeout}  OR  {entries:[...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    idx = _idx(_IDX_LT_FALLBACK)
+    table = RNS.Transport.link_table
+
+    def _decompose(key, entry):
+        nh_if_obj = entry[idx["IDX_LT_NH_IF"]]
+        rcvd_if_obj = entry[idx["IDX_LT_RCVD_IF"]]
+        nh_if = _iface_descriptor(inst, nh_if_obj) if nh_if_obj is not None else None
+        rcvd_if = _iface_descriptor(inst, rcvd_if_obj) if rcvd_if_obj is not None else None
+        nh_trid = entry[idx["IDX_LT_NH_TRID"]]
+        dsthash = entry[idx["IDX_LT_DSTHASH"]]
+        return {
+            "link_id": key.hex() if isinstance(key, (bytes, bytearray)) else key,
+            "timestamp": float(entry[idx["IDX_LT_TIMESTAMP"]]),
+            "next_hop_transport_id": nh_trid.hex() if isinstance(nh_trid, (bytes, bytearray)) else None,
+            "next_hop_if": nh_if["iface_id"] if nh_if else None,
+            "next_hop_if_hash": nh_if["hash"] if nh_if else None,
+            "remaining_hops": int(entry[idx["IDX_LT_REM_HOPS"]]),
+            "received_if": rcvd_if["iface_id"] if rcvd_if else None,
+            "received_if_hash": rcvd_if["hash"] if rcvd_if else None,
+            "hops": int(entry[idx["IDX_LT_HOPS"]]),
+            "destination_hash": dsthash.hex() if isinstance(dsthash, (bytes, bytearray)) else None,
+            "validated": bool(entry[idx["IDX_LT_VALIDATED"]]),
+            "proof_timeout": float(entry[idx["IDX_LT_PROOF_TMO"]]),
+        }
+
+    link_id = params.get("link_id")
+    if link_id is not None:
+        key = bytes.fromhex(link_id)
+        if key not in table:
+            return {"found": False}
+        d = _decompose(key, table[key])
+        d["found"] = True
+        return d
+
+    return {"entries": [_decompose(k, v) for k, v in table.items()]}
 
 
 def cmd_behavioral_register_destination(params):
@@ -1954,6 +2027,7 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
     "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
     "behavioral_seed_link_table": cmd_behavioral_seed_link_table,
+    "behavioral_read_link_table": cmd_behavioral_read_link_table,
     "behavioral_register_announce_handler": cmd_behavioral_register_announce_handler,
     "behavioral_read_announce_handler_calls": cmd_behavioral_read_announce_handler_calls,
 }

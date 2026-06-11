@@ -59,15 +59,23 @@ from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     DESTINATION_TYPE_LINK,
     HEADER_2,
+    PACKET_TYPE_LINKREQUEST,
     TRUNCATED_HASH_BYTES,
     TUNNEL_SYNTHESIZE_DESTINATION_NAME,
     _plain_destination_hash,
     build_announce_from_destination,
     build_data_packet,
+    build_link_request_packet,
     build_link_transport_packet,
     build_tunnel_synthesize,
     parse_packet_header,
 )
+
+
+# RNS link-establishment constants (RNS/Link.py, RNS/Reticulum.py), used to
+# verify the relay's proof-timeout formula independently of the impl's output.
+_ESTABLISHMENT_TIMEOUT_PER_HOP = 6  # RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT
+_RETICULUM_MTU = 500                # RNS.Reticulum.MTU (for extra_link_proof_timeout)
 
 
 __category_title__ = "Transport Behavior"
@@ -175,6 +183,121 @@ def test_header2_next_hop_no_path_silent_drop(behavioral):
             "known path was also not forwarded"
         )
         assert parse_packet_header(forwarded[0])["destination_hash"] == known_dest
+    finally:
+        behavioral.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# 1b. linkrequest-forward-creates-link-entry (CORE)
+# ---------------------------------------------------------------------------
+@conformance_case(
+    commands=["start", "attach_mock_interface", "announce_build", "inject",
+              "drain_tx", "read_path_table", "read_link_table", "packet_build",
+              "packet_unpack", "packet_hash"],
+    verifies=(
+        "Forwarding a LINKREQUEST creates a correctly-keyed, correctly-populated "
+        "link_table entry (Transport.py:1583-1623). A HEADER_2 LINKREQUEST aimed "
+        "at THIS node as next hop, for a destination with a known path (hops>1), "
+        "is keyed by link_id == truncated_hash(get_hashable_part) (== packet_hash "
+        "first 16 bytes), with next_hop_transport_id = the path's next hop, "
+        "next_hop interface = the path's interface, received interface = the "
+        "ingress, remaining_hops = the path hop count, taken_hops = packet.hops, "
+        "validated = False, and proof_timeout = now + 6s/remaining_hop + the "
+        "per-interface extra ((8/bitrate)*MTU). The LR is also relayed out the "
+        "path interface."
+    ),
+)
+def test_linkrequest_forward_creates_link_entry(behavioral):
+    """Relay a LINKREQUEST and read back the link_table entry RNS built. Every
+    field is anchored on an independent value: link_id on the packet's own
+    truncated hash (computed via packet_hash, not read from the table), next_hop
+    on the path table (established by a SEPARATE announce), remaining_hops on the
+    path hop count, taken_hops on the +1 receive increment, and proof_timeout on
+    the spec formula 6s/hop + (8/bitrate)*MTU bracketed around the inject. An impl
+    that mis-keys the entry, miscounts hops, marks it validated, or bungles the
+    proof-timeout formula is caught."""
+    import time
+
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface_in = inst.attach_mock_interface("in", mode="FULL")
+        iface_eg = inst.attach_mock_interface("eg", mode="FULL")
+
+        # Learn a path to D with hops>1 (wire 2 -> 3) via the egress interface.
+        dest, path = _learn_path(
+            inst, behavioral.bridge, iface_eg, aspect="lr-entry", wire_hops=2,
+        )
+        assert path["found"] and path["hops"] == 3, f"path not learned hops==3: {path}"
+        path_next_hop = path["next_hop"]
+        assert path_next_hop is not None
+        inst.drain_tx(iface_in)
+        inst.drain_tx(iface_eg)
+
+        # Build a HEADER_2 LINKREQUEST to D, naming us as the next transport hop.
+        lr_wire_hops = 4
+        lr_raw, _req = build_link_request_packet(
+            behavioral.bridge, dest,
+            transport_id=inst.identity_hash, hops=lr_wire_hops,
+        )
+        # link_id the relay will key on: truncated_hash(get_hashable_part) ==
+        # packet_hash[:16] for a 64-byte (ECPUBSIZE) body. Derived independently.
+        full_hash = bytes.fromhex(
+            behavioral.bridge.execute("packet_hash", raw=lr_raw.hex())["hash"]
+        )
+        expected_link_id = full_hash[:TRUNCATED_HASH_BYTES]
+
+        t0 = time.time()
+        inst.inject(iface_in, lr_raw)
+        t1 = time.time()
+
+        # The LR is relayed out the path interface (HEADER_2, remaining_hops>1).
+        relayed = inst.drain_tx(iface_eg)
+        assert any(parse_packet_header(p)["packet_type"] == PACKET_TYPE_LINKREQUEST
+                   for p in relayed), (
+            "the LINKREQUEST was not relayed out the path interface"
+        )
+        assert inst.drain_tx(iface_in) == [], "LR echoed on its ingress interface"
+
+        entry = inst.read_link_table(expected_link_id)
+        assert entry["found"], (
+            "no link_table entry was keyed by truncated_hash(get_hashable_part) — "
+            "the relay either dropped the LR or keyed the entry incorrectly"
+        )
+        # next-hop transport id / interface come from the path table (independent).
+        assert entry["next_hop_transport_id"] == path_next_hop, (
+            f"link entry next-hop {entry['next_hop_transport_id']} != path next-hop "
+            f"{path_next_hop}"
+        )
+        assert entry["next_hop_if"] == iface_eg, (
+            "link entry next-hop interface is not the path's interface"
+        )
+        assert entry["received_if"] == iface_in, (
+            "link entry received interface is not the LR's ingress interface"
+        )
+        assert entry["remaining_hops"] == 3, (
+            f"link entry remaining_hops {entry['remaining_hops']} != path hops 3"
+        )
+        # taken hops == packet.hops on receive == wire hops + 1 (receive increment).
+        assert entry["hops"] == lr_wire_hops + 1, (
+            f"link entry taken-hops {entry['hops']} != injected wire hops + 1 "
+            f"({lr_wire_hops + 1})"
+        )
+        assert entry["validated"] is False, (
+            "a freshly-relayed link entry must be unvalidated (validated only on "
+            "the returning LRPROOF)"
+        )
+        assert entry["destination_hash"] == dest.hex(), (
+            "link entry destination_hash is not the LR's destination"
+        )
+
+        # proof_timeout = extra_link_proof_timeout(ingress) + now
+        #                 + 6 * max(1, remaining_hops). extra = (8/bitrate)*MTU.
+        extra = (8.0 / 10_000_000) * _RETICULUM_MTU  # MockInterface default bitrate
+        base = _ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, 3) + extra
+        assert (t0 + base) - 0.5 <= entry["proof_timeout"] <= (t1 + base) + 0.5, (
+            f"proof_timeout {entry['proof_timeout']} not within the spec window "
+            f"[{t0 + base:.3f}, {t1 + base:.3f}] (6s/hop * 3 + per-interface extra)"
+        )
     finally:
         behavioral.cleanup()
 

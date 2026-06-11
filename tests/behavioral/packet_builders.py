@@ -494,6 +494,75 @@ def build_link_transport_packet(
     return out
 
 
+LINK_ECPUBSIZE = 64  # RNS.Link.ECPUBSIZE (X25519 32 + Ed25519 32)
+
+
+def build_link_request_packet(
+    bridge,
+    dest_hash: bytes,
+    *,
+    transport_id: bytes,
+    hops: int = 0,
+    request_data: Optional[bytes] = None,
+) -> tuple:
+    """Build a HEADER_2 LINKREQUEST packet addressed to `dest_hash` via
+    `transport_id` (the relay form: transport_type==TRANSPORT).
+
+    A link request to a SINGLE destination carries the initiator's cleartext
+    public-key bytes (ECPUBSIZE=64) as its data field — RNS does NOT encrypt a
+    LINKREQUEST body (the responder needs the keys to derive the link). For the
+    transport RELAY path (Transport.py:1583-1623) the body is opaque: the relay
+    computes link_id = truncated_hash(get_hashable_part()) and, for a 64-byte
+    body, does no MTU parsing (mtu_from_lr_packet needs 67 bytes), so 64 arbitrary
+    bytes are a valid relayable request. We compose the flags directly (no
+    signature covers a LINKREQUEST header), assemble the HEADER_1 base, promote it
+    to the HEADER_2 relay layout with `transport_id`, and validate the final
+    bytes through real RNS.Packet.unpack.
+
+    Returns (raw_bytes, request_data). The link_id the relay will key the
+    link_table by is truncated_hash(get_hashable_part()) == packet_hash[:16] for a
+    64-byte body, derivable independently via the bridge's packet_hash.
+    """
+    if len(dest_hash) != TRUNCATED_HASH_BYTES:
+        raise ValueError(
+            f"dest_hash must be {TRUNCATED_HASH_BYTES} bytes, got {len(dest_hash)}"
+        )
+    if len(transport_id) != TRUNCATED_HASH_BYTES:
+        raise ValueError(
+            f"transport_id must be {TRUNCATED_HASH_BYTES} bytes, got {len(transport_id)}"
+        )
+    if request_data is None:
+        request_data = secrets.token_bytes(LINK_ECPUBSIZE)
+    if len(request_data) != LINK_ECPUBSIZE:
+        raise ValueError(
+            f"request_data must be {LINK_ECPUBSIZE} bytes (ECPUBSIZE), "
+            f"got {len(request_data)}"
+        )
+    flags = compose_flags(
+        header_type=HEADER_1,
+        context_flag=CONTEXT_FLAG_UNSET,
+        transport_type=TRANSPORT_BROADCAST,
+        destination_type=DESTINATION_TYPE_SINGLE,
+        packet_type=PACKET_TYPE_LINKREQUEST,
+    )
+    h1 = (
+        bytes([flags, int(hops)])
+        + bytes(dest_hash)
+        + bytes([CONTEXT_NONE])
+        + bytes(request_data)
+    )
+    raw = _promote_to_header2(h1, transport_id)
+
+    parsed = _unpack(bridge, raw)
+    assert parsed["packet_type"] == PACKET_TYPE_LINKREQUEST
+    assert parsed["header_type"] == HEADER_2
+    assert parsed["transport_type"] == TRANSPORT_TRANSPORT
+    assert parsed["destination_hash"] == dest_hash.hex()
+    assert parsed["transport_id"] == transport_id.hex()
+    assert parsed["data"] == bytes(request_data).hex()
+    return raw, bytes(request_data)
+
+
 def build_path_request(
     bridge,
     dest_hash: bytes,

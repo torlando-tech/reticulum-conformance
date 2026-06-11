@@ -275,6 +275,11 @@ def _reset_transport_state():
     # handle's validate_announce gate (Identity.py:567-569), so clear it here.
     if hasattr(T, "blackholed_identities") and hasattr(T.blackholed_identities, "clear"):
         T.blackholed_identities.clear()
+    # Externally-registered announce handlers are a process-wide list
+    # (Transport.announce_handlers). A handler registered by one handle must not
+    # leak into the next handle's announce dispatch (Transport.py:2034-2087).
+    if hasattr(T, "announce_handlers") and hasattr(T.announce_handlers, "clear"):
+        T.announce_handlers.clear()
     # Pending path-request bookkeeping (Transport.path_requests /
     # discovery_path_requests). request_path records the requested destination
     # here; left over, it would make the unknown-destination ingress-limit
@@ -445,6 +450,15 @@ def cmd_behavioral_stop(params):
     for destination in inst.get("destinations", []):
         try:
             RNS.Transport.deregister_destination(destination)
+        except Exception:
+            pass
+
+    # Deregister any recording announce handlers this handle registered so they
+    # don't leak into the next handle's Transport.announce_handlers dispatch
+    # (Transport.py:2034-2087).
+    for handler in inst.get("announce_handlers", {}).values():
+        try:
+            RNS.Transport.deregister_announce_handler(handler)
         except Exception:
             pass
 
@@ -1767,6 +1781,144 @@ def cmd_behavioral_hold_and_release_announce(params):
     }
 
 
+def _make_recording_announce_handler(aspect_filter, receive_path_responses,
+                                     num_params, raise_on_call, omit_aspect_filter):
+    """Build a real announce-handler object for RNS.Transport.register_announce_handler.
+
+    The object exposes exactly the duck-typed surface RNS requires
+    (Transport.register_announce_handler / Transport.inbound:2034-2087): an
+    `aspect_filter` attribute, an optional `receive_path_responses` attribute,
+    and a `received_announce(...)` callable whose parameter COUNT (3 or 4)
+    selects which RNS dispatch arm fires. RNS itself does all the matching
+    (hash_from_name_and_identity), path-response gating, and threaded dispatch;
+    this handler only RECORDS the values RNS hands it (destination_hash,
+    announced_identity.hash, app_data, announce_packet_hash) — no protocol bytes
+    are reconstructed here.
+    """
+    calls = []
+    lock = threading.Lock()
+
+    def _record(destination_hash, announced_identity, app_data,
+                announce_packet_hash=None):
+        rec = {
+            "destination_hash": destination_hash.hex()
+                if isinstance(destination_hash, (bytes, bytearray)) else None,
+            "announced_identity_hash": getattr(announced_identity, "hash", None).hex()
+                if getattr(announced_identity, "hash", None) is not None else None,
+            "app_data": app_data.hex()
+                if isinstance(app_data, (bytes, bytearray)) else None,
+        }
+        if announce_packet_hash is not None:
+            rec["announce_packet_hash"] = announce_packet_hash.hex() \
+                if isinstance(announce_packet_hash, (bytes, bytearray)) else None
+        with lock:
+            calls.append(rec)
+
+    if num_params == 4:
+        def received_announce(destination_hash, announced_identity, app_data,
+                              announce_packet_hash):
+            _record(destination_hash, announced_identity, app_data,
+                    announce_packet_hash)
+            if raise_on_call:
+                raise RuntimeError("recording announce handler deliberately raised")
+    else:
+        def received_announce(destination_hash, announced_identity, app_data):
+            _record(destination_hash, announced_identity, app_data)
+            if raise_on_call:
+                raise RuntimeError("recording announce handler deliberately raised")
+
+    class _RecordingAnnounceHandler:
+        pass
+
+    handler = _RecordingAnnounceHandler()
+    # Per the rule under test, RNS.Transport.register_announce_handler only
+    # registers a handler that HAS an aspect_filter attribute; omit it to drive
+    # the rejection branch.
+    if not omit_aspect_filter:
+        handler.aspect_filter = aspect_filter
+    if receive_path_responses is not None:
+        handler.receive_path_responses = bool(receive_path_responses)
+    handler.received_announce = received_announce
+    handler._recorded_calls = calls
+    handler._recorded_lock = lock
+    return handler
+
+
+def cmd_behavioral_register_announce_handler(params):
+    """Register a real recording announce-handler on this Transport instance.
+
+    Delegates to RNS.Transport.register_announce_handler (Transport.py:2465) with
+    a duck-typed handler whose received_announce only records the arguments RNS
+    dispatches to it. The dispatch decision (aspect_filter match via
+    Destination.hash_from_name_and_identity, the PATH_RESPONSE/
+    receive_path_responses gate, the 3-vs-4-parameter signature arm, and the
+    per-handler exception isolation) is ENTIRELY RNS's — see Transport.inbound
+    :2034-2087. The test reads back the recorded calls via
+    behavioral_read_announce_handler_calls.
+
+    params: handle, aspect_filter (str|None), receive_path_responses (bool|None),
+            num_params (3|4, default 3), raise_on_call (bool),
+            omit_aspect_filter (bool)
+    returns: {handler_id, registered}  (registered=False iff RNS declined the
+             handler because it lacked an aspect_filter attribute)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    aspect_filter = params.get("aspect_filter")
+    receive_path_responses = params.get("receive_path_responses")
+    num_params = int(params.get("num_params", 3))
+    raise_on_call = bool(params.get("raise_on_call", False))
+    omit_aspect_filter = bool(params.get("omit_aspect_filter", False))
+
+    handler = _make_recording_announce_handler(
+        aspect_filter, receive_path_responses, num_params, raise_on_call,
+        omit_aspect_filter,
+    )
+    RNS.Transport.register_announce_handler(handler)
+    registered = handler in RNS.Transport.announce_handlers
+
+    handler_id = secrets.token_hex(8)
+    inst.setdefault("announce_handlers", {})[handler_id] = handler
+    return {"handler_id": handler_id, "registered": registered}
+
+
+def cmd_behavioral_read_announce_handler_calls(params):
+    """Return the calls a registered recording announce-handler has received.
+
+    Pure read of the list the handler's received_announce (driven by real RNS
+    dispatch) appended to. See cmd_behavioral_register_announce_handler.
+
+    params: handle, handler_id
+    returns: {calls: [{destination_hash, announced_identity_hash, app_data
+                       [, announce_packet_hash]}], registered}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    handler_id = params["handler_id"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    handler = inst.get("announce_handlers", {}).get(handler_id)
+    if handler is None:
+        raise ValueError(f"Unknown announce handler_id: {handler_id}")
+
+    with handler._recorded_lock:
+        calls = [dict(c) for c in handler._recorded_calls]
+    return {
+        "calls": calls,
+        "registered": handler in RNS.Transport.announce_handlers,
+    }
+
+
 BEHAVIORAL_COMMANDS = {
     "behavioral_register_destination": cmd_behavioral_register_destination,
     "behavioral_hold_and_release_announce": cmd_behavioral_hold_and_release_announce,
@@ -1802,4 +1954,6 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
     "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
     "behavioral_seed_link_table": cmd_behavioral_seed_link_table,
+    "behavioral_register_announce_handler": cmd_behavioral_register_announce_handler,
+    "behavioral_read_announce_handler_calls": cmd_behavioral_read_announce_handler_calls,
 }

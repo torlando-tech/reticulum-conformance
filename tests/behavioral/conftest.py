@@ -329,6 +329,33 @@ class Instance:
         )
         return bytes.fromhex(resp["destination_hash"])
 
+    def register_announce_handler(self, aspect_filter=None,
+                                  receive_path_responses=None, num_params=3,
+                                  raise_on_call=False, omit_aspect_filter=False):
+        """Register a real recording announce handler on this Transport via
+        RNS.Transport.register_announce_handler. Returns {handler_id, registered}.
+        The handler records every (destination_hash, announced_identity, app_data
+        [, announce_packet_hash]) RNS dispatches to it; read them back with
+        read_announce_handler_calls. See behavioral_register_announce_handler."""
+        kwargs = {"handle": self.handle, "num_params": num_params}
+        if aspect_filter is not None:
+            kwargs["aspect_filter"] = aspect_filter
+        if receive_path_responses is not None:
+            kwargs["receive_path_responses"] = receive_path_responses
+        if raise_on_call:
+            kwargs["raise_on_call"] = True
+        if omit_aspect_filter:
+            kwargs["omit_aspect_filter"] = True
+        return self.bridge.execute("behavioral_register_announce_handler", **kwargs)
+
+    def read_announce_handler_calls(self, handler_id):
+        """Return {calls: [...], registered} for a recording announce handler.
+        See behavioral_read_announce_handler_calls."""
+        return self.bridge.execute(
+            "behavioral_read_announce_handler_calls",
+            handle=self.handle, handler_id=handler_id,
+        )
+
     def read_announce_rate(self, dest):
         """Read Transport.announce_rate_table[dest] (bytes) as {found, last,
         rate_violations, blocked_until, timestamps[]} or {'found': False}. See

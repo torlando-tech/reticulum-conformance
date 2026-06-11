@@ -159,6 +159,20 @@ def bytes_to_hex(data):
     return data.hex()
 
 
+def _maybe_num(value):
+    """Pass a numeric RNS attribute straight through for JSON, preserving None.
+
+    RNS stores the ingress-control knobs as plain ints/floats; this only
+    normalises the absence case (None) and avoids leaking any non-number type
+    into the JSON response. No value is computed here — the number is read
+    verbatim off the live RNS interface object."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return value if isinstance(value, (int, float)) else float(value)
+
+
 # Command handlers
 
 def cmd_x25519_generate(params):
@@ -2993,6 +3007,10 @@ def cmd_discovery_build_announce_appdata(params):
         'stamp_size': stamp_size,
         'transport_id': bytes_to_hex(RNS.Transport.identity.hash),
         'transport_enabled': transport_enabled,
+        # Pure read of the sender default-stamp constant (Discovery.py:34) so a
+        # test can pin it without the cost passing through this command's own
+        # 14-fallback default.
+        'default_stamp_value': Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE,
     }
 
 
@@ -3054,8 +3072,16 @@ def cmd_discovery_receive_announce(params):
         else:
             captured.update(info)
 
-    handler = Discovery.InterfaceAnnounceHandler(
-        required_value=required_value, callback=_cb)
+    # When default_required_value is requested, build the handler WITHOUT
+    # passing required_value so the impl's own default
+    # (InterfaceAnnounceHandler.__init__ default = InterfaceAnnouncer.
+    # DEFAULT_STAMP_VALUE) applies — lets a test pin the receiver's default
+    # acceptance threshold rather than an explicitly-supplied one.
+    if params.get('default_required_value'):
+        handler = Discovery.InterfaceAnnounceHandler(callback=_cb)
+    else:
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=required_value, callback=_cb)
     handler.received_announce(dest_hash, announced, app_data)
 
     out = {
@@ -3064,6 +3090,11 @@ def cmd_discovery_receive_announce(params):
         'info_present': bool(captured),
         'accepted': bool(captured),
         'announce_identity_hash': bytes_to_hex(announced.hash),
+        # Pure reads off the real handler / announcer for receiver-wiring and
+        # default-threshold assertions (Discovery.py:200,192,34).
+        'aspect_filter': handler.aspect_filter,
+        'required_value': handler.required_value,
+        'default_stamp_value': Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE,
     }
     if captured:
         safe = {}
@@ -3412,6 +3443,132 @@ def cmd_discovery_inject_records(params):
     }
 
 
+def cmd_discovery_store_record(params):
+    """Drive the REAL InterfaceDiscovery storage/listing whitelist + dedup paths
+    over a GENUINE discovery record.
+
+    Exercises three resolver-store decisions that are made entirely by RNS:
+      * the storage-acceptance type whitelist in interface_discovered — a record
+        whose type is NOT in InterfaceDiscovery.DISCOVERABLE_TYPES (notably
+        TCPClientInterface, which the handler-level DISCOVERABLE_INTERFACE_TYPES
+        DOES accept) is received but never written to disk (Discovery.py:457);
+      * the re-announce dedup / heard_count increment for a repeated record
+        (same transport_id+name -> same discovery_hash filename, Discovery.py:
+        356-357,476-495);
+      * the listing trust-revocation purge — with an interface_discovery_sources
+        allowlist applied at LIST time, a stored record whose network_id is not
+        in the allowlist is removed (Discovery.py:417-418).
+
+    The record is a real announce built by get_interface_announce_data (and, when
+    set_interface_type forces a type the sender would otherwise rewrite,
+    re-stamped through the real craft path), received through real
+    received_announce to obtain the genuine info dict, then stored via real
+    interface_discovered. The bridge reconstructs no storage logic; it only
+    chooses the type/repeat/source allowlist and reads RNS's verdict back: stored
+    is a filesystem existence check on the record file RNS wrote, and heard_count
+    is read off the info dict real list_discovered_interfaces returns.
+    """
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', True)
+    # Source allowlist seen by received_announce while building the record.
+    recv_sources = params.get('recv_sources')
+    setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+            [hex_to_bytes(s) for s in recv_sources] if recv_sources else [])
+
+    disc = Discovery.InterfaceDiscovery(discover_interfaces=False)
+
+    def _clean():
+        for fn in os.listdir(disc.storagepath):
+            try:
+                os.unlink(os.path.join(disc.storagepath, fn))
+            except OSError:
+                pass
+
+    _clean()
+
+    set_type = params.get('set_interface_type')
+    repeat = int(params.get('repeat', 1))
+    stamp_value = params.get('stamp_value', 6)
+    fields = params.get('fields') or {
+        'name': params.get('name', 'Node'),
+        'reachable_on': 'example.com', 'port': 4242}
+
+    if params.get('announce_identity_priv'):
+        announced = RNS.Identity.from_bytes(
+            hex_to_bytes(params['announce_identity_priv']))
+    else:
+        announced = RNS.Identity()
+
+    base = {'interface_type': 'TCPServerInterface', 'stamp_value': stamp_value,
+            'transport_enabled': True, 'fields': fields}
+    if set_type:
+        crafted = cmd_discovery_craft_announce({**base, 'set_interface_type': set_type})
+        app_data = hex_to_bytes(crafted['app_data'])
+    else:
+        built = cmd_discovery_build_announce_appdata(base)
+        app_data = hex_to_bytes(built['app_data'])
+
+    record_type = None
+    discovery_hash = None
+    received_ok = False
+    for _ in range(repeat):
+        captured = {}
+
+        def _cb(info, _c=captured):
+            if info:
+                _c.update(info)
+
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=stamp_value, callback=_cb)
+        handler.received_announce(announced.hash, announced, app_data)
+        if not captured:
+            break
+        received_ok = True
+        record_type = captured.get('type')
+        discovery_hash = captured.get('discovery_hash')
+        disc.interface_discovered(captured)
+
+    fname = RNS.hexrep(discovery_hash, delimit=False) if discovery_hash else None
+    fpath = os.path.join(disc.storagepath, fname) if fname else None
+    stored = bool(fpath and os.path.isfile(fpath))
+
+    # Optional trust-revocation purge: apply a (possibly different) allowlist at
+    # LIST time and let list_discovered_interfaces enforce it.
+    if 'list_sources' in params:
+        ls = params['list_sources']
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+                [hex_to_bytes(s) for s in (ls or [])])
+    listed = disc.list_discovered_interfaces()
+    listed_names = [i.get('name') for i in listed]
+
+    # heard_count comes off the info dict RNS's list_discovered_interfaces
+    # returns (it unpacks the stored record itself); never decoded in-bridge.
+    heard_count = None
+    for i in listed:
+        ih = i.get('discovery_hash')
+        if discovery_hash is not None and ih == discovery_hash:
+            heard_count = i.get('heard_count')
+            break
+
+    _clean()
+    return {
+        'received': received_ok,
+        'record_type': record_type,
+        'stored': stored,
+        'heard_count': heard_count,
+        'discovery_hash': bytes_to_hex(discovery_hash) if discovery_hash else None,
+        'listed_names': listed_names,
+        'announce_identity_hash': bytes_to_hex(announced.hash),
+        'discoverable_types': list(Discovery.InterfaceDiscovery.DISCOVERABLE_TYPES),
+        'discoverable_interface_types':
+            list(Discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES),
+    }
+
+
 # Probe interface source: a minimal real RNS Interface subclass that opens no
 # sockets/hardware. Loaded via RNS's own external-interface mechanism
 # (Reticulum._synthesize_interface -> exec of a module exporting interface_class,
@@ -3525,6 +3682,21 @@ def cmd_config_parse_interface(params):
             'ifac_netname': getattr(iface, 'ifac_netname', None),
             'ifac_netkey': getattr(iface, 'ifac_netkey', None),
             'ifac_active': getattr(iface, 'ifac_identity', None) is not None,
+            # Per-interface ingress-control (ic_*) knobs. RNS 1.3.1's
+            # Interface.__init__ seeds these from Reticulum.get_instance().
+            # _default_ic_* (Interface.py:120-130, falling back to the
+            # Interface class constants), and _synthesize_interface overrides
+            # them from the [[interface]] config when present
+            # (Reticulum.py:744-892). We read them straight off the live
+            # interface object so tests can pin both the override path and the
+            # class-constant default fallback.
+            'ic_max_held_announces': _maybe_num(getattr(iface, 'ic_max_held_announces', None)),
+            'ic_burst_hold': _maybe_num(getattr(iface, 'ic_burst_hold', None)),
+            'ic_burst_freq_new': _maybe_num(getattr(iface, 'ic_burst_freq_new', None)),
+            'ic_burst_freq': _maybe_num(getattr(iface, 'ic_burst_freq', None)),
+            'ic_new_time': _maybe_num(getattr(iface, 'ic_new_time', None)),
+            'ic_burst_penalty': _maybe_num(getattr(iface, 'ic_burst_penalty', None)),
+            'ic_held_release_interval': _maybe_num(getattr(iface, 'ic_held_release_interval', None)),
         })
         RNS.Transport.remove_interface(iface)
     return result
@@ -3569,6 +3741,40 @@ def cmd_interface_default_ifac_size(params):
             name: int(cls.DEFAULT_IFAC_SIZE) for name, cls in classes.items()
         },
         "ifac_min_size": int(RNS.Reticulum.IFAC_MIN_SIZE),
+    }
+
+
+def cmd_interface_optimise_mtu(params):
+    """Run RNS's real Interface.optimise_mtu bitrate->HW_MTU tier mapping.
+
+    Delegates to the live (unbound) RNS.Interfaces.Interface.optimise_mtu
+    (Interface.py:198-221), driven over a stand-in carrying exactly the two
+    attributes that method reads (AUTOCONFIGURE_MTU, bitrate) and the HW_MTU
+    slot it writes — the same stand-in pattern used by the framing read/write
+    hooks. The bridge computes no MTU itself: RNS picks the bitrate tier and
+    assigns HW_MTU. When autoconfigure is False, RNS leaves HW_MTU untouched
+    (the pre-seeded sentinel is returned), pinning that the tier table only
+    fires for AUTOCONFIGURE_MTU interfaces.
+
+    params:
+        bitrate (int): the interface bitrate (bps) to map.
+        autoconfigure (bool, default True): the AUTOCONFIGURE_MTU flag.
+    """
+    _get_full_rns()
+    import types
+    from RNS.Interfaces.Interface import Interface
+
+    bitrate = int(params['bitrate'])
+    autoconfigure = bool(params.get('autoconfigure', True))
+    # Sentinel HW_MTU so a no-op (autoconfigure off) is observable as unchanged.
+    sentinel = -1
+    stand_in = types.SimpleNamespace(
+        AUTOCONFIGURE_MTU=autoconfigure, bitrate=bitrate, HW_MTU=sentinel,
+    )
+    Interface.optimise_mtu(stand_in)
+    return {
+        'hw_mtu': stand_in.HW_MTU,
+        'unchanged': stand_in.HW_MTU == sentinel,
     }
 
 
@@ -3687,9 +3893,11 @@ COMMANDS = {
     'discovery_announce_identity': cmd_discovery_announce_identity,
     'discovery_feature_defaults': cmd_discovery_feature_defaults,
     'discovery_inject_records': cmd_discovery_inject_records,
+    'discovery_store_record': cmd_discovery_store_record,
     # Reticulum config parsing — raw config string through RNS's own parser
     'config_parse_interface': cmd_config_parse_interface,
     'interface_default_ifac_size': cmd_interface_default_ifac_size,
+    'interface_optimise_mtu': cmd_interface_optimise_mtu,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

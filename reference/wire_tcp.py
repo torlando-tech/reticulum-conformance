@@ -3145,17 +3145,29 @@ def _find_link_by_id(inst, link_id):
     on the DESTINATION side — the receiver's inbound link carries the reduced
     mtu — so wire_link_mtu must be able to read a listener's inbound link too,
     not just an initiator's outbound one.
+
+    Briefly polls when the link is not found immediately: an initiator's
+    link_open can return ACTIVE a few ms before the RECEIVER's
+    on_link_established callback has appended the inbound link to its listener
+    (the LRPROOF is sent before the callback completes), so a server-side
+    injector invoked right after link setup can race that registration. Under
+    full-suite load this window widens; polling absorbs it. A genuinely unknown
+    link_id simply waits out the short timeout, then returns None as before.
     """
-    link = inst.get("out_links", {}).get(link_id)
-    if link is not None:
-        return link
-    for listener in inst.get("listeners", {}).values():
-        with listener["recv_lock"]:
-            inbound = list(listener.get("inbound_links", []))
-        for lk in inbound:
-            if getattr(lk, "link_id", None) == link_id:
-                return lk
-    return None
+    deadline = time.time() + 3.0
+    while True:
+        link = inst.get("out_links", {}).get(link_id)
+        if link is not None:
+            return link
+        for listener in inst.get("listeners", {}).values():
+            with listener["recv_lock"]:
+                inbound = list(listener.get("inbound_links", []))
+            for lk in inbound:
+                if getattr(lk, "link_id", None) == link_id:
+                    return lk
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.02)
 
 
 def cmd_wire_link_mtu(params):

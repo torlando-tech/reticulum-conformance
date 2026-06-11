@@ -3515,9 +3515,61 @@ def cmd_config_parse_interface(params):
             'default_ifac_size': int(iface.DEFAULT_IFAC_SIZE),
             'discoverable': bool(iface.discoverable),
             'discovery_announce_interval': iface.discovery_announce_interval,
+            # IFAC credential resolution (Reticulum.py:724-738, :895-916). RNS
+            # stores the resolved network name / passphrase straight onto the
+            # interface; an empty-string config value resolves to None (unset),
+            # and the networkname/network_name and passphrase/pass_phrase aliases
+            # both feed the same attribute. ifac_active reflects whether RNS
+            # actually derived an IFAC identity (interface.ifac_identity is set
+            # iff netname or netkey is non-None).
+            'ifac_netname': getattr(iface, 'ifac_netname', None),
+            'ifac_netkey': getattr(iface, 'ifac_netkey', None),
+            'ifac_active': getattr(iface, 'ifac_identity', None) is not None,
         })
         RNS.Transport.remove_interface(iface)
     return result
+
+
+def cmd_interface_default_ifac_size(params):
+    """Return the per-class DEFAULT_IFAC_SIZE constants for the RNS interface
+    types, read straight off the interface CLASS objects.
+
+    Delegates entirely to real RNS: each value is the class attribute
+    `<Interface>.DEFAULT_IFAC_SIZE` (e.g. SerialInterface.py:53 == 8,
+    TCPInterface.py:77 == 16). These are static class constants, so the classes
+    are merely imported and the attribute read — no instance is built and no
+    device/socket is opened (the serial/KISS/RNode classes only touch hardware
+    at __init__, which we never call). This pins the spec rule that
+    low-bandwidth, framed-serial media (Serial/KISS/AX25KISS/RNode/Pipe) default
+    to an 8-byte IFAC authentication tag while packet/IP media (TCP/UDP/Auto)
+    default to 16 — an impl that used 16 on serial-class media would partition
+    itself from conformant peers on those networks.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS.Interfaces.SerialInterface import SerialInterface
+    from RNS.Interfaces.KISSInterface import KISSInterface
+    from RNS.Interfaces.AX25KISSInterface import AX25KISSInterface
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    from RNS.Interfaces.PipeInterface import PipeInterface
+    from RNS.Interfaces.TCPInterface import TCPServerInterface, TCPClientInterface
+    from RNS.Interfaces.UDPInterface import UDPInterface
+
+    classes = {
+        "SerialInterface": SerialInterface,
+        "KISSInterface": KISSInterface,
+        "AX25KISSInterface": AX25KISSInterface,
+        "RNodeInterface": RNodeInterface,
+        "PipeInterface": PipeInterface,
+        "TCPServerInterface": TCPServerInterface,
+        "TCPClientInterface": TCPClientInterface,
+        "UDPInterface": UDPInterface,
+    }
+    return {
+        "default_ifac_size": {
+            name: int(cls.DEFAULT_IFAC_SIZE) for name, cls in classes.items()
+        },
+        "ifac_min_size": int(RNS.Reticulum.IFAC_MIN_SIZE),
+    }
 
 
 # Command dispatcher
@@ -3637,6 +3689,7 @@ COMMANDS = {
     'discovery_inject_records': cmd_discovery_inject_records,
     # Reticulum config parsing — raw config string through RNS's own parser
     'config_parse_interface': cmd_config_parse_interface,
+    'interface_default_ifac_size': cmd_interface_default_ifac_size,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

@@ -92,7 +92,7 @@ class _WirePeer:
         mode: str | None = None,
         share_instance: bool = False,
         share_instance_type: str | None = None,
-        enable_transport: bool = True,
+        enable_transport: bool | None = True,
         fixed_mtu: int | None = None,
         ifac_size: int | None = None,
         bitrate: int | None = None,
@@ -100,6 +100,10 @@ class _WirePeer:
         use_implicit_proof: bool | None = None,
         enable_remote_management: bool = False,
         remote_management_allowed: list | None = None,
+        panic_on_interface_error: bool | None = None,
+        blackhole_sources: list | None = None,
+        interface_discovery_sources: list | None = None,
+        rpc_key: str | None = None,
     ) -> int:
         """Bring up a TCPServerInterface on this peer.
 
@@ -149,7 +153,12 @@ class _WirePeer:
             kwargs["share_instance"] = True
             if share_instance_type is not None:
                 kwargs["share_instance_type"] = share_instance_type
-        if not enable_transport:
+        # enable_transport tri-state: None -> omit the config line entirely
+        # (pins the option-ABSENT default-off posture); False -> explicit No;
+        # True (default) -> the line is left implicit (server default).
+        if enable_transport is None:
+            kwargs["enable_transport"] = None
+        elif not enable_transport:
             kwargs["enable_transport"] = False
         if ifac_size is not None:
             kwargs["ifac_size"] = int(ifac_size)
@@ -163,6 +172,14 @@ class _WirePeer:
             kwargs["enable_remote_management"] = True
         if remote_management_allowed is not None:
             kwargs["remote_management_allowed"] = list(remote_management_allowed)
+        if panic_on_interface_error is not None:
+            kwargs["panic_on_interface_error"] = bool(panic_on_interface_error)
+        if blackhole_sources is not None:
+            kwargs["blackhole_sources"] = list(blackhole_sources)
+        if interface_discovery_sources is not None:
+            kwargs["interface_discovery_sources"] = list(interface_discovery_sources)
+        if rpc_key is not None:
+            kwargs["rpc_key"] = str(rpc_key)
         resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
@@ -2754,6 +2771,13 @@ class _WirePeer:
         """Read the ground-truth process-wide posture flags RNS resolved."""
         assert self.handle, "start_* must be called first"
         return self.bridge.execute("wire_instance_posture", handle=self.handle)
+
+    def mgmt_destinations(self) -> dict:
+        """Read the live transport-management Destinations (probe /
+        remote-management) RNS registered at Transport.start. See
+        cmd_wire_mgmt_destinations for the returned shape."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_mgmt_destinations", handle=self.handle)
 
     def interface_bitrate(self) -> dict:
         """Read this peer's effective interface bitrate + class guess +

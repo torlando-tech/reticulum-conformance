@@ -1695,8 +1695,81 @@ def cmd_behavioral_blackhole_set_sources(params):
     return {"count": len(trusted)}
 
 
+def cmd_behavioral_hold_and_release_announce(params):
+    """Hold a set of real announce packets on an interface's ingress-control
+    queue, then run ONE release pass and report which destination was released.
+
+    This exposes the lowest-hops-FIRST release decision in
+    Interface.process_held_announces (Interfaces/Interface.py:234-253) without
+    any real clock dependence:
+
+      * Each raw announce is turned into a genuine RNS.Packet exactly as
+        Transport.inbound does (`RNS.Packet(None, raw)` + `packet.unpack()`,
+        Transport.py:1451-1452), its receiving_interface pointed at the mock
+        interface, and handed to the REAL `interface.hold_announce(packet)`
+        (Interface.py:228-232) — the same call Transport.inbound makes at
+        :1704. The harness reimplements no hold/selection logic.
+      * `interface.ic_held_release` is backdated to 0 so the release gate
+        (`time.time() > ic_held_release`) is open with no sleep — the same
+        backdating technique the rest of the suite uses for time-gated jobs.
+      * `interface.process_held_announces()` is then called ONCE. It selects the
+        held announce with the FEWEST hops, pops it from `held_announces`, and
+        re-injects it on a daemon thread. We read `held_announces` keys before
+        and after (the pop is synchronous) to report exactly which destination
+        was released. The re-injection does NOT re-hold the announce: a fresh
+        mock interface has ic_burst_active False and incoming_announce_frequency
+        0, so should_ingress_limit() is False (Interface.py:145-165), the branch
+        that would re-hold it (Transport.py:1703-1704) is not taken.
+
+    params:
+        handle, iface_id, announces (list of raw announce hex)
+    returns:
+        held_before (list of dest_hash hex), held_after (list), released (list),
+        hops ({dest_hash hex: hop count})
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    announces = params["announces"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    hops_map = {}
+    for raw_hex in announces:
+        raw = bytes.fromhex(raw_hex)
+        # Build the Packet exactly as Transport.inbound does, then hold it via
+        # the real ingress-control API.
+        packet = RNS.Packet(None, raw)
+        if not packet.unpack():
+            raise ValueError("could not unpack supplied announce packet")
+        packet.receiving_interface = iface
+        iface.hold_announce(packet)
+        hops_map[packet.destination_hash.hex()] = int(packet.hops)
+
+    held_before = [dh.hex() for dh in iface.held_announces.keys()]
+    # Open the release gate deterministically (no sleep).
+    iface.ic_held_release = 0
+    iface.process_held_announces()
+    held_after = [dh.hex() for dh in iface.held_announces.keys()]
+    released = [dh for dh in held_before if dh not in held_after]
+
+    return {
+        "held_before": held_before,
+        "held_after": held_after,
+        "released": released,
+        "hops": hops_map,
+    }
+
+
 BEHAVIORAL_COMMANDS = {
     "behavioral_register_destination": cmd_behavioral_register_destination,
+    "behavioral_hold_and_release_announce": cmd_behavioral_hold_and_release_announce,
     "behavioral_read_announce_rate": cmd_behavioral_read_announce_rate,
     "behavioral_set_path_expires": cmd_behavioral_set_path_expires,
     "behavioral_mark_path_unresponsive": cmd_behavioral_mark_path_unresponsive,

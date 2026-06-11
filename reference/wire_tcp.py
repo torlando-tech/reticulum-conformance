@@ -220,13 +220,16 @@ def _write_ifac_ini(
     shared_instance_port: int | None = None,
     instance_control_port: int | None = None,
     rpc_key: str | None = None,
-    enable_transport: bool = True,
+    enable_transport: bool | None = True,
     ifac_size: int | None = None,
     bitrate: int | None = None,
     respond_to_probes: bool = False,
     use_implicit_proof: bool | None = None,
     enable_remote_management: bool = False,
     remote_management_allowed: list | None = None,
+    panic_on_interface_error: bool | None = None,
+    blackhole_sources: list | None = None,
+    interface_discovery_sources: list | None = None,
 ):
     """Write a minimal RNS config.
 
@@ -329,7 +332,37 @@ def _write_ifac_ini(
         if rpc_key
         else ""
     )
-    transport_value = "Yes" if enable_transport else "No"
+    # enable_transport is tri-state: True/False writes the explicit knob;
+    # None OMITS the line entirely, so a test can pin the option-ABSENT
+    # default-off posture (Reticulum.py:253 __transport_enabled defaults False;
+    # the parser at :497-499 only flips it True on an explicit Yes — absent and
+    # No are equivalent, but the default-off case is the one no prior test wrote).
+    if enable_transport is None:
+        transport_line = ""
+    else:
+        transport_line = f"  enable_transport = {'Yes' if enable_transport else 'No'}\n"
+
+    # panic_on_interface_error tri-state (Reticulum.py:280 default False,
+    # parsed at :551-553). None omits the line (default-off posture); a bool
+    # writes the explicit Yes/No knob.
+    panic_line = ""
+    if panic_on_interface_error is not None:
+        panic_line = (
+            f"  panic_on_interface_error = {'Yes' if panic_on_interface_error else 'No'}\n"
+        )
+
+    # blackhole_sources / interface_discovery_sources are comma-separated lists
+    # of identity-hash hex strings. RNS validates each at __apply_config time
+    # (Reticulum.py:575-591): a wrong-length or non-hex entry raises ValueError
+    # and aborts startup; valid entries are deduplicated into the source lists.
+    blackhole_line = ""
+    if blackhole_sources:
+        joined = ", ".join(str(h) for h in blackhole_sources)
+        blackhole_line = f"  blackhole_sources = {joined}\n"
+    discovery_line = ""
+    if interface_discovery_sources:
+        joined = ", ".join(str(h) for h in interface_discovery_sources)
+        discovery_line = f"  interface_discovery_sources = {joined}\n"
 
     # [reticulum]-level posture knobs. RNS parses each in __apply_config
     # (Reticulum.py:528-545, :555-558): respond_to_probes -> __allow_probes,
@@ -363,7 +396,7 @@ def _write_ifac_ini(
     with open(config_file, "w") as f:
         f.write(
             "[reticulum]\n"
-            f"  enable_transport = {transport_value}\n"
+            f"{transport_line}"
             f"  share_instance = {share_value}\n"
             f"{instance_line}"
             f"{type_line}"
@@ -374,6 +407,9 @@ def _write_ifac_ini(
             f"{remote_mgmt_line}"
             f"{remote_allowed_line}"
             f"{implicit_proof_line}"
+            f"{panic_line}"
+            f"{blackhole_line}"
+            f"{discovery_line}"
             f"{interfaces_section}"
         )
 
@@ -440,7 +476,13 @@ def cmd_wire_start_tcp_server(params):
     # an attached local client's announces/links must still reach a TCP peer even
     # though Reticulum.transport_enabled() is False on the master; an impl that
     # gates local-client forwarding on transport_enabled black-holes them.
-    enable_transport = bool(params.get("enable_transport", True))
+    #
+    # enable_transport is tri-state: omitting the param keeps the default (True);
+    # passing it explicitly as None writes NO enable_transport line at all, so a
+    # test can pin the option-ABSENT default-off posture (Reticulum.py:497-499
+    # only flips transport on for an explicit Yes).
+    _et = params.get("enable_transport", True)
+    enable_transport = None if _et is None else bool(_et)
     # fixed_mtu pins the TCPInterface to a small fixed link MTU
     # (TCPInterface.py:110-116: disables AUTOCONFIGURE_MTU, sets HW_MTU). Both
     # peers of a link must use the same value so the negotiated link SDU stays
@@ -460,6 +502,19 @@ def cmd_wire_start_tcp_server(params):
         use_implicit_proof = bool(use_implicit_proof)
     enable_remote_management = bool(params.get("enable_remote_management", False))
     remote_management_allowed = params.get("remote_management_allowed")
+    # panic_on_interface_error is tri-state (None omits the line -> default off).
+    _panic = params.get("panic_on_interface_error")
+    panic_on_interface_error = None if _panic is None else bool(_panic)
+    # blackhole_sources / interface_discovery_sources: lists of identity-hash
+    # hex strings written verbatim so RNS's own __apply_config length/hex
+    # validation (Reticulum.py:575-591) runs against them at startup.
+    blackhole_sources = params.get("blackhole_sources")
+    interface_discovery_sources = params.get("interface_discovery_sources")
+    # rpc_key override for a STANDALONE node (not just shared-instance masters):
+    # lets a test feed a malformed or custom rpc_key and observe the parse-time
+    # fallback/acceptance (Reticulum.py:489-495). None -> keep RNS default
+    # derivation; a string is written verbatim into the config.
+    standalone_rpc_key = params.get("rpc_key")
     share_instance_type = params.get("share_instance_type")
     if share_instance_type is not None:
         share_instance_type = str(share_instance_type).lower()
@@ -492,6 +547,10 @@ def cmd_wire_start_tcp_server(params):
         shared_instance_port = _allocate_free_port()
         instance_control_port = _allocate_free_port()
         rpc_key_hex = secrets.token_hex(32)
+    # A standalone rpc_key override (malformed-hex / custom-key tests) takes
+    # precedence over the auto-generated shared-instance key.
+    if standalone_rpc_key is not None:
+        rpc_key_hex = str(standalone_rpc_key)
 
     config_dir = tempfile.mkdtemp(prefix="rns_wire_server_")
     # instance_name must be unique per bridge process: the AF_UNIX abstract
@@ -526,6 +585,9 @@ def cmd_wire_start_tcp_server(params):
         use_implicit_proof=use_implicit_proof,
         enable_remote_management=enable_remote_management,
         remote_management_allowed=remote_management_allowed,
+        panic_on_interface_error=panic_on_interface_error,
+        blackhole_sources=blackhole_sources,
+        interface_discovery_sources=interface_discovery_sources,
     )
 
     RNS = _get_rns()
@@ -8273,6 +8335,19 @@ def cmd_wire_instance_posture(params):
         "remote_management_allowed": [
             h.hex() for h in RNS.Transport.remote_management_allowed
         ],
+        # panic_on_interface_error is a plain class attribute set at
+        # Reticulum.__init__ (Reticulum.py:280 default False, :551-553 flips it
+        # True on the knob). getattr default False covers a never-constructed
+        # instance (it always exists here, since start_* built the singleton).
+        "panic_on_interface_error": bool(
+            getattr(RNS.Reticulum, "panic_on_interface_error", False)
+        ),
+        # blackhole / interface-discovery source identity hashes, deduplicated
+        # into the static lists by __apply_config (Reticulum.py:575-591).
+        "blackhole_sources": [h.hex() for h in RNS.Reticulum.blackhole_sources()],
+        "interface_discovery_sources": [
+            h.hex() for h in RNS.Reticulum.interface_discovery_sources()
+        ],
         "is_shared_instance": bool(
             getattr(inst["rns"], "is_shared_instance", False)
         ),
@@ -8280,6 +8355,90 @@ def cmd_wire_instance_posture(params):
             getattr(inst["rns"], "is_connected_to_shared_instance", False)
         ),
     }
+
+
+def cmd_wire_mgmt_destinations(params):
+    """Read the live transport-management Destinations RNS registered at
+    Transport.start time, so a test can pin the PROTOCOL CONSEQUENCE of the
+    respond_to_probes / enable_remote_management config knobs — not just the
+    posture flag.
+
+    Delegates entirely to real RNS: every value is read straight off the live
+    RNS.Transport / RNS.Destination objects RNS itself built —
+    Transport.probe_destination (Transport.py:396-403) and
+    Transport.remote_management_destination (Transport.py:252-258). No protocol
+    bytes are reconstructed; the destination hashes are the genuine
+    Destination.hash() outputs and the request-handler table is RNS's own
+    `request_handlers` dict.
+
+    Returned (all hex where bytes):
+      transport_identity_hash, app_name (Transport.APP_NAME)
+      probe: {present, hash, name, proof_strategy, accepts_links,
+              in_mgmt_destinations}
+      remote_management: {present, hash, name, in_mgmt_destinations,
+              in_mgmt_hashes, request_handlers:[{path, path_hash, allow,
+              allowed_hashes, allowed_list_is_acl}]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    T = RNS.Transport
+    identity = T.identity
+    mgmt_dests = list(getattr(T, "mgmt_destinations", []))
+    mgmt_hashes = list(getattr(T, "mgmt_hashes", []))
+
+    out = {
+        "transport_identity_hash": identity.hash.hex() if identity else None,
+        "app_name": T.APP_NAME,
+    }
+
+    probe = getattr(T, "probe_destination", None)
+    if probe is None:
+        out["probe"] = {"present": False}
+    else:
+        out["probe"] = {
+            "present": True,
+            "hash": probe.hash.hex(),
+            "name": probe.name,
+            "proof_strategy": int(probe.proof_strategy),
+            "accepts_links": bool(probe.accepts_links()),
+            "in_mgmt_destinations": any(d is probe for d in mgmt_dests),
+        }
+
+    rmd = getattr(T, "remote_management_destination", None)
+    # remote_management_destination has no class-level default; it only exists
+    # once enable_remote_management has fired. A disabled (fresh-process) node
+    # simply lacks the attribute.
+    if rmd is None or not RNS.Reticulum.remote_management_enabled():
+        out["remote_management"] = {"present": False}
+    else:
+        handlers = []
+        for path_hash, hdef in rmd.request_handlers.items():
+            # hdef == [path, response_generator, allow, allowed_list, auto_compress]
+            path, _gen, allow, allowed_list, _ac = hdef
+            handlers.append({
+                "path": path,
+                "path_hash": path_hash.hex(),
+                "allow": int(allow),
+                "allowed_hashes": [
+                    h.hex() for h in (allowed_list or [])
+                ],
+                # The handler's allowed_list IS the live Transport ACL object.
+                "allowed_list_is_acl": allowed_list is T.remote_management_allowed,
+            })
+        out["remote_management"] = {
+            "present": True,
+            "hash": rmd.hash.hex(),
+            "name": rmd.name,
+            "in_mgmt_destinations": any(d is rmd for d in mgmt_dests),
+            "in_mgmt_hashes": any(h == rmd.hash for h in mgmt_hashes),
+            "request_handlers": handlers,
+        }
+    return out
 
 
 def cmd_wire_interface_bitrate(params):
@@ -9507,6 +9666,7 @@ WIRE_COMMANDS = {
     # reticulum_config posture / config-derivation read-backs
     "wire_ifac_signature": cmd_wire_ifac_signature,
     "wire_instance_posture": cmd_wire_instance_posture,
+    "wire_mgmt_destinations": cmd_wire_mgmt_destinations,
     "wire_interface_bitrate": cmd_wire_interface_bitrate,
     "wire_rpc_authkey": cmd_wire_rpc_authkey,
     "wire_first_hop_timeout": cmd_wire_first_hop_timeout,

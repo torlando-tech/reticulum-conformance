@@ -201,6 +201,20 @@ class Instance:
             rem_hops=rem_hops, hops=hops,
         )
 
+    def hold_and_release_announce(self, iface_id, announces):
+        """Hold a set of real announce packets on the interface's ingress-control
+        queue and run ONE release pass; returns {held_before, held_after,
+        released, hops} (dest_hash hex). See
+        behavioral_hold_and_release_announce — exposes the lowest-hops-first
+        release decision (Interface.process_held_announces)."""
+        return self.bridge.execute(
+            "behavioral_hold_and_release_announce",
+            handle=self.handle,
+            iface_id=iface_id,
+            announces=[a.hex() if isinstance(a, (bytes, bytearray)) else a
+                       for a in announces],
+        )
+
     def inject(self, iface_id, raw):
         self.bridge.execute(
             "behavioral_inject",

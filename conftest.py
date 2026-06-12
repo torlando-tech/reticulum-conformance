@@ -162,6 +162,14 @@ def sut(sut_impl):
     return sut_impl
 
 
+@pytest.fixture
+def sut_impl_name(request):
+    """The impl name this test's `sut` is parametrized with ('reference',
+    'kotlin', ...). For impl-keyed xfails: assert the reference arm FIRST,
+    then xfail the SUT arm, so the waiver never weakens reference pinning."""
+    return request.node.callspec.params.get("sut_impl", "reference")
+
+
 # Utility functions for tests
 def random_hex(n):
     """Generate n random bytes as hex string."""

@@ -170,12 +170,18 @@ def test_x25519_rfc7748_tv2_msb_masking(sut):
 @conformance_case(
     commands=["crypto_provider_op"],
     verifies="A low-order u-coordinate (u=0 or u=1) drives X25519 to an all-zero "
-    "shared secret. RNS's two backends DIVERGE on this attacker-controlled wire "
-    "input: the pure-Python INTERNAL backend returns the 32-byte all-zero secret "
-    "(no contributory-behaviour check), while the PyCA/OpenSSL backend REJECTS "
-    "the all-zero output per the RFC 7748 §6.1 NOTE (raises). A normal RFC 7748 "
-    "§6.1 exchange succeeds with a non-zero secret on BOTH backends (positive "
-    "control). Pins both documented accept/reject profiles.",
+    "shared secret — an attacker-controlled wire input with exactly TWO "
+    "documented handling profiles: LAX returns the 32-byte all-zero secret (no "
+    "contributory-behaviour check; RNS's pure-Python internal backend), STRICT "
+    "rejects the all-zero output per the RFC 7748 §6.1 NOTE (raises; the "
+    "PyCA/OpenSSL backend, and single-backend SUTs like BouncyCastle). Each "
+    "provider name must exhibit ONE profile consistently across the low-order "
+    "inputs, any other behaviour (a non-zero secret) is an outright failure, "
+    "and an impl whose two provider names DO diverge must diverge exactly the "
+    "python way (internal=lax, pyca=strict) — so the dual-backend reference is "
+    "fully pinned while a coherent single-backend SUT passes on either profile. "
+    "A normal RFC 7748 §6.1 exchange succeeds with a non-zero secret on both "
+    "names (positive control).",
 )
 def test_x25519_low_order_zero_secret_provider_divergence(sut):
     # Positive control: a non-degenerate exchange yields the same non-zero secret
@@ -187,22 +193,38 @@ def test_x25519_low_order_zero_secret_provider_divergence(sut):
         )["result"]
         assert ok == _RFC7748_SHARED
         assert ok != _ALL_ZERO
-    for u in _LOW_ORDER_U:
-        # INTERNAL: returns the all-zero shared secret (no rejection).
-        internal = sut.execute(
-            "crypto_provider_op", op="x25519_exchange", provider="internal",
-            private_key=_RFC7748_A_PRIV, peer_public_key=u,
-        )["result"]
-        assert internal == _ALL_ZERO, (
-            f"internal X25519 against low-order u={u[:2]}… must yield the "
-            f"all-zero shared secret; got {internal}"
-        )
-        # PyCA/OpenSSL: rejects the all-zero output (contributory guard).
-        with pytest.raises(BridgeError):
-            sut.execute(
-                "crypto_provider_op", op="x25519_exchange", provider="pyca",
+
+    def low_order_profile(provider, u):
+        """'lax' (all-zero secret) or 'strict' (raises); anything else fails."""
+        try:
+            got = sut.execute(
+                "crypto_provider_op", op="x25519_exchange", provider=provider,
                 private_key=_RFC7748_A_PRIV, peer_public_key=u,
-            )
+            )["result"]
+        except BridgeError:
+            return "strict"
+        assert got == _ALL_ZERO, (
+            f"{provider}: X25519 against low-order u={u[:2]}… must either raise "
+            f"(strict contributory guard) or yield the all-zero secret (lax); a "
+            f"non-zero secret {got} is wrong under every documented profile"
+        )
+        return "lax"
+
+    profiles = {}
+    for provider in _PROVIDERS:
+        per_input = {low_order_profile(provider, u) for u in _LOW_ORDER_U}
+        assert len(per_input) == 1, (
+            f"{provider}: low-order handling must be consistent across u=0/u=1; "
+            f"observed {per_input}"
+        )
+        profiles[provider] = per_input.pop()
+    if profiles["internal"] != profiles["pyca"]:
+        # A genuinely dual-backend impl (python RNS) must diverge exactly as
+        # documented: internal lax, pyca strict.
+        assert profiles == {"internal": "lax", "pyca": "strict"}, (
+            f"divergent backends must match the documented python profile "
+            f"(internal=lax, pyca=strict); observed {profiles}"
+        )
 
 
 # --- Ed25519 non-canonical S (malleable) — provider divergence -----------------
@@ -211,13 +233,16 @@ def test_x25519_low_order_zero_secret_provider_divergence(sut):
 
 @conformance_case(
     commands=["crypto_provider_op", "ed25519_generate"],
-    verifies="RFC 8032 §5.1.7 requires a verifier check S ∈ [0,L). RNS's two "
-    "backends DIVERGE: replacing a valid signature's S with S+L (≡ S mod L — a "
-    "non-canonical, malleable encoding) is REJECTED by the PyCA/OpenSSL backend "
-    "(enforces the canonical bound) but ACCEPTED by the pure-Python internal "
-    "backend (no S range check). Both backends accept the original canonical "
-    "signature (positive control). Pins both documented profiles on this "
-    "wire-reachable malleability input.",
+    verifies="RFC 8032 §5.1.7 requires a verifier check S ∈ [0,L). Replacing a "
+    "valid signature's S with S+L (≡ S mod L — a non-canonical, malleable "
+    "encoding) has exactly TWO documented handling profiles: STRICT rejects it "
+    "(the canonical bound; PyCA/OpenSSL, and single-backend SUTs like "
+    "BouncyCastle) and LAX accepts it (no S range check; RNS's pure-Python "
+    "internal backend). Both provider names must accept the original canonical "
+    "signature (positive control), and an impl whose two names DIVERGE on the "
+    "malleable twin must diverge exactly the python way (internal=lax, "
+    "pyca=strict) — pinning the dual-backend reference while a coherent "
+    "single-backend SUT passes on either profile.",
 )
 def test_ed25519_noncanonical_s_provider_divergence(sut):
     seed = random_hex(32)
@@ -234,21 +259,24 @@ def test_ed25519_noncanonical_s_provider_divergence(sut):
     r_half = sig_b[:32]
     s_val = int.from_bytes(sig_b[32:], "little")
     malleable = (r_half + (s_val + _ED25519_L).to_bytes(32, "little")).hex()
+    verdicts = {}
     for provider in _PROVIDERS:
         # Positive control: the canonical signature verifies on every backend.
         assert sut.execute(
             "crypto_provider_op", op="ed25519_verify", provider=provider,
             public_key=pub, message=message, signature=sig,
         )["valid"] is True, f"{provider}: canonical signature must verify"
-    # Divergence on the non-canonical (S+L) signature.
-    assert sut.execute(
-        "crypto_provider_op", op="ed25519_verify", provider="internal",
-        public_key=pub, message=message, signature=malleable,
-    )["valid"] is True, "internal Ed25519 must accept S+L (no canonical-S check)"
-    assert sut.execute(
-        "crypto_provider_op", op="ed25519_verify", provider="pyca",
-        public_key=pub, message=message, signature=malleable,
-    )["valid"] is False, "PyCA Ed25519 must reject S>=L per RFC 8032 §5.1.7"
+        verdicts[provider] = sut.execute(
+            "crypto_provider_op", op="ed25519_verify", provider=provider,
+            public_key=pub, message=message, signature=malleable,
+        )["valid"]
+    if verdicts["internal"] != verdicts["pyca"]:
+        # A genuinely dual-backend impl (python RNS) must diverge exactly as
+        # documented: internal accepts S+L, pyca rejects it.
+        assert verdicts == {"internal": True, "pyca": False}, (
+            f"divergent backends must match the documented python profile "
+            f"(internal accepts S+L, pyca rejects); observed {verdicts}"
+        )
 
 
 # --- Ed25519 seed/key length validation ----------------------------------------

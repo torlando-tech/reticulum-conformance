@@ -2123,6 +2123,13 @@ def cmd_wire_register_request_handler(params):
     # response (b""), which IS sent.
     response_none = bool(params.get("response_none", False))
     response = bytes.fromhex(params["response"]) if params.get("response") else b""
+    # File-response branch (Link.py:884-895): a handler returning
+    # (io.BufferedReader, metadata) makes RNS send a metadata-bearing response
+    # Resource (not a RESPONSE packet), and the receiver passes the open file
+    # handle + metadata straight to the handler un-unpacked. response_file is the
+    # file content (hex); response_metadata is the optional metadata (hex).
+    response_file_hex = params.get("response_file")
+    response_metadata_hex = params.get("response_metadata")
     allow_param = params.get("allow", "all")
     allowed_list_hex = params.get("allowed_identity_hashes", []) or []
 
@@ -2154,6 +2161,19 @@ def cmd_wire_register_request_handler(params):
     _request_handler_responses[key] = None if response_none else response
     _request_handler_log.setdefault(key, [])
 
+    # For a file response, persist the content once; the generator opens a fresh
+    # io.BufferedReader per request (RNS consumes/closes the handle as it streams
+    # the Resource). The metadata travels alongside as the second tuple element.
+    response_file_path = None
+    response_metadata = None
+    if response_file_hex is not None:
+        fd, response_file_path = tempfile.mkstemp(prefix="wire_resp_", suffix=".bin")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(bytes.fromhex(response_file_hex))
+        if response_metadata_hex is not None:
+            response_metadata = bytes.fromhex(response_metadata_hex)
+        inst.setdefault("request_response_files", []).append(response_file_path)
+
     def _generator(req_path, data, request_id, link_id, remote_identity, requested_at):
         _request_handler_log[key].append({
             "data": data if isinstance(data, (bytes, bytearray)) else b"",
@@ -2162,6 +2182,9 @@ def cmd_wire_register_request_handler(params):
             "remote_identity_hash": getattr(remote_identity, "hash", None),
             "requested_at": requested_at,
         })
+        if response_file_path is not None:
+            file_handle = open(response_file_path, "rb")
+            return (file_handle, response_metadata)
         return _request_handler_responses[key]
 
     destination.register_request_handler(
@@ -2223,7 +2246,35 @@ def cmd_wire_link_request(params):
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
 
     timeout_s = timeout_ms / 1000.0
-    receipt = link.request(path, data=data, timeout=timeout_s)
+
+    # A file response arrives as an open file-like (resource.data) that RNS
+    # closes AND deletes immediately after the conclusion callback returns
+    # (Resource.assemble:737-744). Capture it inside the response_callback, which
+    # fires while the handle is still open; metadata (an unpacked object) is
+    # retained on the receipt either way. Normal (bytes / large-resource)
+    # responses already arrive as bytes here, so this is a no-op for them.
+    captured = {}
+
+    def _capture(rcv_receipt):
+        try:
+            resp = rcv_receipt.get_response()
+            if isinstance(resp, (bytes, bytearray)):
+                captured["response"] = bytes(resp)
+            elif hasattr(resp, "read"):
+                try:
+                    resp.seek(0)
+                except Exception:
+                    pass
+                captured["response"] = resp.read()
+            else:
+                captured["response"] = None
+            captured["metadata"] = getattr(rcv_receipt, "metadata", None)
+        except Exception:
+            pass
+
+    receipt = link.request(
+        path, data=data, response_callback=_capture, timeout=timeout_s,
+    )
     # +0.5s slack so the receipt's own internal timeout fires first if
     # the network really stalled — that gives us the FAILED status
     # rather than our own poll-loop timeout returning ambiguous results.
@@ -2231,18 +2282,31 @@ def cmd_wire_link_request(params):
     while time.time() < deadline:
         status = receipt.get_status()
         if status == RNS.RequestReceipt.READY:
-            response = receipt.get_response()
+            if "response" in captured:
+                response_bytes = captured["response"]
+                metadata = captured.get("metadata")
+            else:
+                # Fallback if the callback didn't run: direct read (packet path).
+                response = receipt.get_response()
+                response_bytes = (
+                    bytes(response) if isinstance(response, (bytes, bytearray)) else None
+                )
+                metadata = getattr(receipt, "metadata", None)
             return {
                 "status": "ready",
                 "response": (
-                    response.hex() if isinstance(response, (bytes, bytearray)) else None
+                    response_bytes.hex()
+                    if isinstance(response_bytes, (bytes, bytearray)) else None
+                ),
+                "response_metadata": (
+                    metadata.hex() if isinstance(metadata, (bytes, bytearray)) else None
                 ),
                 "response_time_s": receipt.get_response_time(),
             }
         if status == RNS.RequestReceipt.FAILED:
-            return {"status": "failed", "response": None}
+            return {"status": "failed", "response": None, "response_metadata": None}
         time.sleep(0.05)
-    return {"status": "timeout", "response": None}
+    return {"status": "timeout", "response": None, "response_metadata": None}
 
 
 def cmd_wire_link_request_large(params):
@@ -4935,16 +4999,25 @@ def cmd_wire_listener_channel_rx(params):
         raise ValueError(
             f"No listener registered for destination_hash={destination_hash.hex()}"
         )
-    buffer_state = listener.get("buffer_state") or {}
-    reader = buffer_state.get("reader")
+    # The inbound Link and its RNS.Channel register asynchronously after the
+    # link activates; under full-suite load they may not be ready the instant
+    # the test queries. Poll briefly for the real channel (RNS's own async
+    # registration) before giving up, rather than racing it.
+    deadline = time.time() + 4.0
     channel = None
-    if reader is not None:
-        channel = getattr(reader, "_channel", None)
-    if channel is None:
-        with listener["recv_lock"]:
-            links = list(listener.get("inbound_links", []))
-        if links:
-            channel = links[0].get_channel()
+    while True:
+        buffer_state = listener.get("buffer_state") or {}
+        reader = buffer_state.get("reader")
+        if reader is not None:
+            channel = getattr(reader, "_channel", None)
+        if channel is None:
+            with listener["recv_lock"]:
+                links = list(listener.get("inbound_links", []))
+            if links:
+                channel = links[0].get_channel()
+        if channel is not None or time.time() >= deadline:
+            break
+        time.sleep(0.05)
     if channel is None:
         raise ValueError("no inbound channel on this listener")
     return {

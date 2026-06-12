@@ -530,6 +530,8 @@ class _WirePeer:
         allowed_identity_hashes: list | None = None,
         strategy: str | None = None,
         response_none: bool = False,
+        response_file: bytes | None = None,
+        response_metadata: bytes | None = None,
     ) -> None:
         """Register a fixed-response request handler on a listening
         destination — the bridge plugs in a generator that returns the
@@ -552,6 +554,11 @@ class _WirePeer:
         `response_none=True` makes the handler return None instead of bytes: the
         handler still fires (and is logged), but RNS sends no RESPONSE
         packet/resource (Link.py:893), so the requester only ever times out.
+
+        `response_file` (bytes) makes the handler return a (file, metadata) tuple:
+        RNS sends the response as a metadata-bearing Resource (Link.py:884-895),
+        and the requester sees `response` == the file content with
+        `response_metadata` == `response_metadata` (un-unpacked).
         """
         assert self.handle, "start_* must be called first"
         effective_allow = strategy if strategy is not None else allow
@@ -564,6 +571,10 @@ class _WirePeer:
         }
         if response_none:
             params["response_none"] = True
+        if response_file is not None:
+            params["response_file"] = response_file.hex()
+            if response_metadata is not None:
+                params["response_metadata"] = response_metadata.hex()
         if allowed_identity_hashes:
             params["allowed_identity_hashes"] = [
                 h.hex() if isinstance(h, (bytes, bytearray)) else str(h)

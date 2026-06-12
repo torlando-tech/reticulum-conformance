@@ -2117,6 +2117,11 @@ def cmd_wire_register_request_handler(params):
     handle = params["handle"]
     dest_hash = bytes.fromhex(params["destination_hash"])
     path = params["path"]
+    # response_none makes the generator return None — the handler still fires
+    # (and is logged), but RNS sends no RESPONSE packet/resource (Link.py:893),
+    # so the requester must rely on its timeout. Distinct from an empty-bytes
+    # response (b""), which IS sent.
+    response_none = bool(params.get("response_none", False))
     response = bytes.fromhex(params["response"]) if params.get("response") else b""
     allow_param = params.get("allow", "all")
     allowed_list_hex = params.get("allowed_identity_hashes", []) or []
@@ -2146,7 +2151,7 @@ def cmd_wire_register_request_handler(params):
         raise ValueError(f"unsupported allow: {allow_param!r} (use 'all', 'list' or 'none')")
 
     key = (handle, dest_hash, path)
-    _request_handler_responses[key] = response
+    _request_handler_responses[key] = None if response_none else response
     _request_handler_log.setdefault(key, [])
 
     def _generator(req_path, data, request_id, link_id, remote_identity, requested_at):
@@ -8863,9 +8868,15 @@ def cmd_wire_inject_crafted_link_request(params):
     accepted = link is not None
     establishment_timeout = None
     mode = None
+    mtu = None
     if accepted:
         establishment_timeout = getattr(link, "establishment_timeout", None)
         mode = int(link.mode) if getattr(link, "mode", None) is not None else None
+        # A 64-byte (signalling-less) request carries no MTU, so the inbound
+        # link's MTU stays Reticulum.MTU (500); a 67-byte request confirms one
+        # (Link.validate_request:192-198). Report it so the legacy default is
+        # pinnable.
+        mtu = int(link.mtu) if getattr(link, "mtu", None) is not None else None
         try:
             link.teardown()
         except Exception:
@@ -8878,8 +8889,181 @@ def cmd_wire_inject_crafted_link_request(params):
         "inbound_link_created": accepted,
         "establishment_timeout": establishment_timeout,
         "mode": mode,
+        "mtu": mtu,
         "establishment_timeout_per_hop": int(RNS.Link.ESTABLISHMENT_TIMEOUT_PER_HOP),
         "keepalive": int(RNS.Link.KEEPALIVE),
+    }
+
+
+def cmd_wire_link_type_gate(params):
+    """Pin Link's SINGLE-only construction rule (Link.py:234): an outbound Link
+    can only be established to a SINGLE destination; constructing a Link to a
+    PLAIN or GROUP destination raises TypeError before any handshake. An impl
+    that allows links to PLAIN/GROUP destinations diverges (links carry an
+    encrypted handshake that only the SINGLE identity model supports).
+
+    Self-contained: builds a fresh OUT destination of each type from the live
+    RNS instance and attempts RNS.Link(dest) on each, reporting whether (and
+    with what message) TypeError was raised. SINGLE is the positive control (no
+    TypeError; a real PENDING link is created and torn down); PLAIN and GROUP
+    must each raise. Every object is real RNS — the oracle is Link.__init__.
+
+    Returns {single, plain, group}, each {raised, error, link_created?}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params.get("app_name", "conformance")
+    aspects = params.get("aspects", ["link-type-gate"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    def _attempt(destination):
+        link = None
+        raised = None
+        try:
+            link = RNS.Link(destination)
+        except TypeError as e:
+            raised = str(e)
+        created = link is not None
+        if link is not None:
+            try:
+                link.teardown()
+            except Exception:
+                pass
+        return {"raised": raised is not None, "error": raised, "link_created": created}
+
+    single = RNS.Destination(
+        RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    plain = RNS.Destination(
+        None, RNS.Destination.OUT, RNS.Destination.PLAIN, app_name, *aspects,
+    )
+    group = RNS.Destination(
+        RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP, app_name, *aspects,
+    )
+    return {
+        "single": _attempt(single),
+        "plain": _attempt(plain),
+        "group": _attempt(group),
+    }
+
+
+def cmd_wire_link_phy_stats_gate(params):
+    """Pin Link physical-layer-stats gating (Link.py:573-598): get_rssi /
+    get_snr / get_q return the stored rssi/snr/q values ONLY when
+    track_phy_stats is enabled; with tracking off they return None regardless of
+    any stored values. An impl that leaks stale phy stats (or never gates them)
+    diverges from the documented API contract.
+
+    Stores sentinel phy values on the established link, then reads the getters
+    with tracking OFF (default), ON (via the real link.track_phy_stats(True)),
+    and OFF again. Every read goes through RNS's own getters — the oracle is the
+    real gating logic.
+
+    Returns {stored, off, on, off_again}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    link = inst.get("out_links", {}).get(link_id) or _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    stored = {"rssi": -42, "snr": 7, "q": 83}
+
+    def _read():
+        return {"rssi": link.get_rssi(), "snr": link.get_snr(), "q": link.get_q()}
+
+    # Tracking is off by default — set stored values directly and confirm the
+    # getters gate them to None.
+    link.rssi, link.snr, link.q = stored["rssi"], stored["snr"], stored["q"]
+    off = _read()
+
+    link.track_phy_stats(True)
+    link.rssi, link.snr, link.q = stored["rssi"], stored["snr"], stored["q"]
+    on = _read()
+
+    link.track_phy_stats(False)
+    link.rssi, link.snr, link.q = stored["rssi"], stored["snr"], stored["q"]
+    off_again = _read()
+
+    return {"stored": stored, "off": off, "on": on, "off_again": off_again}
+
+
+def cmd_wire_link_teardown_emission(params):
+    """Pin Link.teardown's LINKCLOSE-emission gate (Link.py:699-704): teardown
+    emits an on-wire LINKCLOSE packet ONLY when the link is past PENDING (and
+    not already CLOSED). A PENDING link tears down silently (watchdog expiry of
+    an un-established link must not spray a close packet); an ACTIVE link emits
+    exactly one LINKCLOSE. An impl that emits a close for a never-established
+    link (or omits it for an active one) diverges observably.
+
+    Wraps RNS.Packet.send to count LINKCLOSE emissions across two teardowns:
+    a freshly-built initiator link forced PENDING, and the supplied ESTABLISHED
+    outbound link. The link objects and teardown are all real RNS.
+
+    Returns {pending_linkclose_emitted, active_linkclose_emitted,
+    active_status_before}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    app_name = params.get("app_name", "conformance")
+    aspects = params.get("aspects", ["teardown-emit"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    active_link = inst.get("out_links", {}).get(link_id)
+    if active_link is None:
+        raise ValueError(f"Unknown outbound link_id: {link_id.hex()}")
+
+    captured = {"count": 0}
+    orig_send = RNS.Packet.send
+
+    def capturing_send(pkt_self, _orig=orig_send):
+        try:
+            if getattr(pkt_self, "context", None) == RNS.Packet.LINKCLOSE:
+                captured["count"] += 1
+        except Exception:
+            pass
+        return _orig(pkt_self)
+
+    RNS.Packet.send = capturing_send
+    try:
+        # PENDING: a fresh initiator link forced PENDING (its constructor sends a
+        # LINKREQUEST, never a LINKCLOSE, so it does not perturb the count).
+        pending = RNS.Link(RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+            app_name, *aspects,
+        ))
+        pending.status = RNS.Link.PENDING
+        before_pending = captured["count"]
+        pending.teardown()
+        pending_emitted = captured["count"] - before_pending
+
+        # ACTIVE: the established link.
+        active_status_before = _LINK_STATUS_NAMES.get(
+            getattr(active_link, "status", None)
+        )
+        before_active = captured["count"]
+        active_link.teardown()
+        active_emitted = captured["count"] - before_active
+    finally:
+        RNS.Packet.send = orig_send
+
+    return {
+        "pending_linkclose_emitted": pending_emitted,
+        "active_linkclose_emitted": active_emitted,
+        "active_status_before": active_status_before,
     }
 
 
@@ -9749,6 +9933,9 @@ WIRE_COMMANDS = {
     "wire_link_request_payload": cmd_wire_link_request_payload,
     "wire_link_signalling_bytes": cmd_wire_link_signalling_bytes,
     "wire_inject_crafted_link_request": cmd_wire_inject_crafted_link_request,
+    "wire_link_type_gate": cmd_wire_link_type_gate,
+    "wire_link_phy_stats_gate": cmd_wire_link_phy_stats_gate,
+    "wire_link_teardown_emission": cmd_wire_link_teardown_emission,
     "wire_link_accept_gate": cmd_wire_link_accept_gate,
     "wire_link_key_material": cmd_wire_link_key_material,
     "wire_inject_closed_link_data": cmd_wire_inject_closed_link_data,

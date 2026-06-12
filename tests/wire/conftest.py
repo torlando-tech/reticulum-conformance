@@ -525,10 +525,11 @@ class _WirePeer:
         self,
         destination_hash: bytes,
         path: str,
-        response: bytes,
+        response: bytes = b"",
         allow: str = "all",
         allowed_identity_hashes: list | None = None,
         strategy: str | None = None,
+        response_none: bool = False,
     ) -> None:
         """Register a fixed-response request handler on a listening
         destination — the bridge plugs in a generator that returns the
@@ -547,6 +548,10 @@ class _WirePeer:
         `strategy` is an explicit alias for `allow` (the contract names this
         policy the request "strategy"); when given it overrides `allow`. Both
         map to the wire command's `allow` parameter.
+
+        `response_none=True` makes the handler return None instead of bytes: the
+        handler still fires (and is logged), but RNS sends no RESPONSE
+        packet/resource (Link.py:893), so the requester only ever times out.
         """
         assert self.handle, "start_* must be called first"
         effective_allow = strategy if strategy is not None else allow
@@ -557,6 +562,8 @@ class _WirePeer:
             "response": response.hex(),
             "allow": effective_allow,
         }
+        if response_none:
+            params["response_none"] = True
         if allowed_identity_hashes:
             params["allowed_identity_hashes"] = [
                 h.hex() if isinstance(h, (bytes, bytearray)) else str(h)
@@ -2557,13 +2564,41 @@ class _WirePeer:
     def inject_crafted_lrproof(self, variant: str) -> dict:
         """Adversarial LRPROOF injector: on this peer, create a self-contained
         initiator link to a fresh controlled destination, craft an LRPROOF of
-        `variant` (valid / forged_signature / wrong_signed_data) and feed it
-        through the real Link.validate_proof, reporting {variant, activated,
-        status, status_name}. A valid proof activates the link; a forged one
-        does not."""
+        `variant` (valid / forged_signature / wrong_signed_data / mode_mismatch /
+        wrong_size / non_pending) and feed it through the real
+        Link.validate_proof, reporting {variant, activated, status, status_name,
+        mtu, mode}. A valid proof activates the link; a forged / mode-mismatched
+        / wrong-sized / out-of-state one does not."""
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_inject_crafted_lrproof", handle=self.handle, variant=variant,
+        )
+
+    def link_type_gate(self) -> dict:
+        """Pin Link's SINGLE-only rule: attempt RNS.Link() to a fresh OUT
+        destination of each type. Returns {single, plain, group}, each
+        {raised, error, link_created?}. SINGLE must not raise (positive
+        control); PLAIN and GROUP must each raise TypeError."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_link_type_gate", handle=self.handle)
+
+    def link_phy_stats_gate(self, link_id: bytes) -> dict:
+        """Pin Link phy-stats gating on an established link: stores sentinel
+        rssi/snr/q and reads get_rssi/get_snr/get_q with tracking off, on, and
+        off again. Returns {stored, off, on, off_again}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_phy_stats_gate", handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def link_teardown_emission(self, link_id: bytes) -> dict:
+        """Pin Link.teardown's LINKCLOSE-emission gate: counts LINKCLOSE packets
+        emitted when tearing down a fresh PENDING link vs the supplied
+        established (ACTIVE) link. Returns {pending_linkclose_emitted,
+        active_linkclose_emitted, active_status_before}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_teardown_emission", handle=self.handle, link_id=link_id.hex(),
         )
 
     def capture_lrproof_frame(self) -> dict:

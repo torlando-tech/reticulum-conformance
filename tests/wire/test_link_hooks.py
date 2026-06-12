@@ -166,7 +166,19 @@ def test_link_request_size_and_mode_validation(wire_pair_started):
         res = client.inject_crafted_link_request(variant)
         assert res["accepted"] is True, (variant, res)
         assert res["inbound_link_created"] is True, (variant, res)
-    assert client.inject_crafted_link_request("valid64")["data_len"] == _ECPUBSIZE
+    v64 = client.inject_crafted_link_request("valid64")
+    assert v64["data_len"] == _ECPUBSIZE
+    # A bare 64-byte (signalling-less) LINKREQUEST is the 1.0.x compat path:
+    # mode defaults to MODE_DEFAULT and the inbound link's MTU stays the
+    # Reticulum.MTU == 500 fallback (no MTU is signalled) — pin both so an impl
+    # that mis-derives the legacy defaults diverges (Link.py:172-176, 192-200).
+    assert v64["mode"] == _MODE_AES256_CBC, (
+        f"a 64-byte LINKREQUEST must default to MODE_DEFAULT (AES256_CBC): {v64!r}"
+    )
+    assert v64["mtu"] == _RETICULUM_MTU, (
+        f"a 64-byte LINKREQUEST carries no MTU; the link MTU must stay the "
+        f"Reticulum.MTU fallback of {_RETICULUM_MTU}: {v64!r}"
+    )
     assert client.inject_crafted_link_request("valid67")["data_len"] == (
         _ECPUBSIZE + _LINK_MTU_SIZE
     )

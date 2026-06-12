@@ -2290,6 +2290,20 @@ class _WirePeer:
             timeout_ms=timeout_ms,
         )
 
+    def send_undecryptable(self, destination_hash: bytes, data: bytes,
+                           app_name: str, aspects: list) -> dict:
+        """Adversarial: send a SINGLE DATA packet whose ciphertext is damaged so
+        the receiver cannot decrypt it, returning {sent, receipt_id}. Poll the
+        receipt with packet_receipt_status — it must NEVER reach DELIVERED (the
+        receiver delivers nothing and emits no proof). See
+        wire_send_undecryptable."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_undecryptable",
+            handle=self.handle, destination_hash=destination_hash.hex(),
+            data=data.hex(), app_name=app_name, aspects=list(aspects),
+        )
+
     def inject_crafted_proof(self, receipt_id: str, variant: str) -> dict:
         """Adversarial PROOF injector: craft a forged/malformed PROOF of
         `variant` against the pending PacketReceipt `receipt_id` and run it

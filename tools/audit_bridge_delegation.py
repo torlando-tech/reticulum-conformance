@@ -166,11 +166,30 @@ MIRRORS_RNS_RECEIVE: dict[str, str] = {
 # (build_command_index fails the audit if a name here stops backing a real
 # handler). Anything that ASSEMBLES protocol bytes is still HANDROLLED.
 ADVERSARIAL_CORRUPTORS: dict[str, str] = {
+    "cmd_wire_send_undecryptable":
+        "Builds a real SINGLE DATA packet to the recalled OUT destination via "
+        "RNS.Packet.pack (genuine RNS encryption + receipt), then damages one "
+        "ciphertext byte so the receiver's Token HMAC verification fails and "
+        "Destination.receive returns False. Asserts the receiver delivers nothing "
+        "and emits no proof — the real decrypt/reject path is under test; no "
+        "protocol is assembled here.",
     "cmd_wire_inject_tampered_link_data":
         "Packs a real DATA packet to an established link via RNS.Packet.pack, "
         "damages one byte (or truncates), and feeds it to the real link.receive; "
         "asserts the genuine packet is delivered and the tampered one is dropped "
         "by RNS's own token-HMAC-before-decrypt — no protocol assembled here.",
+    "cmd_wire_inject_crafted_lrproof":
+        "Builds a link-establishment PROOF and replays it through the real "
+        "Link.validate_proof (the oracle that decides ACTIVE / PENDING / CLOSED). "
+        "The signatures are genuine RNS crypto (real Identity.sign by the "
+        "destination key, a throwaway key, or over unrelated data) and the body "
+        "is concatenated exactly as Link.prove builds it; the mode_mismatch "
+        "variant signs a GENUINE full-MTU proof (real Link.signalling_bytes at "
+        "the link's own mode) and then flips ONLY the mode field of one "
+        "signalling byte, and wrong_size truncates a genuine 96-byte proof — both "
+        "are single-artifact corruptions, not hand-assembled protocol. No "
+        "validation logic is reimplemented; RNS's own validate_proof judges every "
+        "variant.",
     "cmd_wire_inject_crafted_link_request":
         "Feeds a crafted LINKREQUEST payload through the real "
         "Link.validate_request. The 64/67-byte and size variants are slices of "

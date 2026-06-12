@@ -3338,6 +3338,65 @@ def cmd_wire_send_packet(params):
     return {"sent": True, "receipt_id": receipt_id, "hops": hops}
 
 
+def cmd_wire_send_undecryptable(params):
+    """Adversarial: send a SINGLE DATA packet whose ciphertext is DAMAGED so the
+    receiver cannot decrypt it, to verify the receiver delivers nothing and emits
+    no proof (Transport.py:2157 gates prove() on a truthy Destination.receive()).
+
+    Built exactly like wire_send_packet — a real RNS.Packet to the recalled OUT
+    SINGLE destination, with a tracked PacketReceipt — and packed by real RNS, so
+    it routes normally and reaches the receiver's Transport.inbound. The ONLY
+    difference is one damaged ciphertext byte (after pack(), so the corruption
+    survives onto the wire): the receiver's Token HMAC verification then fails and
+    Identity.decrypt returns None, so Destination.receive returns False — which
+    short-circuits before BOTH the packet callback AND the PROVE_ALL auto-proof.
+    No protocol is assembled here; a genuine RNS-encrypted packet is merely
+    damaged, so the receiver's real decrypt/reject path is what's under test.
+
+    Returns {sent, receipt_id} (poll via wire_packet_receipt_status — it must
+    NEVER reach DELIVERED, since no proof comes back).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data", ""))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; ensure an announce "
+            f"for this destination was received first."
+        )
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects
+    )
+
+    packet = RNS.Packet(out_destination, payload, create_receipt=True)
+    packet.pack()  # real RNS encryption; packed=True so send() won't re-pack
+    # Damage the final ciphertext byte (the Token HMAC tail) so the receiver's
+    # HMAC verification fails and decrypt returns None.
+    raw = bytearray(packet.raw)
+    raw[-1] = (raw[-1] + 1) % 256
+    packet.raw = bytes(raw)
+
+    receipt = packet.send()
+    if receipt is False:
+        return {"sent": False, "receipt_id": None}
+    receipt_id = None
+    if receipt is not None:
+        receipt_id = secrets.token_hex(8)
+        inst.setdefault("receipts", {})[receipt_id] = receipt
+    inst["destinations"].append((identity, out_destination))
+    return {"sent": True, "receipt_id": receipt_id}
+
+
 _PACKET_RECEIPT_STATUS_NAMES = {0x00: "FAILED", 0x01: "SENT", 0x02: "DELIVERED", 0xFF: "CULLED"}
 
 
@@ -8039,6 +8098,19 @@ def cmd_wire_inject_crafted_lrproof(params):
       forged_signature  — a DIFFERENT (throwaway) identity signs; must NOT activate.
       wrong_signed_data — the destination identity signs UNRELATED data; must NOT
                           activate.
+      mode_mismatch     — a GENUINE full-MTU proof signed at the link's own mode,
+                          with ONLY the mode field of the real signalling bytes
+                          flipped to a different enabled mode. validate_proof reads
+                          the mode first and raises on the mismatch
+                          (Link.py:401-403), so the link must go to CLOSED.
+      wrong_size        — a genuine legacy proof truncated one byte short of the
+                          96-byte form (and not the 99-byte MTU form): neither size
+                          branch matches, so validate_proof silently ignores it and
+                          the link stays PENDING.
+      non_pending       — a genuine, VALID proof delivered to a link that is NOT
+                          PENDING (forced CLOSED first): the PENDING guard
+                          (Link.py:398) must make validate_proof a no-op, so a late
+                          valid proof cannot resurrect a closed link.
 
     Returns {variant, activated, status, status_name}.
     """
@@ -8061,6 +8133,7 @@ def cmd_wire_inject_crafted_lrproof(params):
     link.status = RNS.Link.PENDING
 
     ec_half = RNS.Link.ECPUBSIZE // 2
+    sig_len = RNS.Identity.SIGLENGTH // 8
     ephemeral = X25519.X25519PrivateKey.generate()
     ephemeral_pub = ephemeral.public_key().public_bytes()
     dest_sig_pub = dest_identity.get_public_key()[ec_half:RNS.Link.ECPUBSIZE]
@@ -8068,14 +8141,41 @@ def cmd_wire_inject_crafted_lrproof(params):
 
     if variant == "valid":
         signature = dest_identity.sign(signed_data)
+        proof_data = signature + ephemeral_pub
     elif variant == "forged_signature":
         signature = RNS.Identity().sign(signed_data)  # signed by the WRONG key
+        proof_data = signature + ephemeral_pub
     elif variant == "wrong_signed_data":
         signature = dest_identity.sign(secrets.token_bytes(96))  # sig over unrelated data
+        proof_data = signature + ephemeral_pub
+    elif variant == "non_pending":
+        # A genuine, valid proof — but delivered to a non-PENDING link, so the
+        # PENDING guard (Link.py:398) must skip the whole body (no-op).
+        signature = dest_identity.sign(signed_data)
+        proof_data = signature + ephemeral_pub
+        link.status = RNS.Link.CLOSED
+    elif variant == "wrong_size":
+        # Genuine legacy proof, truncated one byte short of the 96-byte form.
+        signature = dest_identity.sign(signed_data)
+        proof_data = (signature + ephemeral_pub)[:-1]  # 95 bytes
+    elif variant == "mode_mismatch":
+        # Genuine full-MTU proof signed at the link's own (enabled) mode; then
+        # damage ONLY the mode field of the real signalling bytes to a different
+        # enabled mode. This is an adversarial corruption of a genuine artifact.
+        signalling = RNS.Link.signalling_bytes(RNS.Reticulum.MTU, link.mode)
+        signature = dest_identity.sign(
+            link.link_id + ephemeral_pub + dest_sig_pub + signalling
+        )
+        raw = bytearray(signature + ephemeral_pub + signalling)
+        wrong_mode = RNS.Link.MODE_AES256_GCM  # 0x02, != MODE_DEFAULT (0x01)
+        mode_idx = sig_len + ec_half  # first signalling byte (index 96)
+        raw[mode_idx] = (raw[mode_idx] & ~RNS.Link.MODE_BYTEMASK) | (
+            (wrong_mode << 5) & RNS.Link.MODE_BYTEMASK
+        )
+        proof_data = bytes(raw)
     else:
         raise ValueError(f"unknown lrproof variant: {variant!r}")
 
-    proof_data = signature + ephemeral_pub
     out_packet = RNS.Packet(
         link, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF,
     )
@@ -8090,6 +8190,11 @@ def cmd_wire_inject_crafted_lrproof(params):
 
     status_after = getattr(link, "status", None)
     activated = status_after == RNS.Link.ACTIVE
+    # On the legacy 96-byte (signalling-less) proof, validate_proof confirms no
+    # MTU (confirmed_mtu None), so the activated link's MTU falls back to
+    # Reticulum.MTU (Link.py:427). Report it so the fallback is assertable.
+    mtu_after = getattr(link, "mtu", None) if activated else None
+    mode_after = getattr(link, "mode", None)
     try:
         link.teardown()
     except Exception:
@@ -8099,6 +8204,8 @@ def cmd_wire_inject_crafted_lrproof(params):
         "activated": activated,
         "status": int(status_after) if status_after is not None else None,
         "status_name": _LINK_STATUS_NAMES.get(status_after),
+        "mtu": int(mtu_after) if mtu_after is not None else None,
+        "mode": int(mode_after) if mode_after is not None else None,
     }
 
 
@@ -9566,6 +9673,7 @@ WIRE_COMMANDS = {
     "wire_transport_enabled": cmd_wire_transport_enabled,
     "wire_link_mtu": cmd_wire_link_mtu,
     "wire_send_packet": cmd_wire_send_packet,
+    "wire_send_undecryptable": cmd_wire_send_undecryptable,
     "wire_packet_receipt_status": cmd_wire_packet_receipt_status,
     # Channel out-of-order / duplicate injection + window observation
     "wire_channel_inject": cmd_wire_channel_inject,

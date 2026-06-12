@@ -1334,29 +1334,90 @@ def cmd_behavioral_register_destination(params):
     destination, Transport.inbound must NOT process it into the path/announce
     tables (route-hijack defense).
 
-    params: handle, app_name, aspects (list), identity_seed (64-byte private key hex)
+    Optional knobs let a test observe inbound DELIVERY decisions
+    (Transport.py:2155-2165): `type` ('single'|'plain'|'group', default 'single')
+    sets the registered destination's type (so a wrong-flag-type packet can be
+    shown to be dropped at the type-match gate); `proof_strategy`
+    ('all'|'none'|'app') calls Destination.set_proof_strategy (so a PROVE_ALL
+    destination's prove()-on-receive() behaviour is observable via the PROOF it
+    emits on drain_tx). A recording packet callback is always attached — it fires
+    only when RNS's own Destination.receive() returns truthy, so the delivered
+    plaintexts (read via behavioral_read_destination_deliveries) are the honest
+    observable for "was this packet delivered".
+
+    params: handle, app_name, aspects (list), identity_seed (64-byte hex; omit
+    for PLAIN), type, proof_strategy
     returns: {destination_hash}
     """
     RNS = _get_rns()
     handle = params["handle"]
     app_name = params["app_name"]
     aspects = list(params.get("aspects", []))
-    seed = bytes.fromhex(params["identity_seed"])
-    if len(seed) != 64:
-        raise ValueError("identity_seed must be 64 bytes (32 enc + 32 sig)")
+    dest_type_name = (params.get("type") or "single").lower()
+    proof_strategy = params.get("proof_strategy")
 
     with _instances_lock:
         inst = _instances.get(handle)
     if inst is None:
         raise ValueError(f"Unknown handle: {handle}")
 
-    identity = RNS.Identity(create_keys=False)
-    identity.load_private_key(seed)
-    destination = RNS.Destination(
-        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
-    )
+    type_map = {
+        "single": RNS.Destination.SINGLE,
+        "plain": RNS.Destination.PLAIN,
+        "group": RNS.Destination.GROUP,
+    }
+    if dest_type_name not in type_map:
+        raise ValueError(f"unknown destination type: {dest_type_name!r}")
+
+    if dest_type_name == "plain":
+        destination = RNS.Destination(
+            None, RNS.Destination.IN, RNS.Destination.PLAIN, app_name, *aspects
+        )
+    else:
+        seed = bytes.fromhex(params["identity_seed"])
+        if len(seed) != 64:
+            raise ValueError("identity_seed must be 64 bytes (32 enc + 32 sig)")
+        identity = RNS.Identity(create_keys=False)
+        identity.load_private_key(seed)
+        destination = RNS.Destination(
+            identity, RNS.Destination.IN, type_map[dest_type_name], app_name, *aspects
+        )
+
+    deliveries = []
+
+    def _on_packet(message, packet, _store=deliveries):
+        _store.append(bytes(message))
+
+    destination.set_packet_callback(_on_packet)
+
+    if proof_strategy is not None:
+        strat_map = {
+            "all": RNS.Destination.PROVE_ALL,
+            "none": RNS.Destination.PROVE_NONE,
+            "app": RNS.Destination.PROVE_APP,
+        }
+        destination.set_proof_strategy(strat_map[proof_strategy.lower()])
+
     inst.setdefault("destinations", []).append(destination)
+    inst.setdefault("dest_deliveries", {})[destination.hash] = deliveries
     return {"destination_hash": destination.hash.hex()}
+
+
+def cmd_behavioral_read_destination_deliveries(params):
+    """Read the plaintexts delivered to a registered destination's recording
+    packet callback (set by behavioral_register_destination). Returns
+    {count, deliveries: [hex]}. The callback fires only when RNS's own
+    Destination.receive() returns truthy, so this is the honest observable for
+    the inbound type-match (Transport.py:2155) and decrypt-success
+    (Transport.py:2157) delivery decisions."""
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["dest"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    deliveries = inst.get("dest_deliveries", {}).get(dest_hash, [])
+    return {"count": len(deliveries), "deliveries": [d.hex() for d in deliveries]}
 
 
 def cmd_behavioral_read_announce_rate(params):
@@ -1994,6 +2055,7 @@ def cmd_behavioral_read_announce_handler_calls(params):
 
 BEHAVIORAL_COMMANDS = {
     "behavioral_register_destination": cmd_behavioral_register_destination,
+    "behavioral_read_destination_deliveries": cmd_behavioral_read_destination_deliveries,
     "behavioral_hold_and_release_announce": cmd_behavioral_hold_and_release_announce,
     "behavioral_read_announce_rate": cmd_behavioral_read_announce_rate,
     "behavioral_set_path_expires": cmd_behavioral_set_path_expires,

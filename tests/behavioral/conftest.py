@@ -328,17 +328,33 @@ class Instance:
             "behavioral_detach_interface", handle=self.handle, iface_id=iface_id,
         )
 
-    def register_destination(self, app_name, aspects, identity_seed):
-        """Register a real local IN/SINGLE destination from a 64-byte Identity
-        private key, so its hash enters Transport.destinations_map (the local-
-        destination announce carve-out, Transport.py:1707-1712). Returns the
-        destination hash as bytes. See behavioral_register_destination."""
-        resp = self.bridge.execute(
-            "behavioral_register_destination",
-            handle=self.handle, app_name=app_name, aspects=list(aspects),
-            identity_seed=identity_seed.hex(),
-        )
+    def register_destination(self, app_name, aspects, identity_seed=None,
+                             type="single", proof_strategy=None):
+        """Register a real local IN destination on this Transport instance.
+
+        `type` ('single'|'plain'|'group') sets the destination type;
+        `proof_strategy` ('all'|'none'|'app') sets its proof strategy. A
+        recording packet callback is attached so deliveries are observable via
+        read_destination_deliveries. identity_seed (bytes) is required for
+        single/group, omitted for plain. Returns the destination hash (bytes).
+        See behavioral_register_destination."""
+        kwargs = dict(handle=self.handle, app_name=app_name,
+                      aspects=list(aspects), type=type)
+        if identity_seed is not None:
+            kwargs["identity_seed"] = identity_seed.hex()
+        if proof_strategy is not None:
+            kwargs["proof_strategy"] = proof_strategy
+        resp = self.bridge.execute("behavioral_register_destination", **kwargs)
         return bytes.fromhex(resp["destination_hash"])
+
+    def read_destination_deliveries(self, dest):
+        """Read the plaintexts delivered to a registered destination's recording
+        callback: {count, deliveries:[hex]}. Fires only on a truthy RNS
+        Destination.receive(). See behavioral_read_destination_deliveries."""
+        return self.bridge.execute(
+            "behavioral_read_destination_deliveries",
+            handle=self.handle, dest=dest.hex(),
+        )
 
     def register_announce_handler(self, aspect_filter=None,
                                   receive_path_responses=None, num_params=3,

@@ -492,6 +492,17 @@ def test_bz2_decompression_bomb_marks_corrupt_and_tears_link(wire_pair, wire_lin
         f"{client.role_label} decompression-bomb send reported success — the "
         f"receiver must reject it: {bomb!r}."
     )
+    # The CORRUPT path REJECTS the sender, not merely tears the link down: the
+    # receiver's cancel() calls reject() -> sends a RESOURCE_RCL packet to the
+    # sender (Resource.py:1083, 155-160) BEFORE link.teardown(), so the sender's
+    # Resource lands in REJECTED (0), not FAILED (7). Pinning REJECTED here is
+    # the on-wire-RCL observable a bare teardown could not produce.
+    assert bomb["status"] == _REJECTED, (
+        f"{client.role_label}'s bombed Resource ended in status {bomb['status']} "
+        f"(expected REJECTED=={_REJECTED}); the receiver must send a RESOURCE_RCL "
+        f"on the CORRUPT path, not merely tear the link down (which would leave "
+        f"the sender FAILED=={_FAILED}): {bomb!r}."
+    )
 
     rx = server.resource_receiver_status(dest_hash, timeout_ms=20000)
     assert rx["found"] and rx["corrupt"] is True and rx["status"] == _CORRUPT, (
@@ -513,4 +524,59 @@ def test_bz2_decompression_bomb_marks_corrupt_and_tears_link(wire_pair, wire_lin
         f"{server.role_label} did not tear the inbound link down after a "
         f"CORRUPT Resource: {ls!r} — Resource.cancel() on CORRUPT calls "
         f"link.teardown() (Resource.py:1081-1084)."
+    )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "resource_send", "resource_poll", "resource_receiver_status",
+    ],
+    verifies=(
+        "The receiver's Resource lifecycle callbacks fire exactly as RNS "
+        "specifies: the resource_started callback fires once when an inbound "
+        "Resource begins (Resource.py:227-231) and the conclude callback fires "
+        "once, only when the final segment assembles, carrying the whole "
+        "reassembled payload (Resource.py:725-740). A single-segment transfer is "
+        "pinned via the receiver's started-callback count (== 1) and a single "
+        "full-data conclude (status COMPLETE, byte-exact payload). An impl that "
+        "never fires resource_started, or concludes per-part instead of once at "
+        "the end, diverges"
+    ),
+)
+def test_receiver_resource_callbacks_lifecycle(wire_link_setup):
+    server, client, dest_hash, link_id = wire_link_setup(
+        app_name=_APP_NAME, aspects=("callbacks",)
+    )
+
+    # A small payload is a single Resource segment, so the started callback must
+    # fire exactly once and the conclude exactly once with the full payload.
+    payload = secrets.token_bytes(3 * 1024)
+    send = client.resource_send(link_id, payload, timeout_ms=30000)
+    assert send["success"], (
+        f"{client.role_label} single-segment resource send failed: {send!r}"
+    )
+    assert send["total_segments"] == 1, (
+        f"test precondition: payload must be a single segment, got "
+        f"total_segments={send.get('total_segments')!r}: {send!r}"
+    )
+
+    rx = server.resource_receiver_status(dest_hash, timeout_ms=10000)
+    assert rx["found"] and rx["status"] == _COMPLETE, (
+        f"{server.role_label} inbound Resource did not conclude COMPLETE: {rx!r}"
+    )
+    # resource_started fired exactly once (one inbound-Resource record).
+    assert rx["resource_count"] == 1, (
+        f"the resource_started callback fired {rx['resource_count']} time(s), "
+        f"expected exactly 1 for a single-segment transfer: {rx!r}"
+    )
+    # The single conclude carried the whole reassembled payload.
+    assert rx["data"] == payload.hex(), (
+        f"the conclude callback did not deliver the byte-exact payload "
+        f"(a per-segment conclude would deliver a short chunk): {rx!r}"
+    )
+    # And exactly one conclude landed in the concluded buffer (not one per part).
+    assert server.resource_poll(dest_hash, timeout_ms=2000) == [payload], (
+        f"{server.role_label} concluded the Resource more than once, or not with "
+        f"the full payload — the conclude must fire once at the final segment."
     )

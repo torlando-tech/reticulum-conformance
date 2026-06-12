@@ -2612,6 +2612,14 @@ class _WirePeer:
             "wire_link_teardown_emission", handle=self.handle, link_id=link_id.hex(),
         )
 
+    def interface_transport_defaults(self) -> dict:
+        """Read transport-node interface defaults off the live instance/classes:
+        {local_interface_port, ar_target, ar_penalty, ar_grace}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_interface_transport_defaults", handle=self.handle,
+        )
+
     def discovery_autoconnect_gate(self) -> dict:
         """Drive InterfaceDiscovery.autoconnect's pre-connect decision logic for
         unsupported / Yggdrasil / wrong-type records and report whether any

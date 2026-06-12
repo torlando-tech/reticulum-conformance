@@ -9140,6 +9140,33 @@ def cmd_wire_link_teardown_emission(params):
     }
 
 
+def cmd_wire_interface_transport_defaults(params):
+    """Read the transport-node interface defaults off the live instance / classes
+    (delegating to real RNS): the well-known shared-instance local interface port
+    (Reticulum.local_interface_port, default 37428) and the transport-node
+    announce-rate defaults Interface.DEFAULT_AR_TARGET / _PENALTY / _GRACE
+    (Interface.py; the fallbacks _default_ar_*() use, Reticulum.py:1083-1090).
+
+    These are the interop constants a SUT must match for shared-instance
+    connectivity and announce-rate-target inheritance; the behaviours they govern
+    (the actual shared-instance frame plane, wall-clock announce pacing) are
+    out of scope. Returns {local_interface_port, ar_target, ar_penalty, ar_grace}.
+    """
+    RNS = _get_rns()
+    Interface = RNS.Interfaces.Interface.Interface
+    instance = RNS.Reticulum.get_instance()
+    return {
+        "local_interface_port": (
+            int(instance.local_interface_port)
+            if instance is not None and getattr(instance, "local_interface_port", None) is not None
+            else None
+        ),
+        "ar_target": int(Interface.DEFAULT_AR_TARGET),
+        "ar_penalty": int(Interface.DEFAULT_AR_PENALTY),
+        "ar_grace": int(Interface.DEFAULT_AR_GRACE),
+    }
+
+
 def cmd_wire_discovery_autoconnect_gate(params):
     """Pin InterfaceDiscovery.autoconnect's pre-connect decision logic
     (Discovery.py:626-682), which decides whether a discovered interface record
@@ -10089,6 +10116,7 @@ WIRE_COMMANDS = {
     "wire_link_phy_stats_gate": cmd_wire_link_phy_stats_gate,
     "wire_link_teardown_emission": cmd_wire_link_teardown_emission,
     "wire_discovery_autoconnect_gate": cmd_wire_discovery_autoconnect_gate,
+    "wire_interface_transport_defaults": cmd_wire_interface_transport_defaults,
     "wire_link_accept_gate": cmd_wire_link_accept_gate,
     "wire_link_key_material": cmd_wire_link_key_material,
     "wire_inject_closed_link_data": cmd_wire_inject_closed_link_data,

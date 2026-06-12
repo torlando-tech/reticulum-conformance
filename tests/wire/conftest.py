@@ -2612,6 +2612,16 @@ class _WirePeer:
             "wire_link_teardown_emission", handle=self.handle, link_id=link_id.hex(),
         )
 
+    def discovery_autoconnect_gate(self) -> dict:
+        """Drive InterfaceDiscovery.autoconnect's pre-connect decision logic for
+        unsupported / Yggdrasil / wrong-type records and report whether any
+        interface was added (interfaces_added per case, all must be 0) plus the
+        endpoint_hash == SHA-256(reachable_on:port) match."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_discovery_autoconnect_gate", handle=self.handle,
+        )
+
     def capture_lrproof_frame(self) -> dict:
         """Capture a genuine outbound LRPROOF frame's raw bytes + flag shape.
 

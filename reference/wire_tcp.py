@@ -9140,6 +9140,85 @@ def cmd_wire_link_teardown_emission(params):
     }
 
 
+def cmd_wire_discovery_autoconnect_gate(params):
+    """Pin InterfaceDiscovery.autoconnect's pre-connect decision logic
+    (Discovery.py:626-682), which decides whether a discovered interface record
+    should be auto-connected — WITHOUT opening any socket (only the final
+    BackboneInterface construct/connect is out of scope). Drives the REAL
+    InterfaceDiscovery.autoconnect for each record and observes whether an
+    interface was added to RNS.Transport.interfaces:
+
+      * an unsupported AUTOCONNECT_TYPE (e.g. UDPInterface) -> no attempt;
+      * a TCPClientInterface record -> aborted ("not yet implemented");
+      * an I2PInterface record -> aborted ("not yet implemented");
+      * a BackboneInterface whose reachable_on is a Yggdrasil 200::/7 address ->
+        skipped (is_ygg_ipv6, Discovery.py:649-651).
+
+    None of those add an interface. The endpoint dedup key is also pinned:
+    InterfaceDiscovery.endpoint_hash(info) == SHA-256("reachable_on:port")
+    (Discovery.py:601-606), recomputed independently.
+
+    Enables autoconnect for the duration (config gate, default off) and restores
+    it afterward. The InterfaceDiscovery is built with discover_interfaces=False
+    so no listener/announce-handler side effects occur. Returns per-case
+    interface-count deltas + the endpoint_hash match.
+    """
+    RNS = _get_rns()
+
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    Discovery = RNS.Discovery
+    cap_attr = "_Reticulum__autoconnect_discovered_interfaces"
+    saved_cap = getattr(RNS.Reticulum, cap_attr, 0)
+    setattr(RNS.Reticulum, cap_attr, 4)  # enable autoconnect with a cap of 4
+    try:
+        disc = Discovery.InterfaceDiscovery(
+            required_value=14, callback=None, discover_interfaces=False,
+        )
+
+        def _info(itype, reachable_on, port):
+            return {
+                "type": itype,
+                "name": "discovered-test",
+                "reachable_on": reachable_on,
+                "port": port,
+                "config_entry": "[[discovered-test]]",
+                "network_id": b"\x00" * 16,
+            }
+
+        cases = {
+            "wrong_type": _info("UDPInterface", "10.0.0.5", 4242),
+            "tcp_client": _info("TCPClientInterface", "10.0.0.6", 4242),
+            "i2p": _info("I2PInterface", "abcdefgh.b32.i2p", 0),
+            "yggdrasil": _info("BackboneInterface", "200::1", 4242),
+        }
+
+        results = {}
+        for name, info in cases.items():
+            before = len(list(RNS.Transport.interfaces))
+            try:
+                disc.autoconnect(info)
+            except Exception:
+                pass
+            after = len(list(RNS.Transport.interfaces))
+            results[name] = {"interfaces_added": after - before}
+
+        # Report the real endpoint_hash + the spec string the test anchors on
+        # (SHA-256 of "reachable_on:port"); the independent oracle lives in the
+        # test, not the bridge.
+        probe = _info("BackboneInterface", "10.9.9.9", 4242)
+        results["endpoint_hash"] = disc.endpoint_hash(probe).hex()
+        results["endpoint_spec"] = "10.9.9.9:4242"
+    finally:
+        setattr(RNS.Reticulum, cap_attr, saved_cap)
+
+    return results
+
+
 def cmd_wire_link_accept_gate(params):
     """Pin Destination's link-accept gate (Destination.receive -> only answers a
     LINKREQUEST when accept_link_requests is set, Destination.py:420-423).
@@ -10009,6 +10088,7 @@ WIRE_COMMANDS = {
     "wire_link_type_gate": cmd_wire_link_type_gate,
     "wire_link_phy_stats_gate": cmd_wire_link_phy_stats_gate,
     "wire_link_teardown_emission": cmd_wire_link_teardown_emission,
+    "wire_discovery_autoconnect_gate": cmd_wire_discovery_autoconnect_gate,
     "wire_link_accept_gate": cmd_wire_link_accept_gate,
     "wire_link_key_material": cmd_wire_link_key_material,
     "wire_inject_closed_link_data": cmd_wire_inject_closed_link_data,

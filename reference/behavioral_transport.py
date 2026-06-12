@@ -1238,14 +1238,61 @@ def cmd_behavioral_seed_link_table(params):
     hops = int(params.get("hops", 99))
     now = time.time()
 
+    # Optional aging knobs for the link-table cull (Transport.py:685-692):
+    #   timestamp_age_s   — backdate the entry timestamp (validated-entry
+    #                       LINK_TIMEOUT cull when aged past the threshold).
+    #   validated         — False drives the unvalidated proof-timeout cull.
+    #   proof_timeout_in_s— proof_timeout relative to now (negative = already
+    #                       expired, so an unvalidated entry is culled).
+    timestamp = now - float(params.get("timestamp_age_s", 0))
+    validated = bool(params.get("validated", True))
+    proof_timeout = now + float(params.get("proof_timeout_in_s", 60.0))
+
     # link_entry layout (Transport.py IDX_LT_*): [timestamp, next_hop_transport_id,
     # next_hop_interface, remaining_hops, received_interface, hops, dest_hash,
     # validated, proof_timeout].
-    link_entry = [now, None, nh_iface, rem_hops, rcvd_iface, hops, dest, True, now + 60.0]
+    link_entry = [timestamp, None, nh_iface, rem_hops, rcvd_iface, hops, dest,
+                  validated, proof_timeout]
     with RNS.Transport.link_table_lock:
         RNS.Transport.link_table[dest] = link_entry
 
     return {"seeded": True, "dest": dest.hex()}
+
+
+def cmd_behavioral_seed_reverse_table(params):
+    """Seed Transport.reverse_table[key] with a correctly-shaped entry
+    [received_interface, outbound_interface, timestamp] (IDX_RT_*) so the
+    REVERSE_TIMEOUT cull (Transport.py:670-677) can be driven deterministically:
+    an entry whose timestamp is older than REVERSE_TIMEOUT is removed on the next
+    cull pass (behavioral_force_cull). `timestamp_age_s` backdates the timestamp
+    (default 0 = now). The interfaces are real attached MockInterfaces, so the
+    interface-membership cull arms do not fire — isolating the timeout arm.
+
+    params: handle, key (hex truncated packet hash), rcvd_iface_id, outb_iface_id,
+            timestamp_age_s
+    returns: {seeded, key}
+    """
+    import time
+    RNS = _get_rns()
+    handle = params["handle"]
+    key = bytes.fromhex(params["key"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    rcvd_iface = inst["interfaces"].get(params["rcvd_iface_id"])
+    outb_iface = inst["interfaces"].get(params["outb_iface_id"])
+    if rcvd_iface is None or outb_iface is None:
+        raise ValueError("rcvd_iface_id / outb_iface_id must reference attached interfaces")
+
+    timestamp = time.time() - float(params.get("timestamp_age_s", 0))
+    reverse_entry = [rcvd_iface, outb_iface, timestamp]
+    with RNS.Transport.reverse_table_lock:
+        RNS.Transport.reverse_table[key] = reverse_entry
+
+    return {"seeded": True, "key": key.hex()}
 
 
 def cmd_behavioral_read_link_table(params):
@@ -2089,6 +2136,7 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
     "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
     "behavioral_seed_link_table": cmd_behavioral_seed_link_table,
+    "behavioral_seed_reverse_table": cmd_behavioral_seed_reverse_table,
     "behavioral_read_link_table": cmd_behavioral_read_link_table,
     "behavioral_register_announce_handler": cmd_behavioral_register_announce_handler,
     "behavioral_read_announce_handler_calls": cmd_behavioral_read_announce_handler_calls,

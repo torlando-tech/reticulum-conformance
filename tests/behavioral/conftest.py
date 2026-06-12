@@ -190,15 +190,33 @@ class Instance:
         )
 
     def seed_link_table(self, dest, nh_iface_id, rcvd_iface_id,
-                        rem_hops=99, hops=99):
+                        rem_hops=99, hops=99, validated=True,
+                        timestamp_age_s=0, proof_timeout_in_s=60):
         """Install a correctly-shaped Transport.link_table[dest] entry so the
         inbound link-table deferral (Transport.py:1496-1498) can be exercised
-        on a single injected packet. See behavioral_seed_link_table."""
+        on a single injected packet. `validated`/`timestamp_age_s`/
+        `proof_timeout_in_s` drive the link-table cull (Transport.py:685-692):
+        backdate the timestamp past LINK_TIMEOUT (validated) or set an expired
+        proof_timeout (unvalidated). See behavioral_seed_link_table."""
         return self.bridge.execute(
             "behavioral_seed_link_table",
             handle=self.handle, dest=dest.hex(),
             nh_iface_id=nh_iface_id, rcvd_iface_id=rcvd_iface_id,
-            rem_hops=rem_hops, hops=hops,
+            rem_hops=rem_hops, hops=hops, validated=validated,
+            timestamp_age_s=timestamp_age_s, proof_timeout_in_s=proof_timeout_in_s,
+        )
+
+    def seed_reverse_table(self, key, rcvd_iface_id, outb_iface_id,
+                           timestamp_age_s=0):
+        """Install a Transport.reverse_table[key] entry
+        ([received_if, outbound_if, timestamp]) so the REVERSE_TIMEOUT cull
+        (Transport.py:670-677) can be driven by backdating timestamp_age_s past
+        the threshold. See behavioral_seed_reverse_table."""
+        return self.bridge.execute(
+            "behavioral_seed_reverse_table",
+            handle=self.handle, key=key.hex(),
+            rcvd_iface_id=rcvd_iface_id, outb_iface_id=outb_iface_id,
+            timestamp_age_s=timestamp_age_s,
         )
 
     def read_link_table(self, link_id=None):

@@ -624,3 +624,80 @@ def test_tunnel_synthesize_exact_length_gate(behavioral):
         )
     finally:
         behavioral.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# reverse-table-timeout + link-table-timeouts: the table-cull decisions
+# (Transport.py:670-692). Entries aged past their timeout are removed on the
+# next cull pass; fresh entries survive. Driven deterministically by seeding an
+# aged entry and forcing one cull pass (no wall-clock wait).
+# ---------------------------------------------------------------------------
+@conformance_case(
+    commands=["start", "attach_mock_interface", "seed_link_table",
+              "seed_reverse_table", "read_link_table", "read_reverse_table",
+              "force_cull"],
+    verifies=(
+        "Transport culls stale link_table and reverse_table entries on its "
+        "periodic jobs pass (Transport.py:670-692): a VALIDATED link entry aged "
+        "past LINK_TIMEOUT is removed; an UNVALIDATED link entry whose "
+        "proof_timeout has passed is removed; a reverse-table entry aged past "
+        "REVERSE_TIMEOUT (8 min) is removed — while a fresh entry of each kind "
+        "survives the same cull (positive controls). An impl that never culls "
+        "leaks routing state and can mis-route stale links/proofs"
+    ),
+)
+def test_link_and_reverse_table_timeout_culls(behavioral):
+    inst = behavioral.start(enable_transport=True)
+    try:
+        nh = inst.attach_mock_interface("nh", mode="FULL")
+        rc = inst.attach_mock_interface("rc", mode="FULL")
+
+        # Aged well past any threshold so the timeout arm (not the
+        # interface-membership arm — both ifaces stay attached) is what fires.
+        AGED = 100_000  # seconds in the past
+
+        # 1) Validated link entry, aged past LINK_TIMEOUT -> culled.
+        d_old = secrets.token_bytes(16)
+        inst.seed_link_table(d_old, nh, rc, validated=True, timestamp_age_s=AGED)
+        assert inst.read_link_table(d_old)["found"], "seed failed"
+        inst.force_cull()
+        assert inst.read_link_table(d_old)["found"] is False, (
+            "an aged VALIDATED link entry was not culled (LINK_TIMEOUT arm)"
+        )
+
+        # 2) Fresh validated link entry survives (positive control).
+        d_fresh = secrets.token_bytes(16)
+        inst.seed_link_table(d_fresh, nh, rc, validated=True, timestamp_age_s=0)
+        inst.force_cull()
+        assert inst.read_link_table(d_fresh)["found"], (
+            "a fresh VALIDATED link entry was wrongly culled"
+        )
+
+        # 3) Unvalidated link entry with an expired proof_timeout -> culled.
+        d_unval = secrets.token_bytes(16)
+        inst.seed_link_table(d_unval, nh, rc, validated=False,
+                             proof_timeout_in_s=-10)
+        assert inst.read_link_table(d_unval)["found"], "seed failed"
+        inst.force_cull()
+        assert inst.read_link_table(d_unval)["found"] is False, (
+            "an UNVALIDATED link entry past its proof_timeout was not culled"
+        )
+
+        # 4) Reverse-table entry aged past REVERSE_TIMEOUT -> culled.
+        r_old = secrets.token_bytes(16)
+        inst.seed_reverse_table(r_old, rc, nh, timestamp_age_s=AGED)
+        assert inst.read_reverse_table(r_old)["found"], "seed failed"
+        inst.force_cull()
+        assert inst.read_reverse_table(r_old)["found"] is False, (
+            "an aged reverse-table entry was not culled (REVERSE_TIMEOUT arm)"
+        )
+
+        # 5) Fresh reverse-table entry survives (positive control).
+        r_fresh = secrets.token_bytes(16)
+        inst.seed_reverse_table(r_fresh, rc, nh, timestamp_age_s=0)
+        inst.force_cull()
+        assert inst.read_reverse_table(r_fresh)["found"], (
+            "a fresh reverse-table entry was wrongly culled"
+        )
+    finally:
+        behavioral.cleanup()

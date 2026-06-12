@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Authoritative SUT-bridge command-gap report.
+
+Computes the set of bridge commands the test suite actually invokes
+(every ``.execute("<literal>", ...)`` first-arg string constant found by
+AST-walking ``tests/`` including the per-dir conftests) and diffs it
+against the dispatch arms of a Kotlin bridge (every ``"name" ->`` arm in
+the bridge's .kt files).
+
+The ``commands=[...]`` lists on @conformance_case decorators are NOT used:
+they carry prefix-stripped case names (``poll_path`` for ``wire_poll_path``,
+per tools/check_conformance_decorated.py's normalization), which would
+produce phantom gaps. The ``.execute()`` literals are the wire truth.
+
+Usage:
+    python3 tools/kotlin_gap.py [--kt-dir ../reticulum-kt] [--list]
+
+Exit code 0 when no commands are missing, 1 otherwise — usable as a CI
+gate once the surface is complete.
+"""
+
+import argparse
+import ast
+import os
+import re
+import sys
+from collections import defaultdict
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Files whose .execute() calls define the required surface. tests/ covers
+# the per-dir conftest helpers (tests/wire/conftest.py _WirePeer wrappers,
+# tests/behavioral/conftest.py Instance methods); conformance.py and
+# bridge_client.py at the root contain no test-facing execute literals of
+# their own but are included defensively.
+SCAN_DIRS = ["tests"]
+SCAN_FILES = ["conformance.py", "bridge_client.py"]
+
+KT_ARM_RE = re.compile(r'"([a-z][a-z0-9_]*)"\s*->')
+
+
+def suite_commands():
+    """All string-literal first args of any .execute(...) call under tests/."""
+    cmds = set()
+    paths = []
+    for d in SCAN_DIRS:
+        for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, d)):
+            if "__pycache__" in dirpath:
+                continue
+            paths.extend(
+                os.path.join(dirpath, f) for f in filenames if f.endswith(".py")
+            )
+    paths.extend(
+        os.path.join(ROOT, f)
+        for f in SCAN_FILES
+        if os.path.exists(os.path.join(ROOT, f))
+    )
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            try:
+                tree = ast.parse(fh.read(), filename=path)
+            except SyntaxError as exc:  # pragma: no cover - broken test file
+                print(f"WARN: cannot parse {path}: {exc}", file=sys.stderr)
+                continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                cmds.add(node.args[0].value)
+    return cmds
+
+
+def kotlin_commands(kt_dir):
+    """All when-arm command literals in the Kotlin bridge sources."""
+    src_dir = os.path.join(kt_dir, "conformance-bridge", "src", "main", "kotlin")
+    if not os.path.isdir(src_dir):
+        sys.exit(f"ERROR: kotlin bridge source dir not found: {src_dir}")
+    cmds = set()
+    for dirpath, _dirnames, filenames in os.walk(src_dir):
+        for f in filenames:
+            if not f.endswith(".kt"):
+                continue
+            with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                cmds.update(KT_ARM_RE.findall(fh.read()))
+    return cmds
+
+
+def family(cmd):
+    for prefix in ("behavioral_", "wire_", "discovery_", "destination_",
+                   "identity_", "packet_", "announce_", "interface_",
+                   "lxmf_", "rns_", "config_", "token_", "ratchet_"):
+        if cmd.startswith(prefix):
+            return prefix.rstrip("_")
+    return "(other)"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kt-dir", default=os.path.join(ROOT, "..", "reticulum-kt"))
+    ap.add_argument("--list", action="store_true",
+                    help="print every missing command, not just counts")
+    args = ap.parse_args()
+
+    used = suite_commands()
+    have = kotlin_commands(os.path.abspath(args.kt_dir))
+    missing = sorted(used - have)
+
+    by_family = defaultdict(list)
+    for c in missing:
+        by_family[family(c)].append(c)
+
+    print(f"suite-invoked commands : {len(used)}")
+    print(f"kotlin dispatch arms   : {len(have)}")
+    print(f"missing from kotlin    : {len(missing)}")
+    print()
+    for fam in sorted(by_family, key=lambda f: -len(by_family[f])):
+        print(f"  {fam:12s} {len(by_family[fam]):4d}")
+        if args.list:
+            for c in by_family[fam]:
+                print(f"      {c}")
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

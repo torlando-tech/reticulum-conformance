@@ -31,11 +31,15 @@ import time
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     CONTEXT_PATH_RESPONSE,
+    HEADER_1_MIN_SIZE,
     HEADER_2,
+    PATH_REQUEST_DESTINATION_NAME,
     TRUNCATED_HASH_BYTES,
+    _plain_destination_hash,
     build_announce_from_destination,
     build_data_packet,
     build_path_request,
+    parse_packet_header,
 )
 
 
@@ -332,6 +336,105 @@ def test_path_timestamp_refreshed_on_forward(behavioral):
             f"path timestamp changed ({unchanged:.3f} vs rewound {rewound2:.3f}) "
             f"for a packet this node is not the next hop for — the refresh is not "
             f"gated on the forward-over-path action"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# path-request-parse-and-tag-dedup (parse branches) + path-response-local-
+# destination (answer context). The path_request_handler only answers when the
+# payload carries a tag: a 16-byte (dest-only) payload leaves tag_bytes None and
+# is ignored; a <16-byte payload fails the outer length guard and is ignored
+# (Transport.py:2864-2895). When it DOES answer, the emitted cached-announce
+# rebroadcast carries the PATH_RESPONSE context byte (0x0B).
+# ---------------------------------------------------------------------------
+@conformance_case(
+    commands=["start", "attach_mock_interface", "announce_build", "inject",
+              "packet_build", "packet_unpack", "name_hash", "truncated_hash",
+              "read_announce_table", "read_path_table", "drain_tx",
+              "set_announce_timestamp", "force_cull"],
+    verifies=(
+        "Transport.path_request_handler answers a path request ONLY when its "
+        "payload carries a tag, and the answer is a PATH_RESPONSE "
+        "(Transport.py:2864-2895): a tagless 16-byte (destination-hash-only) "
+        "request leaves tag_bytes None and schedules no answer; a sub-16-byte "
+        "request fails the outer length guard and schedules no answer; a tagged "
+        "request IS answered (cached-announce rebroadcast scheduled with "
+        "block_rebroadcasts), and when that answer fires it is emitted with the "
+        "PATH_RESPONSE context byte (0x0B). An impl that answers tagless/short "
+        "requests, or emits the answer with a plain ANNOUNCE context, diverges"
+    ),
+)
+def test_path_request_parse_branches_and_response_context(behavioral):
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        learn = inst.attach_mock_interface("learn", mode="FULL")
+
+        # Seed a known path to D via PATH_RESPONSE (no forward retransmit, so the
+        # announce_table stays empty until a path request schedules an answer).
+        seed, dest, _ = build_announce_from_destination(
+            behavioral.bridge, identity_private_key=secrets.token_bytes(64),
+            app_name="prparse", aspects=["x"], emission_ts=1_000_000_030,
+            wire_hops=0, context=CONTEXT_PATH_RESPONSE,
+        )
+        inst.inject(learn, seed)
+        assert inst.read_path_table(dest)["found"], "seed path not created"
+        assert inst.read_announce_table(dest)["found"] is False
+
+        # Tagless (16-byte, destination-hash only) -> tag_bytes None -> no answer.
+        tagless = build_path_request(behavioral.bridge, dest,
+                                     transport_id=None, tag=None)
+        inst.inject(iface_a, tagless)
+        assert inst.read_announce_table(dest)["found"] is False, (
+            "a tagless path request was answered — RNS only answers tagged "
+            "requests (Transport.py:2884-2895)"
+        )
+
+        # Sub-16-byte payload -> outer length guard fails -> no answer.
+        pr_ctrl = _plain_destination_hash(
+            behavioral.bridge, PATH_REQUEST_DESTINATION_NAME
+        )
+        short = build_data_packet(
+            behavioral.bridge, pr_ctrl, destination_type="plain",
+            payload=b"\x00" * 8, hops=0,
+        )
+        inst.inject(iface_a, short)
+        assert inst.read_announce_table(dest)["found"] is False, (
+            "a sub-16-byte path request was answered — the outer length guard "
+            "(len(data) >= 16) must drop it"
+        )
+
+        # Positive control: a TAGGED request is answered, and the emitted answer
+        # carries the PATH_RESPONSE context byte.
+        inst.drain_tx(iface_a)
+        tagged = build_path_request(
+            behavioral.bridge, dest,
+            transport_id=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+            tag=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+        )
+        inst.inject(iface_a, tagged)
+        ans = inst.read_announce_table(dest)
+        assert ans["found"] and ans["block_rebroadcasts"] is True, (
+            f"a tagged path request was not answered (positive control): {ans}"
+        )
+
+        # Fire the scheduled answer and capture the emitted packet's context.
+        guard = 0
+        while inst.read_announce_table(dest)["found"]:
+            guard += 1
+            assert guard <= 6, "could not drain the scheduled answer"
+            inst.set_announce_timestamp(dest, retransmit_timeout=0)
+            inst.force_cull()
+        emitted = inst.drain_tx(iface_a)
+        contexts = [
+            parse_packet_header(p)["context"]
+            for p in emitted if len(p) >= HEADER_1_MIN_SIZE
+        ]
+        assert CONTEXT_PATH_RESPONSE in contexts, (
+            f"the path-request answer was not emitted with the PATH_RESPONSE "
+            f"context byte (0x0B); got contexts {[hex(c) for c in contexts]}"
         )
     finally:
         behavioral.cleanup()

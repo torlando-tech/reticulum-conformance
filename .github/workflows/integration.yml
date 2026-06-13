@@ -51,14 +51,18 @@ jobs:
 
       - name: Run integration suite (--python-only) with min-passed guard
         env:
-          # Minimum number of tests that must actually PASS. At minimum this
-          # must be >= 1 so an all-skip/all-error run is RED (the whole point
-          # of this job — the domain was dormant at 0 passed). Ratchet this up
-          # toward the full integration count (currently 34) as the in-process
-          # harness fixes (N-H4 DEFAULT_IFAC_SIZE, N-H5 crash-safe fixtures)
-          # land, so a partial-dormancy regression (most tests silently
-          # skipping again) is also caught.
-          MIN_PASSED: "1"
+          # Minimum number of tests that must actually PASS. This is a coverage
+          # FLOOR, not a failure mask: the guard below fails the job on ANY
+          # failed/errored test independently (see `if failures or errors`), so
+          # MIN_PASSED can never let a failing test through. Its job is to catch
+          # *dormancy* — pytest exits 0 when every test is skipped, so an all-skip
+          # (or now a mostly-skip) run would otherwise look green while testing
+          # little. Set to 30: below the full integration count (~34-36) to leave
+          # buffer for any tests that legitimately skip on this CI runner, but
+          # high enough that a partial-dormancy regression (most tests silently
+          # skipping again) turns the job RED. Re-check against an actual CI pass
+          # count and raise further toward the full count if all tests run here.
+          MIN_PASSED: "30"
         run: |
           rc=0
           python3 -m pytest integration/ --python-only -q \

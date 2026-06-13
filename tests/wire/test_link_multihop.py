@@ -42,6 +42,12 @@ Kotlin-sender triples are the diagnostic targets.
 import secrets
 import time
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 # Allow generous time budgets — link establishment involves multiple
 # round-trips plus the default RNS handshake timing (PATHFINDER + link
@@ -88,6 +94,13 @@ def _setup_three_peer_topology(wire_3peer):
     return sender, transport, receiver, dest_hash
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open",
+    ],
+    verifies="A 2-hop Link (sender → TCP transport → receiver) establishes successfully across a transport node and link_open returns a 16-byte link_id within the establishment timeout",
+)
 def test_link_establishes_multihop(wire_3peer):
     """Baseline: a 2-hop Link must establish successfully across a transport.
 
@@ -112,6 +125,13 @@ def test_link_establishes_multihop(wire_3peer):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "link_send", "link_poll",
+    ],
+    verifies="Bytes sent over an established multi-hop Link (sender → TCP transport → receiver) arrive at the receiver, with the exact payload present among the polled link DATA — catches HEADER_2 transport_id mis-wrapping that drops data packets at the intermediate transport",
+)
 def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     """The real test: once the link is established, sent bytes must
     arrive at the receiver.
@@ -157,6 +177,13 @@ def test_link_data_reaches_receiver_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "link_send", "link_poll",
+    ],
+    verifies="Five back-to-back link DATA packets (16-48 bytes each) sent over a multi-hop Link all arrive at the receiver, matching the sent payloads as a set with an equal count — catches 'only the first packet routes' regressions",
+)
 def test_link_data_roundtrip_multiple_packets(wire_trio, wire_3peer):
     """Extension: multiple consecutive sends must all arrive. This
     catches regressions where only the first post-establishment packet

@@ -36,6 +36,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 # Path expiry constants, in milliseconds since epoch (both sides agreed).
 # Matches Python Transport.PATHFINDER_E / AP_PATH_TIME / ROAMING_PATH_TIME
@@ -112,6 +118,13 @@ def _start_three_peer_topology(
 # ---------------------------------------------------------------------------
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "announce",
+        "read_path_random_hash", "read_path_entry", "request_path", "poll_path",
+    ],
+    verifies="When a transport node answers a path request for a destination it has cached, the re-emitted announce is the cached one — the requester's learned 10-byte random_hash is byte-identical to the one the transport cached, proving no regeneration",
+)
 def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
     """When B (transport) answers a PR for a destination it has cached,
     the re-emitted announce MUST be the cached announce — identifiable
@@ -214,6 +227,13 @@ _ALL_MODES_FOR_GATING = sorted(_DISCOVER_PATHS_FOR_MODES | _NON_DISCOVER_MODES)
 
 
 @pytest.mark.parametrize("transport_mode", _ALL_MODES_FOR_GATING)
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "request_path",
+        "has_discovery_path_request",
+    ],
+    verifies="A transport node forwards a path request for an unknown destination to its other interfaces only when the receiving interface's mode is in DISCOVER_PATHS_FOR (ACCESS_POINT, GATEWAY, ROAMING), asserting the discovery_path_requests membership exactly matches that gate",
+)
 def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
     """When C sends a PR for an UNKNOWN destination to B, B must only
     forward the request to its other interfaces if B's receiving
@@ -288,6 +308,13 @@ def _tx_delta_after_pr(requester, transport_peer, dest_hash):
     return transport_peer.tx_bytes() - tx_before
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "announce", "read_path_entry",
+        "tx_bytes", "request_path",
+    ],
+    verifies="ROAMING loop prevention: when a path request arrives on the same interface that is the cached path's received_from under ROAMING mode, the transport emits no answer packet (post-PR TX-byte delta stays below the idle-traffic budget)",
+)
 def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     """ROAMING loop prevention: when a PR arrives on an interface that
     is itself the `received_from` of the cached path, B must refuse to
@@ -359,6 +386,13 @@ def test_roaming_no_answer_when_next_hop_on_same_interface(wire_peers):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "announce", "read_path_entry",
+        "tx_bytes", "request_path",
+    ],
+    verifies="Positive companion to the ROAMING drop: under FULL mode the loop-prevention rule does not apply, so the transport answers the path request and emits a non-zero TX-byte delta, proving the negative test's observable is not vacuous",
+)
 def test_roaming_loop_prevention_positive_companion(wire_peers):
     """Companion to the negative test above. Same 2-peer topology, but
     under FULL mode the loop-prevention rule does NOT apply, so B must
@@ -424,6 +458,10 @@ _EXPIRY_JITTER_MS = 1000
 @pytest.mark.parametrize(
     "mode,expected_delta_ms,label", _EXPIRY_EXPECTATIONS,
     ids=[label for _mode, _delta, label in _EXPIRY_EXPECTATIONS],
+)
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "read_path_entry"],
+    verifies="A cached path entry's expires-minus-timestamp equals the per-mode expiry constant selected from the receiving interface's mode: ACCESS_POINT -> AP_PATH_TIME (1d), ROAMING -> ROAMING_PATH_TIME (6h), everything else -> PATHFINDER_E (7d)",
 )
 def test_mode_specific_path_expiry_assignment(
     wire_peers, mode, expected_delta_ms, label
@@ -535,14 +573,13 @@ def _poll_path_entry(peer, dest_hash, timeout_sec):
     return entry
 
 
-# Verifies: a node announcing its OWN destination out a BOUNDARY or ROAMING
-# interface reaches the peer (local-origin carve-out fires despite the next-hop
-# block); out an ACCESS_POINT interface it does NOT (AP has no carve-out).
-# (Plain test — this file does not use @conformance_case; cmds exercised:
-# start_tcp_server, start_tcp_client, announce, read_path_entry.)
 @pytest.mark.parametrize(
     "client_mode,expect_learned,label", _CARVE_OUT_MODES,
     ids=[label for _m, _e, label in _CARVE_OUT_MODES],
+)
+@conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "announce", "read_path_entry"],
+    verifies="A node announcing its OWN destination out a BOUNDARY or ROAMING interface reaches the peer (the local-origin carve-out fires despite the next-hop block), while out an ACCESS_POINT interface it does NOT (AP has no local-origin carve-out)",
 )
 def test_local_origin_announce_carveout(
     wire_peers, client_mode, expect_learned, label

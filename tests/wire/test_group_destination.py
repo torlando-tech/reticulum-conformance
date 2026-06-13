@@ -89,9 +89,15 @@ def test_group_cross_peer_symmetric_roundtrip(wire_peers):
     # A originates the group and its symmetric key.
     a = server.group_create(app_name=_APP, aspects=_ASPECTS)
     a_hash, a_key = a["destination_hash"], a["key"]
-    assert len(a_key) > 0, (
-        f"{server.role_label}.group_create returned an empty symmetric key for "
-        f"GROUP {a_hash.hex()}; a GROUP destination must hold a Token key."
+    # A GROUP destination's key is a Token key generated at the default mode,
+    # which is AES-256-CBC in RNS 1.3.x — Token.generate_key() returns 64 bytes
+    # (32-byte HMAC signing key + 32-byte AES-256 key). A 32-byte key would mean
+    # the SUT defaulted to the legacy AES-128 mode; pin 64 so that divergence is
+    # caught (the prior `len > 0` check let a 32-byte AES-128 group key pass).
+    assert len(a_key) == 64, (
+        f"{server.role_label}.group_create returned a {len(a_key)}-byte symmetric "
+        f"key for GROUP {a_hash.hex()}; the AES-256 default requires a 64-byte "
+        f"Token key (a 32-byte key is the legacy AES-128 default)."
     )
 
     # B builds its own group destination and loads A's key (shared out-of-band).

@@ -263,6 +263,70 @@ divergence. See re-audit findings **N-H1 / N-H2 / H5**.
 
 ---
 
+## 4. `Transport` blackhole check on path-table reload compares an `Identity` object against identity-hash bytes — blackholed paths always reload
+
+- **Repo / version:** [markqvist/Reticulum](https://github.com/markqvist/Reticulum) —
+  confirmed in **1.3.1** (`RNS/Transport.py`).
+- **Severity:** Low/medium — the blackhole mechanism's path-table-reload guard is a
+  no-op. Paths to blackholed identities survive a restart and are re-inserted into
+  the path table; the runtime blackhole filters still apply to *new* traffic, so
+  this is a persistence-path bypass of the reload skip only.
+
+### Root cause
+
+`RNS/Transport.py`, path-table load in `start()` (lines **313–315**):
+
+```python
+if len(Transport.blackholed_identities) > 0:
+    path_identity = RNS.Identity.recall(destination_hash, _no_use=True)
+    if path_identity in Transport.blackholed_identities: blackholed = True
+```
+
+`Identity.recall()` returns an `RNS.Identity` **object** (or `None`), but
+`Transport.blackholed_identities` is a dict keyed by identity-hash **bytes**
+(`blackhole_identity()`, lines 3417–3419, inserts `identity_hash` keys; the
+type-correct membership idiom is used elsewhere, e.g. line 3497:
+`associated_identity.hash in Transport.blackholed_identities`). `Identity`
+defines no `__eq__`/`__hash__`, so default object identity applies and an
+`Identity` instance can never equal a `bytes` dict key — the membership test is
+always `False`, `blackholed` is never set, and the entry is loaded anyway.
+
+### Repro
+
+```bash
+python3 - <<'PY'
+import RNS
+ident = RNS.Identity()
+blackholed_identities = {ident.hash: {"until": None}}   # how Transport keys the table
+recalled = ident                                         # stands in for Identity.recall(...)
+print(recalled in blackholed_identities)                 # False — object vs bytes keys
+print(recalled.hash in blackholed_identities)            # True  — the intended check
+PY
+```
+
+On a live node: blackhole an identity (`Transport.blackhole_identity(h)`), let a
+path to one of its destinations be saved to the path table, restart — the path
+entry is reloaded despite the blackhole (the `blackholed == False` branch at
+line 318 runs).
+
+### Suggested fix
+
+```python
+if len(Transport.blackholed_identities) > 0:
+    path_identity = RNS.Identity.recall(destination_hash, _no_use=True)
+    if path_identity != None and path_identity.hash in Transport.blackholed_identities:
+        blackholed = True
+    del path_identity
+```
+
+(Also handles the `recall()`-returns-`None` case, which today only "works" by
+accident of the same broken comparison.)
+
+_Found 2026-06-10 during the conformance-suite completeness re-evaluation
+(discovery/blackhole subsystem analysis); see CONFORMANCE_COMPLETENESS_V2.md §8._
+
+---
+
 _Validated against RNS 1.3.1 + LXMF 0.9.9 (`~/.local/lib/python3.14/site-packages`).
 Line numbers refer to those installed sources; cross-check before filing if the
 upstream HEAD has since shifted._

@@ -92,10 +92,26 @@ class _WirePeer:
         mode: str | None = None,
         share_instance: bool = False,
         share_instance_type: str | None = None,
-        enable_transport: bool = True,
+        enable_transport: bool | None = True,
         fixed_mtu: int | None = None,
+        ifac_size: int | None = None,
+        bitrate: int | None = None,
+        respond_to_probes: bool = False,
+        use_implicit_proof: bool | None = None,
+        enable_remote_management: bool = False,
+        remote_management_allowed: list | None = None,
+        panic_on_interface_error: bool | None = None,
+        blackhole_sources: list | None = None,
+        interface_discovery_sources: list | None = None,
+        rpc_key: str | None = None,
     ) -> int:
         """Bring up a TCPServerInterface on this peer.
+
+        ifac_size (BITS), bitrate (bps), respond_to_probes, use_implicit_proof,
+        enable_remote_management, remote_management_allowed (list of hex hashes)
+        are optional reticulum_config knobs written into this peer's config so a
+        test can read the floored/derived/posture value back off the live RNS
+        objects. Omit a knob to keep RNS's own default.
 
         share_instance=True additionally publishes this peer as a shared
         Reticulum instance so other bridge processes (started via
@@ -137,8 +153,33 @@ class _WirePeer:
             kwargs["share_instance"] = True
             if share_instance_type is not None:
                 kwargs["share_instance_type"] = share_instance_type
-        if not enable_transport:
+        # enable_transport tri-state: None -> omit the config line entirely
+        # (pins the option-ABSENT default-off posture); False -> explicit No;
+        # True (default) -> the line is left implicit (server default).
+        if enable_transport is None:
+            kwargs["enable_transport"] = None
+        elif not enable_transport:
             kwargs["enable_transport"] = False
+        if ifac_size is not None:
+            kwargs["ifac_size"] = int(ifac_size)
+        if bitrate is not None:
+            kwargs["bitrate"] = int(bitrate)
+        if respond_to_probes:
+            kwargs["respond_to_probes"] = True
+        if use_implicit_proof is not None:
+            kwargs["use_implicit_proof"] = bool(use_implicit_proof)
+        if enable_remote_management:
+            kwargs["enable_remote_management"] = True
+        if remote_management_allowed is not None:
+            kwargs["remote_management_allowed"] = list(remote_management_allowed)
+        if panic_on_interface_error is not None:
+            kwargs["panic_on_interface_error"] = bool(panic_on_interface_error)
+        if blackhole_sources is not None:
+            kwargs["blackhole_sources"] = list(blackhole_sources)
+        if interface_discovery_sources is not None:
+            kwargs["interface_discovery_sources"] = list(interface_discovery_sources)
+        if rpc_key is not None:
+            kwargs["rpc_key"] = str(rpc_key)
         resp = self.bridge.execute("wire_start_tcp_server", **kwargs)
         self.handle = resp["handle"]
         self.identity_hash = bytes.fromhex(resp["identity_hash"])
@@ -410,6 +451,7 @@ class _WirePeer:
         aspects: list,
         app_data: bytes = b"",
         enable_ratchets: bool = False,
+        app_data_empty: bool = False,
     ) -> bytes:
         """Create and announce a fresh SINGLE IN destination; return its hash.
 
@@ -435,6 +477,11 @@ class _WirePeer:
         }
         if enable_ratchets:
             params["enable_ratchets"] = True
+        # app_data_empty requests an explicit b"" app_data (present-but-empty),
+        # distinct from omitting app_data; cmd_wire_announce only treats an empty
+        # app_data as present when this flag is set, otherwise it sends None.
+        if app_data_empty:
+            params["app_data_empty"] = True
         resp = self.bridge.execute("wire_announce", **params)
         self.last_announce = resp
         return bytes.fromhex(resp["destination_hash"])
@@ -449,14 +496,42 @@ class _WirePeer:
         )
         return bool(resp.get("found"))
 
+    def inject_raw_frame(
+        self,
+        variant: str,
+        raw: bytes | None = None,
+        dest_hash: bytes | None = None,
+        trim_to: int | None = None,
+    ) -> dict:
+        """Push a genuine (optionally masked/trimmed) RNS frame through this
+        peer's live interface receive path (Transport.inbound) via
+        wire_inject_raw_frame, returning the bridge result dict.
+
+        Result keys: dest_hash (hex str), frame_len (int), learned (bool);
+        build_masked additionally returns raw (hex str) and ifac_size (int);
+        ifac_size is present whenever the frame hit the IFAC interface.
+        """
+        assert self.handle, "start_* must be called first"
+        kwargs: dict = {"handle": self.handle, "variant": variant}
+        if raw is not None:
+            kwargs["raw"] = raw.hex()
+        if dest_hash is not None:
+            kwargs["dest_hash"] = dest_hash.hex()
+        if trim_to is not None:
+            kwargs["trim_to"] = int(trim_to)
+        return self.bridge.execute("wire_inject_raw_frame", **kwargs)
+
     def register_request_handler(
         self,
         destination_hash: bytes,
         path: str,
-        response: bytes,
+        response: bytes = b"",
         allow: str = "all",
         allowed_identity_hashes: list | None = None,
         strategy: str | None = None,
+        response_none: bool = False,
+        response_file: bytes | None = None,
+        response_metadata: bytes | None = None,
     ) -> None:
         """Register a fixed-response request handler on a listening
         destination — the bridge plugs in a generator that returns the
@@ -475,6 +550,15 @@ class _WirePeer:
         `strategy` is an explicit alias for `allow` (the contract names this
         policy the request "strategy"); when given it overrides `allow`. Both
         map to the wire command's `allow` parameter.
+
+        `response_none=True` makes the handler return None instead of bytes: the
+        handler still fires (and is logged), but RNS sends no RESPONSE
+        packet/resource (Link.py:893), so the requester only ever times out.
+
+        `response_file` (bytes) makes the handler return a (file, metadata) tuple:
+        RNS sends the response as a metadata-bearing Resource (Link.py:884-895),
+        and the requester sees `response` == the file content with
+        `response_metadata` == `response_metadata` (un-unpacked).
         """
         assert self.handle, "start_* must be called first"
         effective_allow = strategy if strategy is not None else allow
@@ -485,6 +569,12 @@ class _WirePeer:
             "response": response.hex(),
             "allow": effective_allow,
         }
+        if response_none:
+            params["response_none"] = True
+        if response_file is not None:
+            params["response_file"] = response_file.hex()
+            if response_metadata is not None:
+                params["response_metadata"] = response_metadata.hex()
         if allowed_identity_hashes:
             params["allowed_identity_hashes"] = [
                 h.hex() if isinstance(h, (bytes, bytearray)) else str(h)
@@ -625,6 +715,8 @@ class _WirePeer:
         aspects: list,
         resource_strategy: str | None = None,
         enable_ratchets: bool = False,
+        open_channel: bool = True,
+        buffer_stream_ids: list | None = None,
     ) -> bytes:
         """Register an IN destination that accepts incoming Links.
 
@@ -666,6 +758,14 @@ class _WirePeer:
             params["resource_strategy"] = str(resource_strategy)
         if enable_ratchets:
             params["enable_ratchets"] = True
+        # open_channel=False makes the inbound link accept WITHOUT a channel, so
+        # an inbound CHANNEL packet is dropped unproven (no-channel-no-proof).
+        if not open_channel:
+            params["open_channel"] = False
+        # buffer_stream_ids registers extra receiver-relative RawChannelReaders
+        # for the multi-reader stream-id filtering test.
+        if buffer_stream_ids:
+            params["buffer_stream_ids"] = [int(s) for s in buffer_stream_ids]
         resp = self.bridge.execute("wire_listen", **params)
         dest_hash = bytes.fromhex(resp["destination_hash"])
         self.listen_identities[dest_hash] = {
@@ -1011,6 +1111,77 @@ class _WirePeer:
             "wire_link_mtu", handle=self.handle, link_id=link_id.hex()
         )
 
+    def link_request_timeout(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int | None = None,
+    ) -> dict:
+        """Issue link.request and read back the RequestReceipt's computed
+        timeout WITHOUT waiting for a response.
+
+        With timeout_ms=None, RNS derives the timeout from the link RTT
+        (rtt*6 + 11.25); pass an explicit timeout_ms to bypass the formula.
+        Returns {receipt_timeout, rtt, traffic_timeout_factor,
+        response_max_grace_time, explicit_timeout}.
+        """
+        assert self.handle, "start_* must be called first"
+        params = dict(
+            handle=self.handle, link_id=link_id.hex(), path=path, data=data.hex()
+        )
+        if timeout_ms is not None:
+            params["timeout_ms"] = int(timeout_ms)
+        return self.bridge.execute("wire_link_request_timeout", **params)
+
+    def capture_response_packet(
+        self,
+        link_id: bytes,
+        path: str,
+        data: bytes = b"",
+        timeout_ms: int = 15000,
+    ) -> dict:
+        """Issue link.request and capture the raw RESPONSE / RESOURCE_ADV
+        packets RNS delivers on the initiator's link.
+
+        Returns {status, response, captured:[{context, plaintext}...]} where
+        plaintext is the decrypted RESPONSE packet payload (hex) and context
+        is the packet's context byte (RESPONSE=0x0A, RESOURCE_ADV=0x02).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_capture_response_packet",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            path=path,
+            data=data.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+
+    def interface_hw_mtu(self) -> dict:
+        """Read this peer's wire interface HW_MTU + the link_mtu_discovery
+        config flag.
+
+        Returns {hw_mtu, link_mtu_discovery, reticulum_mtu, autoconfigure_mtu,
+        fixed_mtu, class_hw_mtu}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_interface_hw_mtu", handle=self.handle)
+
+    def send_oversize_link_packet(self, link_id: bytes, size: int) -> dict:
+        """Attempt a single link DATA packet of `size` bytes; report whether
+        RNS accepts or rejects it at the negotiated link MTU bound.
+
+        Returns {sent, rejected, error, mtu, mdu, packet_mtu, raw_len, size}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_oversize_link_packet",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            size=int(size),
+        )
+
     def send_packet(
         self,
         destination_hash: bytes,
@@ -1083,6 +1254,21 @@ class _WirePeer:
             create_receipt=bool(create_receipt),
         )
 
+    def send_over_closed_link(self, link_id: bytes, data: bytes = b"") -> dict:
+        """Attempt RNS.Packet.send() over a CLOSED link (Packet.py:280-286).
+
+        The link must already be torn down (call link_teardown first). Returns
+        {link_status, link_status_name, sent, bytes_transmitted}: a closed link
+        yields sent=False and bytes_transmitted=0 (RNS transmits nothing).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_over_closed_link",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+        )
+
     def send_keepalive_probe(self, link_id: bytes) -> dict:
         """Inject a decrypted 0xFF keepalive into a link's receive path.
 
@@ -1127,8 +1313,20 @@ class _WirePeer:
         injected sequence list.
         """
         assert self.handle, "start_* must be called first"
-        wire_envelopes = [
-            {
+        wire_envelopes = []
+        for e in envelopes:
+            if e.get("raw") is not None:
+                # Raw-override: crafted envelope bytes fed verbatim to
+                # Channel._receive (bypassing Envelope.pack) — e.g. a wrong
+                # length field. sequence is informational only.
+                raw = e["raw"]
+                env = {
+                    "raw": raw.hex() if isinstance(raw, (bytes, bytearray)) else raw,
+                    "sequence": int(e.get("sequence", -1)),
+                }
+                wire_envelopes.append(env)
+                continue
+            env = {
                 "sequence": int(e["sequence"]),
                 "data": (
                     e["data"].hex()
@@ -1136,8 +1334,9 @@ class _WirePeer:
                     else (e.get("data") or "")
                 ),
             }
-            for e in envelopes
-        ]
+            if e.get("msgtype") is not None:
+                env["msgtype"] = int(e["msgtype"])
+            wire_envelopes.append(env)
         resp = self.bridge.execute(
             "wire_channel_inject",
             handle=self.handle,
@@ -1164,11 +1363,27 @@ class _WirePeer:
             "wire_channel_window", handle=self.handle, link_id=link_id.hex()
         )
 
+    def channel_register(self, link_id: bytes, kind: str) -> dict:
+        """Drive Channel message-type registration validation on a real channel.
+
+        kind selects a crafted message class (non_message_base, msgtype_none,
+        reserved, not_constructible, valid) or the special
+        envelope_pack_no_msgtype path. Returns {accepted, error, ce_type}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_register",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            kind=kind,
+        )
+
     def channel_send(
         self,
         link_id: bytes,
         data: bytes,
         drop_acks: bool = False,
+        fail_outlet: bool = False,
         msgtype: int | None = None,
         timeout_ms: int = 20000,
     ) -> dict:
@@ -1208,11 +1423,85 @@ class _WirePeer:
             "link_id": link_id.hex(),
             "data": data.hex(),
             "drop_acks": bool(drop_acks),
+            "fail_outlet": bool(fail_outlet),
             "timeout_ms": int(timeout_ms),
         }
         if msgtype is not None:
             params["msgtype"] = int(msgtype)
         return self.bridge.execute("wire_channel_send", **params)
+
+    def link_set_rtt(self, link_id: bytes, rtt: float) -> dict:
+        """Set a live RNS.Link's measured rtt (LinkChannelOutlet.rtt reads it
+        live). Lets a sequence of real delivered channel_send calls drive the
+        Channel medium/fast rate-promotion bands that loopback RTT can't reach.
+        Returns {rtt, previous}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_set_rtt",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+        )
+
+    def channel_profile(self, link_id: bytes, rtt: float) -> dict:
+        """Report the initial window a REAL RNS.Channel selects for `rtt`
+        (Channel.__init__ profile gate). Returns {rtt, window, window_min,
+        window_max, window_flexibility, rtt_slow} read off a throwaway real
+        Channel; the live channel is untouched (link.rtt restored).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_profile",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+        )
+
+    def channel_timeout_formula(
+        self, link_id: bytes, rtt: float, tries: int, ring_depth: int = 0
+    ) -> dict:
+        """Compute Channel._get_packet_timeout_time(tries) on a throwaway real
+        Channel with the given rtt and tx-ring depth. Returns {timeout, rtt,
+        tries, ring_depth} — the value RNS's own formula produced.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_timeout_formula",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            rtt=float(rtt),
+            tries=int(tries),
+            ring_depth=int(ring_depth),
+        )
+
+    def channel_handler_chain(self, link_id: bytes, handlers: list) -> dict:
+        """Drive Channel._run_callbacks over an ordered handler chain. `handlers`
+        is a list of "true"/"false"/"raise" describing each registered handler's
+        behaviour. Returns {log, next_rx_sequence, handler_count} — `log` is the
+        registration index of every handler that fired, in fire order.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_handler_chain",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            handlers=list(handlers),
+        )
+
+    def channel_spurious_proof(self, link_id: bytes, timeout_ms: int = 12000) -> dict:
+        """Perform a genuine delivered channel send, then re-fire the delivered
+        packet's proof/timeout callbacks (and a never-tracked packet's) to
+        exercise RNS's spurious-message / stale-timeout guards. Returns window
+        snapshots, link status, and any raised exceptions.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_spurious_proof",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            timeout_ms=int(timeout_ms),
+        )
 
     # --- Buffer / RawChannelReader / RawChannelWriter streaming -----------
 
@@ -1221,6 +1510,10 @@ class _WirePeer:
         link_id: bytes,
         data: bytes,
         bomb: bool = False,
+        bomb_decompressed_len: int | None = None,
+        stream_id: int | None = None,
+        eof_with_data: bool = False,
+        use_close: bool = False,
         timeout_ms: int = 30000,
     ) -> dict:
         """Stream bytes over a link via RNS.Buffer (RawChannelWriter).
@@ -1240,17 +1533,26 @@ class _WirePeer:
         Returns {written, eof} (bytes written + whether EOF was flushed).
         """
         assert self.handle, "start_* must be called first"
-        return self.bridge.execute(
-            "wire_buffer_stream",
-            handle=self.handle,
-            link_id=link_id.hex(),
-            data=data.hex(),
-            bomb=bool(bomb),
-            timeout_ms=int(timeout_ms),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "link_id": link_id.hex(),
+            "data": data.hex(),
+            "bomb": bool(bomb),
+            "eof_with_data": bool(eof_with_data),
+            "use_close": bool(use_close),
+            "timeout_ms": int(timeout_ms),
+        }
+        if bomb_decompressed_len is not None:
+            params["bomb_decompressed_len"] = int(bomb_decompressed_len)
+        if stream_id is not None:
+            params["stream_id"] = int(stream_id)
+        return self.bridge.execute("wire_buffer_stream", **params)
 
     def buffer_received(
-        self, destination_hash: bytes, timeout_ms: int = 30000
+        self,
+        destination_hash: bytes,
+        timeout_ms: int = 30000,
+        stream_id: int | None = None,
     ) -> dict:
         """Drain what a listener's RawChannelReader reassembled from a stream.
 
@@ -1263,18 +1565,58 @@ class _WirePeer:
           error   -> the abort reason string when aborted, else None.
         """
         assert self.handle, "start_* must be called first"
-        resp = self.bridge.execute(
-            "wire_buffer_received",
-            handle=self.handle,
-            destination_hash=destination_hash.hex(),
-            timeout_ms=int(timeout_ms),
-        )
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+            "timeout_ms": int(timeout_ms),
+        }
+        if stream_id is not None:
+            params["stream_id"] = int(stream_id)
+        resp = self.bridge.execute("wire_buffer_received", **params)
         return {
             "data": bytes.fromhex(resp["data"]) if resp.get("data") else b"",
             "eof": bool(resp.get("eof", False)),
             "aborted": bool(resp.get("aborted", False)),
             "error": resp.get("error"),
         }
+
+    def channel_emit_capture(
+        self, link_id: bytes, data: bytes = b"", timeout_ms: int = 15000
+    ) -> dict:
+        """Send a real Channel message and capture the emitted Packet's context.
+
+        Returns {context, packet_type, packet_hash, delivered, channel_context,
+        data_context} — context is the context byte of the Packet the Channel
+        outlet transmitted (must equal channel_context == RNS.Packet.CHANNEL).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_channel_emit_capture",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            timeout_ms=int(timeout_ms),
+        )
+
+    def listener_proof_log(self, destination_hash: bytes) -> dict:
+        """Return the receiver-side proof log {contexts, channel_proofs,
+        channel_context} for a listening destination."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_listener_proof_log",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+    def listener_channel_rx(self, destination_hash: bytes) -> dict:
+        """Return the receiver-side Channel rx state {next_rx_sequence,
+        next_sequence, rx_ring} for a listening destination."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_listener_channel_rx",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
 
     # --- GROUP destination symmetric crypto -------------------------------
 
@@ -1541,6 +1883,127 @@ class _WirePeer:
             "latest_ratchet_time": resp.get("latest_ratchet_time"),
         }
 
+    def get_adopted_ratchet(self, destination_hash: bytes) -> dict:
+        """Report the ratchet this peer ADOPTED for a REMOTE destination after
+        hearing its ratcheted announce (wire_get_adopted_ratchet ->
+        RNS.Identity.get_ratchet / _get_ratchet_id, Identity.py:396-411,499-520).
+
+        Returns {found, ratchet_public, ratchet_id}; ratchet_public (32 bytes)
+        and ratchet_id (10 bytes) are decoded to bytes (or None when this peer
+        has not adopted a ratchet for the destination).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_get_adopted_ratchet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+        pub = resp.get("ratchet_public")
+        rid = resp.get("ratchet_id")
+        return {
+            "found": bool(resp.get("found", False)),
+            "ratchet_public": bytes.fromhex(pub) if pub else None,
+            "ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def encrypt_to_remote(
+        self, destination_hash: bytes, plaintext: bytes, use_ratchet: bool = True
+    ) -> dict:
+        """Encrypt to a REMOTE destination, auto-selecting the ratchet this peer
+        ADOPTED from its announce (wire_encrypt_to_remote -> RNS.Identity.recall
+        + get_ratchet + Identity.encrypt, mirroring Destination.encrypt's target
+        choice, Destination.py:595-599).
+
+        use_ratchet=False forces the static X25519 key (negative control).
+        Returns {ciphertext, used_ratchet, ratchet_id, ratchet_public}; bytes
+        fields decoded (ratchet_id/ratchet_public None when no ratchet used).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_encrypt_to_remote",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            plaintext=plaintext.hex(),
+            use_ratchet=bool(use_ratchet),
+        )
+        rid = resp.get("ratchet_id")
+        pub = resp.get("ratchet_public")
+        return {
+            "ciphertext": bytes.fromhex(resp["ciphertext"]),
+            "used_ratchet": bool(resp.get("used_ratchet", False)),
+            "ratchet_id": bytes.fromhex(rid) if rid else None,
+            "ratchet_public": bytes.fromhex(pub) if pub else None,
+        }
+
+    def destination_decrypt(
+        self, destination_hash: bytes, ciphertext: bytes
+    ) -> dict:
+        """Decrypt a ciphertext on a local SINGLE destination and report which
+        ratchet decrypted it (wire_destination_decrypt -> RNS.Destination.decrypt,
+        Destination.py:611-643).
+
+        latest_ratchet_id is the id of the ratchet that succeeded, or None when
+        the static private key decrypted it (Identity.decrypt, Identity.py:886-913).
+        Returns {decrypted, plaintext, latest_ratchet_id} (bytes decoded).
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_destination_decrypt",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            ciphertext=ciphertext.hex(),
+        )
+        pt = resp.get("plaintext")
+        rid = resp.get("latest_ratchet_id")
+        return {
+            "decrypted": bool(resp.get("decrypted", False)),
+            "plaintext": bytes.fromhex(pt) if pt else None,
+            "latest_ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def reannounce(
+        self,
+        destination_hash: bytes,
+        app_data: bytes | None = None,
+        rotate_ago_s: float | None = None,
+    ) -> dict:
+        """Re-announce an already-registered IN destination (wire_reannounce ->
+        RNS.Destination.announce, Destination.py:265-311).
+
+        rotate_ago_s backdates latest_ratchet_time so the rotation gate opens and
+        a genuinely NEW ratchet is announced (the "newer announce replaces the
+        adopted ratchet" driver). Returns {announced, current_ratchet_id} (id
+        decoded to bytes or None).
+        """
+        assert self.handle, "start_* must be called first"
+        params: dict = {
+            "handle": self.handle,
+            "destination_hash": destination_hash.hex(),
+        }
+        if app_data is not None:
+            params["app_data"] = app_data.hex()
+        if rotate_ago_s is not None:
+            params["rotate_ago_s"] = float(rotate_ago_s)
+        resp = self.bridge.execute("wire_reannounce", **params)
+        rid = resp.get("current_ratchet_id")
+        return {
+            "announced": bool(resp.get("announced", False)),
+            "current_ratchet_id": bytes.fromhex(rid) if rid else None,
+        }
+
+    def set_proof_implicit(self, enabled: bool) -> dict:
+        """Toggle this instance's implicit-vs-explicit single-packet PROOF policy
+        (wire_set_proof_implicit -> RNS.Reticulum.should_use_implicit_proof,
+        Reticulum.py:1699-1705). With enabled=False the prover emits the explicit
+        packet_hash||signature proof form. Returns {implicit_proof}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_set_proof_implicit",
+            handle=self.handle,
+            enabled=bool(enabled),
+        )
+
     def set_retained_ratchets(
         self, destination_hash: bytes, n: int, pad_to: int | None = None
     ) -> dict:
@@ -1587,6 +2050,46 @@ class _WirePeer:
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_ratchet_file_roundtrip",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
+
+    def identity_ratchet_persist(self) -> dict:
+        """Persist + reload a RECEIVED ratchet through RNS's IDENTITY-side
+        store, then run the _clean_ratchets not-in-use housekeeping
+        (wire_identity_ratchet_persist -> RNS.Identity._remember_ratchet /
+        get_ratchet / _clean_ratchets, Identity.py:424-522).
+
+        Distinct from ratchet_file_roundtrip (the DESTINATION-side signed store).
+        The bridge generates a genuine 32-byte ratchet, lets RNS persist it as
+        {ratchet, received} via the atomic temp-file write, drops the in-memory
+        cache to force the on-disk load, reads it back through get_ratchet, then
+        cleans it (the random dest hash is not in known_destinations). Returns
+        {dest_hash, ratchet_len, file_written, tmp_leftover, reload_match,
+        reloaded_len, accepted_size, cleaned_removed}. The bridge never builds or
+        parses the on-disk msgpack — RNS's own writer+reader round-trip it.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_identity_ratchet_persist",
+            handle=self.handle,
+        )
+
+    def known_destinations_roundtrip(self, destination_hash: bytes) -> dict:
+        """Save -> clear -> reload this peer's on-disk known_destinations table
+        and report whether `destination_hash` round-trips
+        (wire_known_destinations_roundtrip -> RNS.Identity.save_known_destinations
+        / load_known_destinations, Identity.py:176-265).
+
+        The bridge persists the whole table via RNS's own serializer, clears the
+        in-memory table (recall then misses), reloads from disk (recall hits
+        again). The bridge never builds or parses the on-disk msgpack. Returns
+        {present_before_save, recall_after_clear_found, recall_after_load_found,
+        app_data_after_load, entry_len_after_load, table_size_after_load}.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_known_destinations_roundtrip",
             handle=self.handle,
             destination_hash=destination_hash.hex(),
         )
@@ -1638,6 +2141,16 @@ class _WirePeer:
             "proof_is_explicit": resp.get("proof_is_explicit"),
             "impl_length": resp.get("impl_length"),
             "expl_length": resp.get("expl_length"),
+            # Raw wire frame of the emitted PROOF + the proved packet's full
+            # hash, so a test can pin the proof packet's flag-byte shape and
+            # its truncated-hash destination addressing.
+            "proof_raw": (
+                bytes.fromhex(resp["proof_raw"]) if resp.get("proof_raw") else None
+            ),
+            "proved_packet_hash": (
+                bytes.fromhex(resp["proved_packet_hash"])
+                if resp.get("proved_packet_hash") else None
+            ),
         }
 
     # --- PLAIN destination no-op encrypt / decrypt ------------------------
@@ -1760,6 +2273,512 @@ class _WirePeer:
             forged_id=forged_id.hex(),
         )
 
+    def send_packet(
+        self,
+        destination_hash: bytes,
+        data: bytes,
+        app_name: str,
+        aspects: list,
+        create_receipt: bool = True,
+    ) -> dict:
+        """Send a single SINGLE-destination DATA packet with a tracked
+        PacketReceipt and return {sent, receipt_id, hops} immediately (the
+        non-blocking counterpart to send_packet_with_proof_request). Poll the
+        receipt with packet_receipt_status, or drive it adversarially with
+        inject_crafted_proof."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_packet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            data=data.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            create_receipt=create_receipt,
+        )
+
+    def packet_receipt_status(self, receipt_id: str, timeout_ms: int = 0) -> dict:
+        """Poll a tracked PacketReceipt; returns {status, status_name,
+        delivered, proved}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_packet_receipt_status",
+            handle=self.handle,
+            receipt_id=receipt_id,
+            timeout_ms=timeout_ms,
+        )
+
+    def send_undecryptable(self, destination_hash: bytes, data: bytes,
+                           app_name: str, aspects: list) -> dict:
+        """Adversarial: send a SINGLE DATA packet whose ciphertext is damaged so
+        the receiver cannot decrypt it, returning {sent, receipt_id}. Poll the
+        receipt with packet_receipt_status — it must NEVER reach DELIVERED (the
+        receiver delivers nothing and emits no proof). See
+        wire_send_undecryptable."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_undecryptable",
+            handle=self.handle, destination_hash=destination_hash.hex(),
+            data=data.hex(), app_name=app_name, aspects=list(aspects),
+        )
+
+    def inject_crafted_proof(self, receipt_id: str, variant: str) -> dict:
+        """Adversarial PROOF injector: craft a forged/malformed PROOF of
+        `variant` against the pending PacketReceipt `receipt_id` and run it
+        through the real RNS.PacketReceipt.validate_proof gate, reporting
+        {validated, status, status_name, proved, proof_len}.
+
+        All variants are REJECTION cases (forged_implicit, forged_explicit,
+        wrong_hash_explicit, wrong_length_short/mid/long) — see
+        wire_inject_crafted_proof. A genuinely-valid proof can't be signed
+        cross-process, so the positive control is a real PROVE_ALL delivery."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_proof",
+            handle=self.handle, receipt_id=receipt_id, variant=variant,
+        )
+
+    def inject_tampered_link_data(
+        self, link_id: bytes, data: bytes, corruption: str = "none",
+    ) -> dict:
+        """Adversarial tampered-token injector: build a DATA packet encrypted to
+        an established link, optionally corrupt it (`corruption` ∈ none /
+        ciphertext / hmac / truncate), and feed it through the link's real
+        receive path, reporting {corruption, unpacked, delivered, link_active,
+        status_name}. Run on the RECEIVER peer (it owns the inbound link's
+        packet handler). A tampered packet must NOT be delivered and the link
+        must stay ACTIVE; `corruption='none'` is the positive control."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_tampered_link_data",
+            handle=self.handle, link_id=link_id.hex(),
+            data=data.hex(), corruption=corruption,
+        )
+
+    def inject_crafted_link_identify(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial LINKIDENTIFY injector: craft an identify packet of
+        `variant` (valid / forged_signature / wrong_signed_data / wrong_length),
+        encrypt it to the established link, and feed it through the real
+        link.receive on THIS (non-initiator) peer, reporting {variant,
+        claimed_identity_hash, remote_identity_after, adopted, initiator}. Run on
+        the peer holding the INBOUND link. A valid identify is adopted; every
+        forgery leaves remote_identity None."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_identify",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_crafted_resource_part(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial resource-part injector: build a real sender Resource +
+        receiver (via Resource.accept), then feed a part of `variant` (valid /
+        forged_map_hash) through the real Resource.receive_part, reporting
+        {variant, accepted, parts_before, parts_after, total_parts}. The sender's
+        own part is accepted; a forged-map-hash part is dropped."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_part",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_crafted_resource_proof(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial RESOURCE_PRF injector: build a real sender Resource on the
+        link and run a crafted proof of `variant` (valid / wrong_proof /
+        wrong_length_short / wrong_length_long) through the real
+        Resource.validate_proof, reporting {variant, concluded, status,
+        status_name, proof_len}. A valid 64-byte proof concludes the resource;
+        anything else does not."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_proof",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_constants(self) -> dict:
+        """Read the real Resource / ResourceAdvertisement protocol constants off
+        RNS (WINDOW/WINDOW_MIN/WINDOW_MAX/MAPHASH_LEN/HASHMAP_MAX_LEN/
+        COLLISION_GUARD_SIZE/MAX_EFFICIENT_SIZE/METADATA_MAX_SIZE/MAX_RETRIES/
+        MAX_ADV_RETRIES/...). For pinning each against its spec literal."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_resource_constants", handle=self.handle)
+
+    def inject_crafted_resource_request(self, link_id: bytes, variant: str) -> dict:
+        """Adversarial RESOURCE_REQ injector: build a real sender Resource on the
+        link and feed a crafted request of `variant` (misaligned_hmu / aligned /
+        serve_all) into the real Resource.request, reporting the sequencing-error
+        cancel (misaligned), the aligned-HMU non-cancel, or the served-parts /
+        AWAITING_PROOF / byte-identical-resend behaviour (serve_all)."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_resource_request",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_corrupt_assembled_resource(self, link_id: bytes, variant: str) -> dict:
+        """Assembly-time hash check: build a real sender + receiver, fill the
+        receiver buffer with genuine part bytes (variant 'valid') or corrupt one
+        slot (variant 'corrupt'), run the real Resource.assemble, and report
+        {variant, status_name, complete, corrupt, proof_sent, proof_calls}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_corrupt_assembled_resource",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_duplicate_resource_adv(self, link_id: bytes) -> dict:
+        """Duplicate RESOURCE_ADV de-dup: drive one genuine advertisement through
+        the real Resource.accept twice and report {first_accepted, second_created,
+        incoming_count}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_duplicate_resource_adv",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def inject_malformed_resource_adv(self, link_id: bytes, variant: str) -> dict:
+        """Malformed RESOURCE_ADV drop: feed undecodable msgpack ('garbage') or a
+        valid-but-missing-key ('missing_key') advertisement through the real
+        Resource.accept and report {variant, inbound_started, crashed}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_malformed_resource_adv",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def inject_resource_adv_flags(self, link_id: bytes, variant: str) -> dict:
+        """Request/response advertisement accept logic: drive a request /
+        response / plain advertisement through the real Link.receive dispatcher
+        under a given resource_strategy and report {variant, accepted, strategy}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_resource_adv_flags",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_receiver_request_state(self, link_id: bytes, n: int = 2) -> dict:
+        """Inbound Resource window / consecutive-height read-back: build a real
+        receiver, feed `n` genuine parts in order, and report window/window_min/
+        window_max/consecutive_height_*/hashmap_height_*/received_count."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_receiver_request_state",
+            handle=self.handle, link_id=link_id.hex(), n=n,
+        )
+
+    def inject_hashmap_update(self, link_id: bytes) -> dict:
+        """HMU idempotence: apply the same later hashmap segment twice to a
+        >74-part receiver through the real Resource.hashmap_update and report
+        {height_after_advert, height_after_first, height_after_duplicate,
+        grew_on_first, grew_on_duplicate}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_hashmap_update",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_request_next_content(self, link_id: bytes, variant: str) -> dict:
+        """Receiver-side RESOURCE_REQ content: drive the real
+        Resource.request_next and capture the genuine request plaintext (variant
+        initial / after_parts / exhausted), reporting {window, requested,
+        expected, exhausted, waiting_for_hmu, second_request_emitted}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_request_next_content",
+            handle=self.handle, link_id=link_id.hex(), variant=variant,
+        )
+
+    def resource_late_after_cancel(self, link_id: bytes) -> dict:
+        """FAILED-resource late-packet guard: cancel a real receiver and sender,
+        then feed late genuine part/HMU (receiver) and request/proof (sender)
+        through the real entry points, reporting the before/after observations
+        plus a pre-cancel positive control."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_late_after_cancel",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_part_count_derivation(self, link_id: bytes) -> dict:
+        """Part-count derivation: feed an advertisement with a TAMPERED adv.n to
+        the real Resource.accept and report {receiver_total_parts,
+        derived_expected, adv_n_genuine, adv_n_tampered, sender_parts,
+        transfer_size, receiver_sdu} — the receiver must derive ceil(t/sdu) and
+        ignore the bogus n."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_part_count_derivation",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_decompress_limit(self, link_id: bytes) -> dict:
+        """Decompression-bomb ceiling: read a live Resource's
+        max_decompressed_size / auto_compress_limit and the class
+        AUTO_COMPRESS_MAX_SIZE off real RNS."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_decompress_limit",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_window_inheritance(self, link_id: bytes) -> dict:
+        """Window inheritance: drive a first inbound transfer to COMPLETE, then a
+        second Resource.accept on the same link; report {default_window,
+        window_after_complete, link_last_window, window2_initial, completed_1,
+        total_parts_1} — the second receiver must inherit the recorded window."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_window_inheritance",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_progress(self, link_id: bytes) -> dict:
+        """Transfer-progress contract: feed half a transfer's in-order parts to a
+        real receiver and report {total_parts, fed, received_count,
+        progress_initial, progress_mid, progress_callback_calls} from the real
+        Resource.get_progress / progress callback."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_progress",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_receiver_proof_count(self, link_id: bytes) -> dict:
+        """Per-part proof suppression: count proofs as parts arrive and assert
+        exactly one is emitted after assembly. Reports {proofs_before_final,
+        proofs_after_assembly, status_name, complete}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_receiver_proof_count",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_force_collision(self, link_id: bytes) -> dict:
+        """Drive the hashmap collision-guard remap: force a map-hash collision on
+        the first build pass and report {remapped, random_hash_before,
+        random_hash_after, hashmap_changed, num_parts}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_force_collision",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def resource_outgoing_queue_state(self, link_id: bytes) -> dict:
+        """Pin one-outgoing-resource-at-a-time: register one outgoing resource,
+        advertise a second, and report {ready_empty, ready_with_one,
+        first_status*, second_status*, queued}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_outgoing_queue_state",
+            handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def inject_crafted_lrproof(self, variant: str) -> dict:
+        """Adversarial LRPROOF injector: on this peer, create a self-contained
+        initiator link to a fresh controlled destination, craft an LRPROOF of
+        `variant` (valid / forged_signature / wrong_signed_data / mode_mismatch /
+        wrong_size / non_pending) and feed it through the real
+        Link.validate_proof, reporting {variant, activated, status, status_name,
+        mtu, mode}. A valid proof activates the link; a forged / mode-mismatched
+        / wrong-sized / out-of-state one does not."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_lrproof", handle=self.handle, variant=variant,
+        )
+
+    def link_type_gate(self) -> dict:
+        """Pin Link's SINGLE-only rule: attempt RNS.Link() to a fresh OUT
+        destination of each type. Returns {single, plain, group}, each
+        {raised, error, link_created?}. SINGLE must not raise (positive
+        control); PLAIN and GROUP must each raise TypeError."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_link_type_gate", handle=self.handle)
+
+    def link_phy_stats_gate(self, link_id: bytes) -> dict:
+        """Pin Link phy-stats gating on an established link: stores sentinel
+        rssi/snr/q and reads get_rssi/get_snr/get_q with tracking off, on, and
+        off again. Returns {stored, off, on, off_again}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_phy_stats_gate", handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def link_teardown_emission(self, link_id: bytes) -> dict:
+        """Pin Link.teardown's LINKCLOSE-emission gate: counts LINKCLOSE packets
+        emitted when tearing down a fresh PENDING link vs the supplied
+        established (ACTIVE) link. Returns {pending_linkclose_emitted,
+        active_linkclose_emitted, active_status_before}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_teardown_emission", handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def interface_transport_defaults(self) -> dict:
+        """Read transport-node interface defaults off the live instance/classes:
+        {local_interface_port, ar_target, ar_penalty, ar_grace}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_interface_transport_defaults", handle=self.handle,
+        )
+
+    def discovery_autoconnect_gate(self) -> dict:
+        """Drive InterfaceDiscovery.autoconnect's pre-connect decision logic for
+        unsupported / Yggdrasil / wrong-type records and report whether any
+        interface was added (interfaces_added per case, all must be 0) plus the
+        endpoint_hash == SHA-256(reachable_on:port) match."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_discovery_autoconnect_gate", handle=self.handle,
+        )
+
+    def capture_lrproof_frame(self) -> dict:
+        """Capture a genuine outbound LRPROOF frame's raw bytes + flag shape.
+
+        Self-contained on this peer: builds a real RNS LRPROOF (Link.prove /
+        Packet.pack with context=LRPROOF) and returns {raw, flags, link_id,
+        packet_type, context, expected_link_dest_type, truncated_hashlength}.
+        get_packed_flags forces the LINK destination-type bits for an LRPROOF and
+        pack() writes the link_id in the destination-address position; the test
+        decodes raw[0] and pins both against the spec."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_capture_lrproof_frame", handle=self.handle)
+        return {
+            "raw": bytes.fromhex(resp["raw"]),
+            "flags": int(resp["flags"]),
+            "link_id": bytes.fromhex(resp["link_id"]),
+            "packet_type": int(resp["packet_type"]),
+            "context": int(resp["context"]),
+            "expected_link_dest_type": int(resp["expected_link_dest_type"]),
+            "truncated_hashlength": int(resp["truncated_hashlength"]),
+        }
+
+    def inject_crafted_link_proof(self, variant: str) -> dict:
+        """Self-contained LINK-DATA packet-proof injector: links accept ONLY the
+        96-byte EXPLICIT proof (PacketReceipt.validate_link_proof). Variants
+        valid_explicit (96B valid sig -> validates) / implicit_valid_sig (64B
+        VALID sig -> rejected, proving form is enforced) / implicit_random /
+        wrong_length_short. Returns {variant, validated, status, status_name,
+        proof_len, expl_length, impl_length}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_proof", handle=self.handle, variant=variant,
+        )
+
+    def inject_single_proof_format(self, variant: str) -> dict:
+        """Self-contained single-packet (non-link) PROOF FORMAT injector. Builds
+        the destination from an identity it controls, so it can sign a genuinely-
+        valid proof per the spec. Variants valid_explicit (96B -> validates) /
+        valid_implicit (64B -> validates) / forged_explicit (wrong key ->
+        rejected) / wrong_hash_explicit (hash != receipt -> rejected). Returns
+        {variant, validated, status, status_name, proof_len, expl_length,
+        impl_length}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_single_proof_format", handle=self.handle, variant=variant,
+        )
+
+    def packet_receipt_generation(
+        self, dest_type: str = "single", context: int = 0,
+        packet_type: int | None = None,
+    ) -> dict:
+        """Report whether RNS actually creates a PacketReceipt for a packet of the
+        given dest_type ('single'|'plain') / context / packet_type, with
+        create_receipt=True (the Transport.outbound generate_receipt gate). Sends a
+        real packet out this peer's interface and reads packet.receipt straight off
+        RNS. packet_type (int, default DATA) lets a test drive the gate's first
+        clause (only DATA packets get receipts) by passing ANNOUNCE/LINKREQUEST/
+        PROOF. Returns {dest_type, context, packet_type, sent, has_receipt,
+        create_receipt_flag}."""
+        assert self.handle, "start_* must be called first"
+        params = dict(
+            handle=self.handle, dest_type=dest_type, context=int(context),
+        )
+        if packet_type is not None:
+            params["packet_type"] = int(packet_type)
+        return self.bridge.execute("wire_packet_receipt_generation", **params)
+
+    def packet_receipt_timeout(self, force_timeout: float | None = None) -> dict:
+        """Build a real PacketReceipt for a fresh SINGLE (non-link) destination on
+        this peer's live instance and read back its computed .timeout plus the
+        constituents RNS derived it from (get_first_hop_timeout, hops_to,
+        DEFAULT_PER_HOP_TIMEOUT, TIMEOUT_PER_HOP, PATHFINDER_M). With force_timeout
+        set, the receipt's timeout is overridden and check_timeout() run so the
+        CULLED(timeout==-1)/FAILED transition is observable. Returns the bridge
+        dict verbatim."""
+        assert self.handle, "start_* must be called first"
+        params = dict(handle=self.handle)
+        if force_timeout is not None:
+            params["force_timeout"] = float(force_timeout)
+        return self.bridge.execute("wire_packet_receipt_timeout", **params)
+
+    def link_request_payload(
+        self, app_name: str = "conformance", aspects: list | None = None,
+    ) -> dict:
+        """Capture a real initiator LINKREQUEST payload WITHOUT sending it
+        (Packet.send patched off in the bridge), reporting the request_data and
+        its pub_bytes/sig_pub_bytes/signalling_bytes/mtu/mode/len fields read off
+        the live RNS.Link (Link.py:316). Lets a test pin the unencrypted layout
+        and the fresh-ephemeral-key property."""
+        assert self.handle, "start_* must be called first"
+        kwargs: dict = {"handle": self.handle, "app_name": app_name}
+        if aspects is not None:
+            kwargs["aspects"] = list(aspects)
+        return self.bridge.execute("wire_link_request_payload", **kwargs)
+
+    def link_signalling_bytes(self, mtu: int, mode: int) -> dict:
+        """Delegate to the static RNS.Link.signalling_bytes(mtu, mode), returning
+        the 3-byte signalling field for an enabled mode or {raised: True} for a
+        non-enabled mode, plus the bytemasks / enabled-mode list for independent
+        recomputation."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_signalling_bytes", handle=self.handle,
+            mtu=int(mtu), mode=int(mode),
+        )
+
+    def inject_crafted_link_request(self, variant: str, hops: int = 0) -> dict:
+        """Adversarial LINKREQUEST size/mode injector: feed a crafted payload of
+        `variant` (valid64 / valid67 / size_63 / size_66 / size_0 / bad_mode)
+        through the real Link.validate_request on a fresh self-owned IN
+        destination, reporting {variant, data_len, accepted, inbound_link_created,
+        establishment_timeout, mode, ...}. Only 64/67-byte enabled-mode payloads
+        create a link. `hops` sets the crafted packet's hop count for the
+        establishment_timeout derivation."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_crafted_link_request",
+            handle=self.handle, variant=variant, hops=int(hops),
+        )
+
+    def link_accept_gate(self, accepts: bool) -> dict:
+        """Drive Destination.accepts_links(accepts) then feed a genuine
+        LINKREQUEST through Destination.receive on a fresh self-owned IN
+        destination, reporting {accepts, links_before, links_after,
+        link_created}. Gate OFF -> no link; gate ON -> exactly one."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_accept_gate", handle=self.handle, accepts=bool(accepts),
+        )
+
+    def link_key_material(self, link_id: bytes) -> dict:
+        """Report which ephemeral-key fields (derived_key/shared_key/prv/pub) the
+        live RNS.Link currently holds. An ACTIVE link holds all four; after
+        Link.teardown the link_closed() purge nulls them all."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_link_key_material", handle=self.handle, link_id=link_id.hex(),
+        )
+
+    def inject_closed_link_data(self, link_id: bytes) -> dict:
+        """Cache a pristine DATA packet encrypted to the still-ACTIVE inbound
+        link, tear the link down, then replay the cached packet through
+        link.receive — reporting {delivered, status_name, link_closed}. A CLOSED
+        link drops all traffic (Link.receive guard). Run on the RECEIVER peer."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_inject_closed_link_data", handle=self.handle,
+            link_id=link_id.hex(),
+        )
+
     def link_identify_pending(
         self,
         destination_hash: bytes,
@@ -1810,6 +2829,59 @@ class _WirePeer:
             "signature": bytes.fromhex(resp["signature"]),
             "ifac": bytes.fromhex(resp["ifac"]),
         }
+
+    # --- reticulum_config posture / config-derivation read-backs ----------
+
+    def ifac_signature(self) -> dict:
+        """Read this peer's live interface IFAC identifier signature. Returns
+        {ifac_signature: bytes, ifac_key: bytes, ifac_size: int,
+        default_ifac_size: int}. Peer must have network_name + passphrase."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_ifac_signature", handle=self.handle)
+        return {
+            "ifac_signature": bytes.fromhex(resp["ifac_signature"]),
+            "ifac_key": bytes.fromhex(resp["ifac_key"]),
+            "ifac_size": int(resp["ifac_size"]),
+            "default_ifac_size": int(resp["default_ifac_size"]),
+        }
+
+    def instance_posture(self) -> dict:
+        """Read the ground-truth process-wide posture flags RNS resolved."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_instance_posture", handle=self.handle)
+
+    def mgmt_destinations(self) -> dict:
+        """Read the live transport-management Destinations (probe /
+        remote-management) RNS registered at Transport.start. See
+        cmd_wire_mgmt_destinations for the returned shape."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_mgmt_destinations", handle=self.handle)
+
+    def interface_bitrate(self) -> dict:
+        """Read this peer's effective interface bitrate + class guess +
+        MINIMUM_BITRATE. Returns {bitrate, bitrate_guess, minimum_bitrate}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute("wire_interface_bitrate", handle=self.handle)
+
+    def rpc_authkey(self) -> dict:
+        """Read the derived RPC authkey + transport private key. Returns
+        {rpc_key: bytes, transport_private_key: bytes}."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute("wire_rpc_authkey", handle=self.handle)
+        return {
+            "rpc_key": bytes.fromhex(resp["rpc_key"]),
+            "transport_private_key": bytes.fromhex(resp["transport_private_key"]),
+        }
+
+    def first_hop_timeout(self, destination_hash: bytes) -> dict:
+        """Read RNS.Transport.first_hop_timeout for a destination hash. Returns
+        {timeout, default_per_hop_timeout}."""
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_first_hop_timeout",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+        )
 
     def resource_poll(
         self, destination_hash: bytes, timeout_ms: int = 30000
@@ -1983,6 +3055,26 @@ def wire_peers(wire_pair):
 
 
 @pytest.fixture
+def wire_pair_started(wire_peers):
+    """A server/client TCP pair, both STARTED (interfaces up, settled), but with
+    NO destination/link opened.
+
+    For self-contained link-internals injectors that drive real RNS.Link /
+    RNS.Destination code on a peer's live instance without needing an
+    established wire link (request-payload capture, signalling-byte encoding,
+    LINKREQUEST size/mode validation, the destination accept gate). Yields
+    (server, client) ready to take wire_* commands.
+    """
+    server, client = wire_peers
+    port = server.start_tcp_server(network_name="", passphrase="")
+    client.start_tcp_client(
+        network_name="", passphrase="", target_host="127.0.0.1", target_port=port,
+    )
+    time.sleep(0.5)
+    return server, client
+
+
+@pytest.fixture
 def wire_link_setup(wire_peers):
     """Factory fixture: bring up a direct server/client TCP pair and open one
     established Link from the client to the server's IN destination.
@@ -2022,6 +3114,8 @@ def wire_link_setup(wire_peers):
         resource_strategy: str | None = None,
         proof_strategy: str | None = None,
         enable_ratchets: bool = False,
+        open_channel: bool = True,
+        buffer_stream_ids: list | None = None,
         link_timeout_ms: int = 15000,
         path_timeout_ms: int = 10000,
         settle_sec: float = 1.0,
@@ -2044,6 +3138,8 @@ def wire_link_setup(wire_peers):
             aspects=aspects,
             resource_strategy=resource_strategy,
             enable_ratchets=enable_ratchets,
+            open_channel=open_channel,
+            buffer_stream_ids=buffer_stream_ids,
         )
         if proof_strategy is not None:
             server.set_proof_strategy(dest_hash, proof_strategy)

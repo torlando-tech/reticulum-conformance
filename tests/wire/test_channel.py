@@ -330,3 +330,45 @@ def test_channel_true_stale_sequence_dropped(wire_peers):
         f"live delivery did not advance next_rx_sequence to 4: "
         f"got {w['next_rx_sequence']}"
     )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "channel_inject", "channel_received", "channel_window",
+    ],
+    verifies="RNS Channel drops a received envelope whose MSGTYPE is not registered, WITHOUT advancing the receive sequence: injecting an envelope at the next expected sequence carrying an unregistered MSGTYPE (0x0202) delivers nothing and leaves next_rx_sequence unchanged, so a subsequently-injected REGISTERED envelope at that SAME sequence is delivered normally and advances the sequence (positive control). An impl that advances the rx sequence on an unhandled msgtype would permanently stall the channel at that gap",
+)
+def test_channel_unregistered_msgtype_dropped(wire_peers):
+    server, client, server_dest, link_id = _open_channel_link(wire_peers)
+
+    pre = client.channel_window(link_id)
+    seq = pre["next_rx_sequence"]
+
+    # Inject an envelope at the next expected sequence with an UNREGISTERED
+    # MSGTYPE — the channel only registers the wire message type, so 0x0202 has
+    # no constructor and the envelope must be dropped.
+    client.channel_inject(
+        link_id, [{"sequence": seq, "data": b"unregistered-payload", "msgtype": 0x0202}]
+    )
+    assert client.channel_received(link_id) == [], (
+        "an envelope with an unregistered MSGTYPE was delivered to the handler"
+    )
+    mid = client.channel_window(link_id)
+    assert mid["next_rx_sequence"] == seq, (
+        f"the rx sequence advanced ({seq} -> {mid['next_rx_sequence']}) on an "
+        f"unregistered-msgtype envelope — the channel will stall permanently"
+    )
+
+    # Positive control: a REGISTERED envelope at the SAME sequence is delivered
+    # and advances the sequence — proving the drop above was the msgtype, not a
+    # dead channel.
+    payload = b"registered-payload"
+    client.channel_inject(link_id, [{"sequence": seq, "data": payload}])
+    assert client.channel_received(link_id) == [payload], (
+        "a registered envelope at the previously-dropped sequence was not delivered"
+    )
+    post = client.channel_window(link_id)
+    assert post["next_rx_sequence"] == (seq + 1) % 0x10000, (
+        f"rx sequence did not advance after a valid envelope: {post!r}"
+    )

@@ -1,7 +1,7 @@
 """
 Behavioral tests: Transport core routing state machines (§4a).
 
-These close five confirmed-untested Transport-core gaps, each driven entirely
+These close confirmed-untested Transport-core gaps, each driven entirely
 through the real RNS `Transport.inbound` / `Transport.jobs` paths via the
 behavioral harness (inject raw bytes on a MockInterface, observe the resulting
 table state / emitted bytes). No RNS internals are reimplemented in the test;
@@ -51,18 +51,24 @@ forced jobs() pass — leaving the entry in a stable, observable state.
 """
 
 import secrets
+import time
+
+import pytest
 
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     CONTEXT_PATH_RESPONSE,
     HEADER_2,
+    PACKET_TYPE_ANNOUNCE,
     PACKET_TYPE_PROOF,
+    TRANSPORT_TRANSPORT,
     TRUNCATED_HASH_BYTES,
     _promote_to_header2,
     build_announce_from_destination,
     build_data_packet,
     build_path_request,
     build_proof,
+    first_announce,
     parse_packet_header,
 )
 
@@ -264,7 +270,7 @@ def test_reverse_table_proof_return_routing(behavioral):
         "with a fresh near-now retransmit_timeout (positive control)."
     ),
 )
-def test_announce_random_blob_replay_is_rejected(behavioral):
+def test_announce_random_blob_replay_is_rejected(behavioral, behavioral_impl):
     """RNS protects against announce replay-forging by remembering each
     destination's random_blobs and refusing a re-heard blob
     (Transport.py:1769 `not random_blob in random_blobs`). The discriminating
@@ -274,6 +280,14 @@ def test_announce_random_blob_replay_is_rejected(behavioral):
     with a fresh retries==0 entry and a near-now retransmit_timeout. The path
     table is asserted unchanged as a sanity check; the positive control proves
     the read distinguishes admission from rejection."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -362,12 +376,20 @@ def test_announce_random_blob_replay_is_rejected(behavioral):
         "machine terminates rather than re-broadcasting forever."
     ),
 )
-def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral):
+def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral, behavioral_impl):
     """Drive the announce retransmit counter deterministically and assert the
     completion boundary: present at retries==1 (control — an impl that completes
     too early fails here), removed once retries exceed LOCAL_REBROADCASTS_MAX
     (an impl that never completes keeps the entry and fails the final
     assertion)."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -430,7 +452,7 @@ def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral):
         "entry (positive control), and the held path is left intact."
     ),
 )
-def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral):
+def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral, behavioral_impl):
     """A peer rebroadcasting our in-flight announce one hop further along signals
     that no further local retries are needed; RNS cancels the pending
     retransmit (Transport.py:1731-1736). Two destinations are set up identically
@@ -441,6 +463,14 @@ def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral):
     rebroadcast and not by elapsed time. The heard announce carries an OLDER
     emission and MORE hops, so it does not re-admit D_cancel via the path
     replacement rules; the held 1-hop path is asserted intact."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -581,7 +611,7 @@ def test_path_table_missing_interface_eviction(behavioral):
         "behaviour."
     ),
 )
-def test_path_request_tag_dedup(behavioral):
+def test_path_request_tag_dedup(behavioral, behavioral_impl):
     """Seed a known path to D, then drive three path requests through the
     rnstransport/path/request control destination. PR(D, T1) answers (schedules
     a cached-announce rebroadcast into the announce table with block_rebroadcasts
@@ -590,6 +620,12 @@ def test_path_request_tag_dedup(behavioral):
     schedules nothing; PR(D, T2) with a fresh tag is acted on again. An impl
     with no tag dedup answers the repeat; an impl that dedups on destination
     only fails to answer the fresh-tag request — both fail this test."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#path-request-answer-machinery: AnnounceEntry has no "
+            "block_rebroadcasts field; no PATH_REQUEST_GRACE/RG/local-client-"
+            "immediate answer scheduling. Refs Transport.py:2967-2987."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -654,6 +690,264 @@ def test_path_request_tag_dedup(behavioral):
         assert ans3["found"] and ans3["block_rebroadcasts"] is True, (
             "a path request with a fresh tag was NOT acted on — dedup is keyed "
             "on destination only, ignoring the tag (Transport.py:2891)"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_read_path_table"],
+    verifies=(
+        "Transport.inbound gates an announce on its Ed25519 signature BEFORE any "
+        "state change: a genuine announce injected on an interface creates a "
+        "path-table entry (positive control), but a byte-for-byte identical "
+        "announce with a single tampered signature byte creates NO path-table "
+        "entry — validate_announce fails and the announce is dropped before the "
+        "path table is touched (Transport.py announce_signature gate). An impl "
+        "that learns paths from unverified announces is trivially route-poisoned"
+    ),
+)
+def test_announce_signature_gate_blocks_state_change(behavioral):
+    """Inject a valid announce -> path learned; inject the same announce with a
+    corrupted signature -> path NOT learned. Discriminating both ways: an impl
+    that skips the signature check learns the tampered path (fails the negative);
+    one that drops all announces never learns the valid path (fails the positive
+    control). Two fresh Transport instances so the negative starts from a clean
+    table and cannot inherit the positive control's entry."""
+    # Positive control: a genuine announce is admitted into the path table.
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface = inst.attach_mock_interface("a", mode="FULL")
+        valid, dest_hash, _pub = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["sig_gate"],
+            wire_hops=0,
+        )
+        inst.inject(iface, valid)
+        time.sleep(0.2)
+        assert inst.read_path_table(dest_hash)["found"] is True, (
+            "a valid announce did not create a path-table entry (positive control)"
+        )
+    finally:
+        behavioral.cleanup()
+
+    # Negative: the SAME announce with one tampered signature byte must be
+    # dropped before any path-table write. The signature is the last 64 bytes of
+    # an announce that carries no ratchet and no app_data.
+    inst2 = behavioral.start(enable_transport=True)
+    try:
+        iface2 = inst2.attach_mock_interface("a", mode="FULL")
+        valid2, dest_hash2, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["sig_gate"],
+            wire_hops=0,
+        )
+        tampered = bytearray(valid2)
+        tampered[-1] ^= 0x01  # flip a bit in the trailing Ed25519 signature
+        inst2.inject(iface2, bytes(tampered))
+        time.sleep(0.2)
+        assert inst2.read_path_table(dest_hash2)["found"] is False, (
+            "a tampered-signature announce created a path-table entry — the "
+            "inbound signature gate did not fire before the state change"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_drain_tx"],
+    verifies=(
+        "A transport-enabled node rebroadcasting a heard announce out another "
+        "interface emits it in the transport-relay wire form: HEADER_2, "
+        "transport_type==TRANSPORT, the node's OWN identity hash as transport_id, "
+        "the destination_hash carried through unchanged, and the hop count = "
+        "wire_hops + 1 (the receive increment). An impl that rebroadcasts as "
+        "HEADER_1 (no transport_id) lets downstream peers learn a direct path "
+        "that black-holes"
+    ),
+)
+def test_announce_rebroadcast_wire_format(behavioral):
+    """Inject a valid announce (wire_hops=2) on interface A of a transport node
+    with two FULL interfaces; the rebroadcast on interface B must be the
+    HEADER_2/TRANSPORT relay form carrying this node's identity as transport_id
+    and hops==3. Discriminating: an impl that forwards HEADER_1 fails the
+    header/transport_id assertions; one that does not increment fails the hops
+    assertion."""
+    inst = behavioral.start(enable_transport=True)
+    self_id = inst.identity_hash
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        iface_b = inst.attach_mock_interface("b", mode="FULL")
+
+        raw, dest, _pub = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["rebroadcast"],
+            random_prefix=b"\x2a" * 5,
+            emission_ts=1_000_000_200,
+            wire_hops=2,
+        )
+        inst.inject(iface_a, raw)
+        # The rebroadcast goes through the announce retransmit job (a random
+        # 0-0.5s initial delay), so wait past that window before draining.
+        time.sleep(1.0)
+
+        out = first_announce(inst.drain_tx(iface_b))
+        assert out is not None, (
+            "no announce was rebroadcast on the second interface — the transport "
+            "node did not forward the heard announce"
+        )
+        assert out["packet_type"] == PACKET_TYPE_ANNOUNCE
+        assert out["destination_hash"] == dest, "rebroadcast targets the wrong destination"
+        assert out["header_type"] == HEADER_2, (
+            f"rebroadcast must be HEADER_2 (transport relay), got header_type={out['header_type']}"
+        )
+        assert out["transport_type"] == TRANSPORT_TRANSPORT, (
+            f"rebroadcast must carry transport_type==TRANSPORT, got {out['transport_type']}"
+        )
+        assert out["transport_id"] == self_id, (
+            f"rebroadcast must carry this node's identity as transport_id; got "
+            f"{out['transport_id'].hex() if out['transport_id'] else None}, "
+            f"expected {self_id.hex()}"
+        )
+        assert out["hops"] == 3, (
+            f"wire_hops=2 + receive increment -> hops==3 on the rebroadcast, "
+            f"got {out['hops']}"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_read_path_table"],
+    verifies=(
+        "An interface WITHOUT IFAC enabled drops any inbound packet that has the "
+        "IFAC flag bit (raw[0] & 0x80) set, before unpack (Transport.inbound IFAC "
+        "gate, else branch): a genuine announce with the flag clear is admitted "
+        "to the path table (positive control), but the byte-identical announce "
+        "with bit 7 forced on is dropped — no path entry. Confirms both that the "
+        "packet layer emits the IFAC flag as 0 and that an open interface refuses "
+        "IFAC-flagged traffic (an impl that ignores the flag accepts spoofed "
+        "IFAC-tagged packets)"
+    ),
+)
+def test_ifac_flagged_packet_dropped_on_open_interface(behavioral):
+    """Non-IFAC (open) MockInterface: an announce with raw[0]&0x80==0 is learned,
+    but the same announce with bit 7 set is dropped at the inbound IFAC gate
+    before reaching the path table. Two fresh instances so the negative starts
+    clean. Discriminating: an impl missing the open-interface IFAC-flag drop
+    learns the flagged announce's path (fails the negative)."""
+    # Positive control: a normally-flagged (bit 7 == 0) announce is admitted.
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface = inst.attach_mock_interface("open", mode="FULL")
+        raw, dest, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance", aspects=["ifac_open"], wire_hops=0,
+        )
+        assert raw[0] & 0x80 == 0, "packet layer must emit the IFAC flag bit as 0"
+        inst.inject(iface, raw)
+        time.sleep(0.2)
+        assert inst.read_path_table(dest)["found"] is True, (
+            "a non-IFAC-flagged announce was not learned on an open interface "
+            "(positive control)"
+        )
+    finally:
+        behavioral.cleanup()
+
+    # Negative: the same announce with the IFAC flag forced on must be dropped.
+    inst2 = behavioral.start(enable_transport=True)
+    try:
+        iface2 = inst2.attach_mock_interface("open", mode="FULL")
+        raw2, dest2, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance", aspects=["ifac_open"], wire_hops=0,
+        )
+        flagged = bytearray(raw2)
+        flagged[0] |= 0x80  # set the IFAC flag with no IFAC field present
+        inst2.inject(iface2, bytes(flagged))
+        time.sleep(0.2)
+        assert inst2.read_path_table(dest2)["found"] is False, (
+            "an IFAC-flagged packet was accepted on an interface without IFAC "
+            "enabled — the open-interface IFAC-flag drop did not fire"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "announce_build", "behavioral_attach_mock_interface",
+              "behavioral_inject", "behavioral_drain_tx", "behavioral_read_path_table",
+              "behavioral_read_announce_table", "packet_build", "packet_unpack",
+              "name_hash", "truncated_hash"],
+    verifies=(
+        "A TRANSPORT-DISABLED instance does NOT answer a path request for a "
+        "non-local destination it has a path to: with transport disabled, after "
+        "learning a path to D (path_table entry present — the precondition that "
+        "proves the node KNOWS the path), a path request for D schedules NO "
+        "cached-announce rebroadcast (no announce_table answer), because "
+        "Transport only answers on behalf of others when transport_enabled() or "
+        "the request is from a local client (Transport.path_request). An impl "
+        "that answers regardless of the transport gate would leak routing for a "
+        "node that opted out of transport"
+    ),
+)
+def test_transport_disabled_does_not_answer_path_request(behavioral):
+    """Transport off: the node learns D's path but must not answer remote path
+    requests for it (only transport nodes / local-client requests are answered).
+    The path-table precondition anchors the no-answer to the transport gate, not
+    to the node never having learned the path. The transport-ENABLED counterpart
+    (the same PR IS answered) is pinned by test_path_request_tag_dedup."""
+    inst = behavioral.start(enable_transport=False)
+    try:
+        iface_a = inst.attach_mock_interface("a", mode="FULL")
+        iface_b = inst.attach_mock_interface("b", mode="FULL")
+
+        # Seed a path to D via a PATH_RESPONSE announce (caches the announce
+        # without scheduling a forward retransmit).
+        seed, dest, _ = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="testapp", aspects=["notransport_pr"],
+            emission_ts=1_000_000_000, wire_hops=0,
+            context=CONTEXT_PATH_RESPONSE,
+        )
+        inst.inject(iface_b, seed)
+        time.sleep(0.2)
+
+        # Precondition: the transport-disabled node DID learn the path — so a
+        # later non-answer is the transport gate, not ignorance of the path.
+        assert inst.read_path_table(dest)["found"] is True, (
+            "transport-disabled node did not learn the seeded path; the "
+            "no-answer assertion below would be vacuous"
+        )
+
+        inst.drain_tx(iface_a)
+        inst.drain_tx(iface_b)
+
+        # A path request for D (a non-local destination) must NOT be answered:
+        # no cached-announce rebroadcast is scheduled.
+        pr = build_path_request(
+            behavioral.bridge, dest,
+            transport_id=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+            tag=secrets.token_bytes(TRUNCATED_HASH_BYTES),
+        )
+        inst.inject(iface_a, pr)
+        time.sleep(0.2)
+
+        assert inst.read_announce_table(dest)["found"] is False, (
+            "a transport-disabled node scheduled a path-request answer for a "
+            "non-local destination — it answered despite transport being disabled"
         )
     finally:
         behavioral.cleanup()

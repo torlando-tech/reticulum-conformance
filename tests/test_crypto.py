@@ -51,6 +51,42 @@ X25519_RFC7748_SCALAR = "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a224
 X25519_RFC7748_U = "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"
 X25519_RFC7748_OUTPUT = "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
 
+# RFC 4231 — HMAC-SHA256 known-answer vectors.
+#   TC2: a short ASCII key ("Jefe") + message.
+#   TC6: a 131-byte key (LONGER than the 64-byte SHA-256 block) — pins the
+#        RFC 2104 rule that an over-long key is hashed down first.
+HMAC_RFC4231_TC2_KEY = "4a656665"  # "Jefe"
+HMAC_RFC4231_TC2_MSG = b"what do ya want for nothing?".hex()
+HMAC_RFC4231_TC2_MAC = (
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+)
+HMAC_RFC4231_TC6_KEY = "aa" * 131  # 131 bytes > 64-byte block size
+HMAC_RFC4231_TC6_MSG = (
+    b"Test Using Larger Than Block-Size Key - Hash Key First".hex()
+)
+HMAC_RFC4231_TC6_MAC = (
+    "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+)
+
+# NIST SP 800-38A, F.2.5 — CBC-AES256.Encrypt known-answer vector. Block-aligned
+# (4 × 16-byte blocks), so it drives the RAW block cipher with no PKCS7 padding.
+AES256_CBC_NIST_KEY = (
+    "603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4"
+)
+AES256_CBC_NIST_IV = "000102030405060708090a0b0c0d0e0f"
+AES256_CBC_NIST_PT = (
+    "6bc1bee22e409f96e93d7e117393172a"
+    "ae2d8a571e03ac9c9eb76fac45af8e51"
+    "30c81c46a35ce411e5fbc1191a0a52ef"
+    "f69f2445df4f9b17ad2b417be66c3710"
+)
+AES256_CBC_NIST_CT = (
+    "f58c4c04d6e5f1ba779eabfb5f7bfbd6"
+    "9cfc4e967edb808d679f777bc6702c7d"
+    "39f23369a9d9bacfa530e26304231461"
+    "b2eb05e2c39be9fcda6c19078c6a9d1b"
+)
+
 # RFC 8032 — Ed25519, Test 1 (section 7.1). Message is the empty string.
 ED25519_RFC8032_T1_SEED = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 ED25519_RFC8032_T1_PUBLIC = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
@@ -600,4 +636,226 @@ def test_ed25519_verify_tampered_signature(sut, reference):
     )["valid"] is False
     assert sut.execute(
         "ed25519_verify", public_key=keys["public_key"], message=message, signature=tampered_sig
+    )["valid"] is False
+
+
+# --- HMAC-SHA256 RFC 4231 known-answer vectors (gap: hmac-sha256-rfc2104) -----
+
+
+@conformance_case(
+    commands=["hmac_sha256"],
+    verifies="Known-answer: HMAC-SHA256 RFC 4231 Test Case 2 (key 'Jefe', message 'what do ya want for nothing?') yields the published MAC 5bdcc146… on both the SUT and the reference — anchors the HMAC to RFC 2104/4231, not just to the other impl",
+)
+def test_hmac_sha256_rfc4231_tc2(sut, reference):
+    ref = reference.execute("hmac_sha256", key=HMAC_RFC4231_TC2_KEY, message=HMAC_RFC4231_TC2_MSG)
+    res = sut.execute("hmac_sha256", key=HMAC_RFC4231_TC2_KEY, message=HMAC_RFC4231_TC2_MSG)
+    assert_hex_equal(ref["hmac"], HMAC_RFC4231_TC2_MAC)
+    assert_hex_equal(res["hmac"], HMAC_RFC4231_TC2_MAC)
+
+
+@conformance_case(
+    commands=["hmac_sha256"],
+    verifies="Known-answer: HMAC-SHA256 RFC 4231 Test Case 6 uses a 131-byte key — LONGER than SHA-256's 64-byte block — and must reproduce the published MAC 60e43159…, pinning the RFC 2104 rule that an over-length key is hashed down to the block size first (an impl that truncates or pads the long key instead diverges)",
+)
+def test_hmac_sha256_rfc4231_tc6_larger_than_block_key(sut, reference):
+    ref = reference.execute("hmac_sha256", key=HMAC_RFC4231_TC6_KEY, message=HMAC_RFC4231_TC6_MSG)
+    res = sut.execute("hmac_sha256", key=HMAC_RFC4231_TC6_KEY, message=HMAC_RFC4231_TC6_MSG)
+    assert_hex_equal(ref["hmac"], HMAC_RFC4231_TC6_MAC)
+    assert_hex_equal(res["hmac"], HMAC_RFC4231_TC6_MAC)
+
+
+# --- AES-256-CBC semantics (gap: aes-cbc-semantics) ---------------------------
+
+
+@conformance_case(
+    commands=["aes_256_cbc_encrypt", "aes_256_cbc_decrypt"],
+    verifies="Known-answer: raw AES-256-CBC matches NIST SP 800-38A §F.2.5 (fixed key/IV, 4 block-aligned plaintext blocks) byte-for-byte (ciphertext f58c4c04…) on both impls, and decrypt inverts it back to the NIST plaintext — pins the block cipher to FIPS-197/SP800-38A rather than to the other impl",
+)
+def test_aes256_cbc_nist_sp800_38a_kat(sut, reference):
+    for impl, label in ((reference, "ref"), (sut, "sut")):
+        ct = impl.execute(
+            "aes_256_cbc_encrypt",
+            plaintext=AES256_CBC_NIST_PT, key=AES256_CBC_NIST_KEY, iv=AES256_CBC_NIST_IV,
+        )["ciphertext"]
+        assert_hex_equal(ct, AES256_CBC_NIST_CT, f"{label}: NIST CBC-AES256 ciphertext")
+        pt = impl.execute(
+            "aes_256_cbc_decrypt",
+            ciphertext=AES256_CBC_NIST_CT, key=AES256_CBC_NIST_KEY, iv=AES256_CBC_NIST_IV,
+        )["plaintext"]
+        assert_hex_equal(pt, AES256_CBC_NIST_PT, f"{label}: NIST CBC-AES256 decrypt")
+
+
+@conformance_case(
+    commands=["aes_256_cbc_encrypt"],
+    verifies="AES-256-CBC enforces its operand lengths: a correct 32-byte key + 16-byte IV encrypts (positive control), but a wrong-length key (16 bytes) or a wrong-length IV (8 bytes) is rejected rather than silently producing ciphertext under a mis-sized operand",
+)
+def test_aes256_cbc_rejects_wrong_key_and_iv_lengths(sut):
+    block = random_hex(16)
+    good_key = random_hex(32)
+    good_iv = random_hex(16)
+    # Positive control: correctly-sized operands encrypt.
+    ok = sut.execute("aes_256_cbc_encrypt", plaintext=block, key=good_key, iv=good_iv)
+    assert len(bytes.fromhex(ok["ciphertext"])) == 16
+    # Negative: a 16-byte (AES-128-sized) key must be rejected for AES-256.
+    with pytest.raises(BridgeError):
+        sut.execute("aes_256_cbc_encrypt", plaintext=block, key=random_hex(16), iv=good_iv)
+    # Negative: a wrong-length IV (must be one 16-byte block) is rejected.
+    with pytest.raises(BridgeError):
+        sut.execute("aes_256_cbc_encrypt", plaintext=block, key=good_key, iv=random_hex(8))
+
+
+# --- RNS Token: key split, mode selection, IV freshness, HMAC-before-decrypt --
+# (gaps: token-key-split-and-mode-selection, aes256-default-in-1-3,
+#  token-iv-csprng-unique, token-hmac-verify-before-decrypt)
+
+
+@conformance_case(
+    commands=["token_encrypt", "aes_encrypt", "hmac_sha256"],
+    verifies="RNS Token with a 64-byte key selects AES-256-CBC and splits the key signing-first: the emitted token decomposes to IV(16) || ciphertext || HMAC(32) where ciphertext == AES-256-CBC+PKCS7(plaintext) under key[32:64] and HMAC == HMAC-SHA256(key[0:32], IV||ciphertext). Decomposing against the AES/HMAC primitives pins the exact split + mode + the 48-byte overhead, so an impl that swaps the halves or uses AES-128 for a 256-bit key fails",
+)
+def test_token_key_split_and_mode_aes256(sut):
+    key = random_hex(64)            # 512 bits -> AES-256 path
+    plaintext = random_hex(40)
+    token = bytes.fromhex(sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"])
+    iv, ciphertext, mac = token[:16], token[16:-32], token[-32:]
+    assert len(token) - len(ciphertext) == 48, "Token overhead must be IV(16)+HMAC(32)=48"
+    assert len(ciphertext) % 16 == 0 and len(ciphertext) > 0
+    kb = bytes.fromhex(key)
+    expected_ct = sut.execute(
+        "aes_encrypt", plaintext=plaintext, key=kb[32:].hex(), iv=iv.hex(), mode="AES_256_CBC",
+    )["ciphertext"]
+    assert_hex_equal(ciphertext.hex(), expected_ct, "ciphertext not AES-256-CBC under key[32:64]")
+    expected_mac = sut.execute("hmac_sha256", key=kb[:32].hex(), message=(iv + ciphertext).hex())["hmac"]
+    assert_hex_equal(mac.hex(), expected_mac, "HMAC not HMAC-SHA256(key[0:32], IV||ct)")
+
+
+@conformance_case(
+    commands=["token_encrypt", "aes_encrypt", "hmac_sha256"],
+    verifies="RNS Token with a 32-byte key selects AES-128-CBC and splits signing-first over the smaller halves: the token decomposes to IV(16) || ciphertext || HMAC(32) where ciphertext == AES-128-CBC+PKCS7(plaintext) under key[16:32] and HMAC == HMAC-SHA256(key[0:16], IV||ciphertext) — pins that a 128-bit key still maps to AES-128 (1.3.x retains AES-128 accept) with the 16/16 split",
+)
+def test_token_key_split_and_mode_aes128(sut):
+    key = random_hex(32)            # 256 bits -> AES-128 path
+    plaintext = random_hex(40)
+    token = bytes.fromhex(sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"])
+    iv, ciphertext, mac = token[:16], token[16:-32], token[-32:]
+    kb = bytes.fromhex(key)
+    expected_ct = sut.execute(
+        "aes_encrypt", plaintext=plaintext, key=kb[16:].hex(), iv=iv.hex(), mode="AES_128_CBC",
+    )["ciphertext"]
+    assert_hex_equal(ciphertext.hex(), expected_ct, "ciphertext not AES-128-CBC under key[16:32]")
+    expected_mac = sut.execute("hmac_sha256", key=kb[:16].hex(), message=(iv + ciphertext).hex())["hmac"]
+    assert_hex_equal(mac.hex(), expected_mac, "HMAC not HMAC-SHA256(key[0:16], IV||ct)")
+
+
+@conformance_case(
+    commands=["token_encrypt", "token_decrypt"],
+    verifies="RNS Token keys must be exactly 128 or 256 bits: 32-byte and 64-byte keys encrypt+round-trip (positive controls), while a 48-byte key (any other length) is rejected at construction — pins the mode-selection length gate",
+)
+def test_token_rejects_invalid_key_length(sut):
+    plaintext = random_hex(24)
+    for klen in (32, 64):
+        key = random_hex(klen)
+        tok = sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"]
+        assert_hex_equal(sut.execute("token_decrypt", key=key, token=tok)["plaintext"], plaintext)
+    with pytest.raises(BridgeError):
+        sut.execute("token_encrypt", key=random_hex(48), plaintext=plaintext)
+
+
+@conformance_case(
+    commands=["token_encrypt", "token_decrypt"],
+    verifies="RNS Token IVs come from a CSPRNG fresh per encryption: two encryptions of the SAME plaintext under the SAME key produce different tokens AND different leading 16-byte IVs, yet both decrypt back to the original plaintext — an impl that reuses or zeroes the IV produces identical tokens and fails",
+)
+def test_token_iv_fresh_per_encryption(sut):
+    key = random_hex(64)
+    plaintext = random_hex(32)
+    t1 = bytes.fromhex(sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"])
+    t2 = bytes.fromhex(sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"])
+    assert t1 != t2, "two encryptions of identical input produced identical tokens (IV reuse)"
+    assert t1[:16] != t2[:16], "the 16-byte IVs were identical across encryptions"
+    assert_hex_equal(sut.execute("token_decrypt", key=key, token=t1.hex())["plaintext"], plaintext)
+    assert_hex_equal(sut.execute("token_decrypt", key=key, token=t2.hex())["plaintext"], plaintext)
+
+
+@conformance_case(
+    commands=["token_encrypt", "token_decrypt", "token_verify_hmac"],
+    verifies="RNS Token authenticates before decrypting: an untampered token verifies HMAC True and decrypts (positive control), but flipping any bit of the ciphertext region OR the trailing HMAC makes verify_hmac return False and token_decrypt reject the token (raise) rather than returning forged/garbage plaintext — pins the verify-HMAC-before-decrypt rule",
+)
+def test_token_hmac_verify_before_decrypt(sut):
+    key = random_hex(64)
+    plaintext = random_hex(40)
+    token = bytearray(bytes.fromhex(sut.execute("token_encrypt", key=key, plaintext=plaintext)["token"]))
+    # Positive control.
+    assert sut.execute("token_verify_hmac", key=key, token=token.hex())["valid"] is True
+    assert_hex_equal(sut.execute("token_decrypt", key=key, token=token.hex())["plaintext"], plaintext)
+    # Negative: tamper a ciphertext byte (offset 20 is inside IV||ct, before the HMAC).
+    ct_tampered = bytearray(token)
+    ct_tampered[20] ^= 0x01
+    assert sut.execute("token_verify_hmac", key=key, token=ct_tampered.hex())["valid"] is False
+    with pytest.raises(BridgeError):
+        sut.execute("token_decrypt", key=key, token=ct_tampered.hex())
+    # Negative: tamper the trailing HMAC.
+    mac_tampered = bytearray(token)
+    mac_tampered[-1] ^= 0x01
+    assert sut.execute("token_verify_hmac", key=key, token=mac_tampered.hex())["valid"] is False
+    with pytest.raises(BridgeError):
+        sut.execute("token_decrypt", key=key, token=mac_tampered.hex())
+
+
+# --- X25519 scalar clamping (gap: x25519-rfc7748) -----------------------------
+
+
+@conformance_case(
+    commands=["x25519_exchange"],
+    verifies="X25519 clamps the scalar per RFC 7748: the low 3 bits of the first byte are cleared before the scalar multiply, so a scalar and the same scalar with those low bits forced to 1 produce the IDENTICAL shared secret. An impl that skips clamping yields a different result for the modified scalar and fails",
+)
+def test_x25519_scalar_clamping(sut):
+    scalar = bytearray(bytes.fromhex(X25519_RFC7748_SCALAR))
+    base = sut.execute(
+        "x25519_exchange", private_key=scalar.hex(), peer_public_key=X25519_RFC7748_U,
+    )["shared_secret"]
+    # Anchor the unmodified result to the published RFC 7748 vector.
+    assert_hex_equal(base, X25519_RFC7748_OUTPUT)
+    # Force the low 3 bits of byte 0 (cleared by clamping) -> must not change output.
+    scalar[0] |= 0x07
+    clamped = sut.execute(
+        "x25519_exchange", private_key=scalar.hex(), peer_public_key=X25519_RFC7748_U,
+    )["shared_secret"]
+    assert_hex_equal(clamped, base, "scalar low-3-bit change altered the result — clamping skipped")
+
+
+# --- Ed25519 verify is total: invalid inputs return False, never raise --------
+# (gap: ed25519-verify-accept-reject)
+
+
+@conformance_case(
+    commands=["ed25519_generate", "ed25519_sign", "ed25519_verify"],
+    verifies="Ed25519 verification is a total predicate: a valid 64-byte signature verifies True (positive anchor), but a wrong-length signature (63 or 65 bytes) verifies False — returned as a boolean, NOT raised — so an impl that crashes on a malformed signature instead of rejecting it fails",
+)
+def test_ed25519_verify_wrong_length_signature_returns_false(sut, reference):
+    seed = random_hex(32)
+    message = random_hex(48)
+    keys = reference.execute("ed25519_generate", seed=seed)
+    sig = reference.execute("ed25519_sign", private_key=keys["private_key"], message=message)["signature"]
+    assert sut.execute(
+        "ed25519_verify", public_key=keys["public_key"], message=message, signature=sig
+    )["valid"] is True
+    for bad, why in ((sig[:-2], "63-byte (one short)"), (sig + "00", "65-byte (one long)")):
+        v = sut.execute("ed25519_verify", public_key=keys["public_key"], message=message, signature=bad)
+        assert v["valid"] is False, f"wrong-length signature ({why}) must verify False, got {v}"
+
+
+@conformance_case(
+    commands=["ed25519_generate", "ed25519_sign", "ed25519_verify"],
+    verifies="Ed25519 rejects a valid signature presented under the WRONG public key: the signature verifies True under its own key (positive anchor) but False under an unrelated public key — pins that verification binds signature to the specific signing key",
+)
+def test_ed25519_verify_wrong_public_key_returns_false(sut, reference):
+    msg = random_hex(48)
+    signer = reference.execute("ed25519_generate", seed=random_hex(32))
+    other = reference.execute("ed25519_generate", seed=random_hex(32))
+    sig = reference.execute("ed25519_sign", private_key=signer["private_key"], message=msg)["signature"]
+    assert sut.execute(
+        "ed25519_verify", public_key=signer["public_key"], message=msg, signature=sig
+    )["valid"] is True
+    assert sut.execute(
+        "ed25519_verify", public_key=other["public_key"], message=msg, signature=sig
     )["valid"] is False

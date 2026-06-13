@@ -274,3 +274,56 @@ def test_stale_same_hops_announce_does_not_overwrite_fresh_path(behavioral):
         )
     finally:
         behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "inject", "read_path_table",
+              "announce_build"],
+    verifies=(
+        "An announce's emission timestamp (carried in the 10-byte random_hash) "
+        "is 5 random bytes followed by the 5-byte big-endian Unix emission time: "
+        "for a controlled emission_ts T, the stored path random_blob is exactly "
+        "10 bytes whose trailing 5 bytes equal T packed big-endian, and two "
+        "announces (distinct destinations) emitted at the SAME T carry the same "
+        "trailing 5 bytes but DIFFERENT leading 5 random bytes — pinning the "
+        "5-random || 5-BE-timestamp layout against a literal, not just a "
+        "round-trip"
+    ),
+)
+def test_announce_emission_timestamp_byte_structure(behavioral):
+    inst = behavioral.start(enable_transport=True)
+    try:
+        iface = inst.attach_mock_interface("a", mode="FULL")
+        emission_ts = 1_234_567_890  # a fixed, known Unix time
+        expected_ts_bytes = emission_ts.to_bytes(5, "big")
+
+        blobs = []
+        for aspect in ("ts_struct_a", "ts_struct_b"):
+            raw, dest, _ = build_announce_from_destination(
+                behavioral.bridge,
+                identity_private_key=secrets.token_bytes(64),
+                app_name="testapp", aspects=[aspect],
+                emission_ts=emission_ts, wire_hops=0,
+            )
+            inst.inject(iface, raw)
+            time.sleep(0.15)
+            entry = inst.read_path_table(dest)
+            assert entry["found"], f"announce for {aspect} did not create a path entry"
+            blob = bytes.fromhex(entry["random_blobs"][0])
+            assert len(blob) == 10, f"random_hash must be 10 bytes, got {len(blob)}"
+            # Trailing 5 bytes are the big-endian emission timestamp (literal pin).
+            assert blob[5:10] == expected_ts_bytes, (
+                f"random_hash[5:10] must equal the 5-byte BE emission time "
+                f"{expected_ts_bytes.hex()}, got {blob[5:10].hex()}"
+            )
+            blobs.append(blob)
+
+        # Same emission timestamp -> identical trailing 5 bytes ...
+        assert blobs[0][5:10] == blobs[1][5:10]
+        # ... but the leading 5 bytes are freshly random per announce.
+        assert blobs[0][0:5] != blobs[1][0:5], (
+            "the leading 5 bytes of the random_hash were identical across two "
+            "announces — they must be fresh randomness, not derived from the time"
+        )
+    finally:
+        behavioral.cleanup()

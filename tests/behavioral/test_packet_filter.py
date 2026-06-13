@@ -36,10 +36,16 @@ import time
 
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
+    CONTEXT_CACHE_REQUEST,
     CONTEXT_CHANNEL,
+    CONTEXT_KEEPALIVE,
     CONTEXT_NONE,
+    CONTEXT_PATH_RESPONSE,
     CONTEXT_RESOURCE,
+    CONTEXT_RESOURCE_PRF,
+    CONTEXT_RESOURCE_REQ,
     HEADER_2,
+    PACKET_TYPE_ANNOUNCE,
     build_announce_from_destination,
     build_data_packet,
 )
@@ -293,22 +299,24 @@ def test_group_nonannounce_hops_gt1_drop(behavioral):
 @conformance_case(
     commands=["start", "packet_build", "packet_unpack", "packet_filter"],
     verifies=(
-        "Context-bypass exemption: a SINGLE DATA packet with context=RESOURCE "
-        "(0x01) and one with context=CHANNEL (0x0E), each run through "
-        "Transport.packet_filter TWICE with remember=True, are accepted BOTH "
-        "times — these contexts are exempted before the hashlist replay drop "
-        "(Transport.py:1345-1350); a context=NONE SINGLE DATA control run the "
-        "same way is accepted then DROPPED on replay, proving the exemption is "
-        "the difference"
+        "Context-bypass exemption for ALL SIX exempted contexts — KEEPALIVE "
+        "(0xFA), RESOURCE_REQ (0x03), RESOURCE_PRF (0x05), RESOURCE (0x01), "
+        "CACHE_REQUEST (0x08) and CHANNEL (0x0E): a SINGLE DATA packet carrying "
+        "each context, run through Transport.packet_filter TWICE with "
+        "remember=True, is accepted BOTH times because these contexts are "
+        "exempted before the hashlist replay drop (Transport.py:1345-1350); a "
+        "context=NONE SINGLE DATA control run the same way is accepted then "
+        "DROPPED on replay, proving the exemption is the difference"
     ),
 )
 def test_context_bypass_exempts_from_hashlist(behavioral):
-    """RESOURCE / CHANNEL (and the other four bypass contexts) return True from
-    packet_filter BEFORE the packet-hashlist check, so a byte-identical replay
-    of such a packet is still accepted even though its hash was remembered. The
-    context=NONE SINGLE DATA contrast — accepted then dropped under the identical
-    twice-with-remember pattern — is the positive control that pins the True/True
-    result to the context exemption rather than a filter that never drops.
+    """All six bypass contexts (KEEPALIVE, RESOURCE_REQ, RESOURCE_PRF, RESOURCE,
+    CACHE_REQUEST, CHANNEL) return True from packet_filter BEFORE the
+    packet-hashlist check, so a byte-identical replay of such a packet is still
+    accepted even though its hash was remembered. The context=NONE SINGLE DATA
+    contrast — accepted then dropped under the identical twice-with-remember
+    pattern — is the positive control that pins the True/True result to the
+    context exemption rather than a filter that never drops.
 
     Discriminating: an impl missing the bypass would hashlist-drop the second
     RESOURCE/CHANNEL sighting (fails True-both-times); an impl that never dedups
@@ -317,7 +325,14 @@ def test_context_bypass_exempts_from_hashlist(behavioral):
     try:
         # Build each raw packet ONCE and filter the same bytes twice, so the
         # second sighting is a genuine byte-identical replay (same packet hash).
-        for ctx, label in ((CONTEXT_RESOURCE, "RESOURCE"), (CONTEXT_CHANNEL, "CHANNEL")):
+        for ctx, label in (
+            (CONTEXT_KEEPALIVE, "KEEPALIVE"),
+            (CONTEXT_RESOURCE_REQ, "RESOURCE_REQ"),
+            (CONTEXT_RESOURCE_PRF, "RESOURCE_PRF"),
+            (CONTEXT_RESOURCE, "RESOURCE"),
+            (CONTEXT_CACHE_REQUEST, "CACHE_REQUEST"),
+            (CONTEXT_CHANNEL, "CHANNEL"),
+        ):
             raw = build_data_packet(
                 behavioral.bridge,
                 secrets.token_bytes(16),
@@ -366,6 +381,62 @@ def test_context_bypass_exempts_from_hashlist(behavioral):
             "a replayed context=NONE SINGLE DATA packet was NOT dropped — the "
             "contrast control proves nothing about the RESOURCE/CHANNEL exemption "
             "if the filter never drops"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "packet_build", "packet_unpack", "packet_filter", "announce_build"],
+    verifies=(
+        "Transport.packet_filter drops a PLAIN-destination and a "
+        "GROUP-destination packet carrying packet_type=ANNOUNCE as structurally "
+        "invalid (accepted False — 'Dropped invalid PLAIN/GROUP announce packet', "
+        "Transport.py:1359-1361 / 1370-1372): only SINGLE destinations legitimately "
+        "carry announces. A real SINGLE announce is accepted under the identical "
+        "filter call (positive control), so the drop is the destination-type "
+        "cross-check, not a filter that rejects all announces"
+    ),
+)
+def test_plain_group_announce_dropped_as_invalid(behavioral):
+    """PLAIN/GROUP destinations announcing is malformed/hostile and RNS drops it
+    in packet_filter before any transport handling. Discriminating: an impl
+    missing the type/packet-type cross-check accepts the PLAIN/GROUP announce
+    (fails the negatives); one that drops all announces rejects the valid SINGLE
+    announce (fails the positive control)."""
+    inst = behavioral.start()
+    try:
+        # Negatives: a PLAIN and a GROUP packet typed as ANNOUNCE must be dropped.
+        for dest_type in ("plain", "group"):
+            built = behavioral.bridge.execute(
+                "packet_build",
+                dest_type=dest_type,
+                packet_type=PACKET_TYPE_ANNOUNCE,
+                context=CONTEXT_NONE,
+                context_flag=0,
+                hops=0,
+                data=secrets.token_bytes(8).hex(),
+            )
+            raw = bytes.fromhex(built["raw"])
+            verdict = inst.packet_filter(raw, remember=False)
+            assert verdict["accepted"] is False, (
+                f"a {dest_type.upper()} packet typed as ANNOUNCE was NOT dropped — "
+                f"the invalid-announce destination-type cross-check is absent "
+                f"(Transport.py:1359-1372)"
+            )
+
+        # Positive control: a genuine SINGLE announce is NOT dropped as invalid.
+        single_announce, _dest, _pub = build_announce_from_destination(
+            behavioral.bridge,
+            identity_private_key=secrets.token_bytes(64),
+            app_name="conformance",
+            aspects=["packet_filter_announce"],
+            wire_hops=0,
+        )
+        ok = inst.packet_filter(single_announce, remember=False)
+        assert ok["accepted"] is True, (
+            "a valid SINGLE announce was dropped — the filter is rejecting all "
+            "announces rather than only the invalid PLAIN/GROUP ones"
         )
     finally:
         behavioral.cleanup()

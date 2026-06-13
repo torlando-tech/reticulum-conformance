@@ -145,6 +145,56 @@ def test_single_packet_proof_emitted_under_prove_all_not_under_prove_none(
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path",
+        "link_open", "set_proof_strategy", "send_packet_with_proof_request",
+    ],
+    verifies=(
+        "A freshly constructed destination DEFAULTS to PROVE_NONE: a single DATA "
+        "packet sent with a proof request to a destination whose proof strategy "
+        "was NEVER set returns no proof (receipt not proved, never DELIVERED) — "
+        "then setting PROVE_ALL on the same destination makes the next packet "
+        "deliver, proving the return path works and the earlier non-delivery is "
+        "the default, not a broken path. An impl defaulting to PROVE_ALL (a "
+        "privacy regression) would wrongly deliver the first packet"
+    ),
+)
+def test_destination_proof_strategy_defaults_to_prove_none(wire_link_setup):
+    # Bring up the pair and learn a path WITHOUT ever calling set_proof_strategy,
+    # so the listening destination is governed by RNS's PROVE_NONE default.
+    server, client, dest_hash, _link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Default (strategy never set): the receiver must NOT prove the packet.
+    default_r = client.send_packet_with_proof_request(
+        dest_hash, data=secrets.token_bytes(20),
+        app_name=_APP, aspects=list(_ASPECTS), timeout_ms=3000,
+    )
+    assert default_r["sent"] is True, f"packet was not sent: {default_r!r}"
+    assert default_r["delivered"] is False, (
+        f"a default destination must default to PROVE_NONE, so the receipt must "
+        f"never reach DELIVERED without an explicit strategy, got {default_r!r}"
+    )
+    assert default_r["proved"] is False, (
+        f"default PROVE_NONE: receipt.proved must stay False, got {default_r!r}"
+    )
+    assert default_r["proof_data"] is None, (
+        f"default PROVE_NONE: no proof bytes must be captured, got {default_r!r}"
+    )
+
+    # Positive control: explicitly enabling PROVE_ALL on the SAME destination
+    # delivers — confirming the return path is functional and the non-delivery
+    # above was the default strategy, not a dead path.
+    server.set_proof_strategy(dest_hash, "all")
+    all_r = client.send_packet_with_proof_request(
+        dest_hash, data=secrets.token_bytes(20),
+        app_name=_APP, aspects=list(_ASPECTS), timeout_ms=8000,
+    )
+    assert all_r["delivered"] is True and all_r["proved"] is True, (
+        f"after setting PROVE_ALL the receipt must deliver+prove, got {all_r!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # PLAIN destination no-op encrypt / decrypt
 # ---------------------------------------------------------------------------

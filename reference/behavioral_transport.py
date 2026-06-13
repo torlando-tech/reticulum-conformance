@@ -270,6 +270,36 @@ def _reset_transport_state():
         T.local_client_interfaces.clear()
     if hasattr(T, "announce_rate_table"):
         T.announce_rate_table.clear()
+    # Blackholed-identity table is process-wide (Transport.blackholed_identities).
+    # A handle that blackholes an identity must not leak that into the next
+    # handle's validate_announce gate (Identity.py:567-569), so clear it here.
+    if hasattr(T, "blackholed_identities") and hasattr(T.blackholed_identities, "clear"):
+        T.blackholed_identities.clear()
+    # Externally-registered announce handlers are a process-wide list
+    # (Transport.announce_handlers). A handler registered by one handle must not
+    # leak into the next handle's announce dispatch (Transport.py:2034-2087).
+    if hasattr(T, "announce_handlers") and hasattr(T.announce_handlers, "clear"):
+        T.announce_handlers.clear()
+    # Pending path-request bookkeeping (Transport.path_requests /
+    # discovery_path_requests). request_path records the requested destination
+    # here; left over, it would make the unknown-destination ingress-limit
+    # carve-out (Transport.py:1699-1701) skip for a later handle's announce.
+    for attr in ("path_requests", "discovery_path_requests"):
+        tbl = getattr(T, attr, None)
+        if tbl is not None and hasattr(tbl, "clear"):
+            tbl.clear()
+    # Path-state map (STATE_UNRESPONSIVE et al., Transport.path_states) backs
+    # mark_path_unresponsive / path_is_unresponsive — clear so an unresponsive
+    # mark from one handle doesn't bias the next handle's path-replacement
+    # equal-emission branch (Transport.py:1818-1823).
+    if hasattr(T, "path_states") and hasattr(T.path_states, "clear"):
+        T.path_states.clear()
+    # Restore the standalone-master posture: the shared-instance predicate is a
+    # plain attribute on Transport.owner that one handle may have flipped True
+    # (cmd_behavioral_start connected_to_shared_instance). Reset so the next
+    # handle starts as a normal filtering node (Transport.py:1337/:1376).
+    if getattr(T, "owner", None) is not None:
+        T.owner.is_connected_to_shared_instance = False
 
 
 _shared_enable_transport: bool | None = None
@@ -336,6 +366,7 @@ def cmd_behavioral_start(params):
 
     identity_seed_hex = params.get("identity_seed")
     enable_transport = bool(params.get("enable_transport", True))
+    connected_to_shared_instance = bool(params.get("connected_to_shared_instance", False))
 
     # Instance-level announce-throttle defaults. These flow down to every
     # interface attached after start unless that attach overrides them. They
@@ -358,6 +389,17 @@ def cmd_behavioral_start(params):
         else tempfile.mkdtemp(prefix="rns_behavioral_")
     )
     rns = _ensure_rns_started(config_dir, enable_transport)
+
+    # Shared-instance predicate (Transport.py:1337 short-circuit in packet_filter,
+    # and the add_packet_hash guard at :1376). On a real node this flips True only
+    # when RNS connects this process to a separate shared master over a
+    # LocalClientInterface; the behavioral harness always runs a standalone master
+    # (share_instance=No), so the flag is otherwise always False and the
+    # "shared instance handles filtering, so don't filter here" branch is never
+    # taken. Setting it on Transport.owner (the Reticulum instance, a plain bool
+    # attribute) lets a test exercise that branch. _reset_transport_state restores
+    # False so it never leaks into the next handle.
+    RNS.Transport.owner.is_connected_to_shared_instance = connected_to_shared_instance
 
     # Inject an identity from the seed if provided; otherwise use whatever RNS
     # generated during startup.
@@ -402,6 +444,24 @@ def cmd_behavioral_stop(params):
         if iface in RNS.Transport.local_client_interfaces:
             RNS.Transport.local_client_interfaces.remove(iface)
 
+    # Deregister any local destinations this handle registered so they don't
+    # leak into the next handle's Transport.destinations_map (the local-
+    # destination announce carve-out, Transport.py:1707-1712).
+    for destination in inst.get("destinations", []):
+        try:
+            RNS.Transport.deregister_destination(destination)
+        except Exception:
+            pass
+
+    # Deregister any recording announce handlers this handle registered so they
+    # don't leak into the next handle's Transport.announce_handlers dispatch
+    # (Transport.py:2034-2087).
+    for handler in inst.get("announce_handlers", {}).values():
+        try:
+            RNS.Transport.deregister_announce_handler(handler)
+        except Exception:
+            pass
+
     _reset_transport_state()
     return {"stopped": True}
 
@@ -415,6 +475,9 @@ def cmd_behavioral_attach_mock_interface(params):
     mode = params.get("mode", "FULL")
     mtu = int(params.get("mtu", 500))
     local_client = bool(params.get("local_client", False))
+    ifac_netname = params.get("ifac_netname")
+    ifac_netkey = params.get("ifac_netkey")
+    ifac_size = params.get("ifac_size")
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -467,10 +530,45 @@ def cmd_behavioral_attach_mock_interface(params):
         if iface not in RNS.Transport.local_client_interfaces:
             RNS.Transport.local_client_interfaces.append(iface)
 
+    # Configure IFAC (Interface Access Codes) on this interface exactly as
+    # RNS.Reticulum._add_interface does (Reticulum.py:1060-1078) when an
+    # interface block carries network_name/passphrase. Everything is derived by
+    # real RNS primitives (Identity.full_hash, Cryptography.hkdf,
+    # Identity.from_bytes); we only assign the results onto the interface, which
+    # is exactly what RNS itself does. This arms the IFAC authentication branch
+    # in Transport.inbound (Transport.py:1399-1445) — the MockInterface defaults
+    # ifac_size=0/ifac_identity=None, so without this the branch is never taken.
+    computed_ifac_size = 0
+    if ifac_netname is not None or ifac_netkey is not None:
+        ifac_origin = b""
+        if ifac_netname is not None:
+            ifac_origin += RNS.Identity.full_hash(ifac_netname.encode("utf-8"))
+        if ifac_netkey is not None:
+            ifac_origin += RNS.Identity.full_hash(ifac_netkey.encode("utf-8"))
+        ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
+        iface.ifac_key = RNS.Cryptography.hkdf(
+            length=64,
+            derive_from=ifac_origin_hash,
+            salt=RNS.Reticulum.IFAC_SALT,
+            context=None,
+        )
+        iface.ifac_identity = RNS.Identity.from_bytes(iface.ifac_key)
+        iface.ifac_signature = iface.ifac_identity.sign(
+            RNS.Identity.full_hash(iface.ifac_key)
+        )
+        # ifac_size defaults to the TCP/UDP DEFAULT_IFAC_SIZE (16); RNS derives
+        # this per interface subclass (Reticulum.py:1049-1050). Allow override.
+        iface.ifac_size = int(ifac_size) if ifac_size is not None else 16
+        computed_ifac_size = iface.ifac_size
+
     inst["interfaces"][iface_id] = iface
     RNS.Transport.interfaces.append(iface)
 
-    return {"iface_id": iface_id, "interface_hash": iface.get_hash().hex()}
+    return {
+        "iface_id": iface_id,
+        "interface_hash": iface.get_hash().hex(),
+        "ifac_size": computed_ifac_size,
+    }
 
 
 def cmd_behavioral_inject(params):
@@ -633,6 +731,11 @@ _IDX_AT_FALLBACK = {
 }
 _IDX_TT_FALLBACK = {
     "IDX_TT_TUNNEL_ID": 0, "IDX_TT_IF": 1, "IDX_TT_PATHS": 2, "IDX_TT_EXPIRES": 3,
+}
+_IDX_LT_FALLBACK = {
+    "IDX_LT_TIMESTAMP": 0, "IDX_LT_NH_TRID": 1, "IDX_LT_NH_IF": 2,
+    "IDX_LT_REM_HOPS": 3, "IDX_LT_RCVD_IF": 4, "IDX_LT_HOPS": 5,
+    "IDX_LT_DSTHASH": 6, "IDX_LT_VALIDATED": 7, "IDX_LT_PROOF_TMO": 8,
 }
 
 
@@ -976,7 +1079,1045 @@ def cmd_behavioral_detach_interface(params):
     return {"detached": True}
 
 
+def cmd_behavioral_ifac_mask(params):
+    """IFAC-mask a genuine RNS packet for a given interface and return the
+    on-wire (masked) bytes.
+
+    Delegates entirely to RNS.Transport.transmit (Transport.py:1050-1085): the
+    interface must have an ifac_identity configured (via
+    behavioral_attach_mock_interface ifac_netname/ifac_netkey). transmit signs
+    the raw with the interface's ifac_identity, derives the HKDF mask, sets the
+    IFAC header flag, inserts the access code and masks the payload — the exact
+    bytes RNS would put on the wire. The MockInterface buffers them in its TX
+    queue; we drain and return them. No masking is reimplemented here.
+
+    The returned masked frame, injected back on the SAME interface, round-trips
+    through the inbound IFAC-authentication branch (Transport.py:1399-1432): RNS
+    unmasks it, recomputes the expected access code and accepts it. Truncating it
+    to <= 2+ifac_size exercises the "too short to contain the IFAC" silent drop
+    (Transport.py:1402, the `else: return`).
+
+    params: handle, iface_id, raw (hex of a genuine unmasked packet)
+    returns: {masked} (hex)
+    """
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    raw = bytes.fromhex(params["raw"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+    if getattr(iface, "ifac_identity", None) is None:
+        raise ValueError("interface has no IFAC identity configured")
+
+    RNS = _get_rns()
+    # Clear any pending TX so we return only the masked frame.
+    iface.drain_tx()
+    RNS.Transport.transmit(iface, raw)
+    emitted = iface.drain_tx()
+    if len(emitted) != 1:
+        raise RuntimeError(f"expected exactly one masked frame, got {len(emitted)}")
+    return {"masked": emitted[0].hex()}
+
+
+def cmd_behavioral_inbound_remembered(params):
+    """Run the FULL RNS.Transport.inbound on a raw frame and report whether the
+    packet's hash was recorded in Transport.packet_hashlist.
+
+    behavioral_packet_filter only runs the packet_filter gate + an unconditional
+    add_packet_hash; it CANNOT observe the inbound-side deferrals at
+    Transport.py:1496-1504, where remember_packet_hash is forced False when the
+    destination is in Transport.link_table, or when the packet is a PROOF with
+    context==LRPROOF. This command drives the real inbound() end to end and then
+    inspects packet_hashlist, so those deferrals (and the IFAC gate at
+    :1399-1445, which runs before any hashing) become observable.
+
+    Observables:
+      hashlist_before / hashlist_after — size of Transport.packet_hashlist around
+        the inbound() call. hashlist_grew == (after > before) is the
+        implementation-independent "this frame caused a packet to be remembered"
+        signal — robust even when the frame is dropped in the IFAC gate before a
+        packet_hash can be computed.
+      packet_hash / in_hashlist — when the frame is independently unpackable, the
+        precise hash and its membership (computed from the supplied raw, whose
+        hops field is excluded from the hash, so it matches the hash inbound
+        stores even though inbound increments hops).
+
+    All hashing/filtering is RNS's; this command never decides accept/remember.
+
+    params: handle, iface_id, raw (hex)
+    returns: {hashlist_before, hashlist_after, hashlist_grew, unpackable,
+              packet_hash, in_hashlist}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    raw = bytes.fromhex(params["raw"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    # Independently determine the packet hash (if the frame is a valid packet).
+    # Uses RNS.Packet.unpack — the same parse inbound runs. The packet hash
+    # excludes the hops byte (get_hashable_part), so it equals the hash inbound
+    # stores even though inbound bumps hops by one.
+    packet_hash = None
+    probe = RNS.Packet(None, raw)
+    try:
+        unpackable = bool(probe.unpack())
+    except Exception:
+        unpackable = False
+    if unpackable:
+        packet_hash = probe.packet_hash
+
+    before = len(RNS.Transport.packet_hashlist)
+    iface.inject(raw)
+    after = len(RNS.Transport.packet_hashlist)
+
+    in_hashlist = bool(packet_hash is not None and packet_hash in RNS.Transport.packet_hashlist)
+
+    return {
+        "hashlist_before": before,
+        "hashlist_after": after,
+        "hashlist_grew": after > before,
+        "unpackable": unpackable,
+        "packet_hash": packet_hash.hex() if packet_hash is not None else None,
+        "in_hashlist": in_hashlist,
+    }
+
+
+def cmd_behavioral_seed_link_table(params):
+    """Seed Transport.link_table[dest] so the inbound link-table deferral
+    (Transport.py:1496-1498) can be exercised on a single injected packet.
+
+    Transport.inbound forces remember_packet_hash=False when an inbound packet's
+    destination_hash is already a key in Transport.link_table — a relayed link
+    can be seen on a shared-medium interface "before it would normally reach us",
+    and remembering it early would break link transport. There is no single-packet
+    way to populate link_table without driving a full multi-hop LINKREQUEST relay,
+    so this command installs a correctly-shaped entry directly (mirroring the
+    RNS link_entry layout at Transport.py:1600-1620, IDX_LT_* at :3570-3578).
+
+    The entry's next-hop and received interfaces are real attached MockInterfaces.
+    REM_HOPS/HOPS default to a value that will NOT match the injected packet's
+    hops, so the later link-transport branch (:1644-1679) does not re-add the
+    hash either — isolating the deferral as the sole reason the packet is not
+    remembered. (Set matching hops to instead drive the relay re-add path.)
+
+    params: handle, dest (hex), nh_iface_id, rcvd_iface_id, rem_hops (default 99),
+            hops (default 99)
+    returns: {seeded, dest}
+    """
+    import time
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    nh_iface = inst["interfaces"].get(params["nh_iface_id"])
+    rcvd_iface = inst["interfaces"].get(params["rcvd_iface_id"])
+    if nh_iface is None or rcvd_iface is None:
+        raise ValueError("nh_iface_id / rcvd_iface_id must reference attached interfaces")
+
+    rem_hops = int(params.get("rem_hops", 99))
+    hops = int(params.get("hops", 99))
+    now = time.time()
+
+    # Optional aging knobs for the link-table cull (Transport.py:685-692):
+    #   timestamp_age_s   — backdate the entry timestamp (validated-entry
+    #                       LINK_TIMEOUT cull when aged past the threshold).
+    #   validated         — False drives the unvalidated proof-timeout cull.
+    #   proof_timeout_in_s— proof_timeout relative to now (negative = already
+    #                       expired, so an unvalidated entry is culled).
+    timestamp = now - float(params.get("timestamp_age_s", 0))
+    validated = bool(params.get("validated", True))
+    proof_timeout = now + float(params.get("proof_timeout_in_s", 60.0))
+
+    # link_entry layout (Transport.py IDX_LT_*): [timestamp, next_hop_transport_id,
+    # next_hop_interface, remaining_hops, received_interface, hops, dest_hash,
+    # validated, proof_timeout].
+    link_entry = [timestamp, None, nh_iface, rem_hops, rcvd_iface, hops, dest,
+                  validated, proof_timeout]
+    with RNS.Transport.link_table_lock:
+        RNS.Transport.link_table[dest] = link_entry
+
+    return {"seeded": True, "dest": dest.hex()}
+
+
+def cmd_behavioral_seed_reverse_table(params):
+    """Seed Transport.reverse_table[key] with a correctly-shaped entry
+    [received_interface, outbound_interface, timestamp] (IDX_RT_*) so the
+    REVERSE_TIMEOUT cull (Transport.py:670-677) can be driven deterministically:
+    an entry whose timestamp is older than REVERSE_TIMEOUT is removed on the next
+    cull pass (behavioral_force_cull). `timestamp_age_s` backdates the timestamp
+    (default 0 = now). The interfaces are real attached MockInterfaces, so the
+    interface-membership cull arms do not fire — isolating the timeout arm.
+
+    params: handle, key (hex truncated packet hash), rcvd_iface_id, outb_iface_id,
+            timestamp_age_s
+    returns: {seeded, key}
+    """
+    import time
+    RNS = _get_rns()
+    handle = params["handle"]
+    key = bytes.fromhex(params["key"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    rcvd_iface = inst["interfaces"].get(params["rcvd_iface_id"])
+    outb_iface = inst["interfaces"].get(params["outb_iface_id"])
+    if rcvd_iface is None or outb_iface is None:
+        raise ValueError("rcvd_iface_id / outb_iface_id must reference attached interfaces")
+
+    timestamp = time.time() - float(params.get("timestamp_age_s", 0))
+    reverse_entry = [rcvd_iface, outb_iface, timestamp]
+    with RNS.Transport.reverse_table_lock:
+        RNS.Transport.reverse_table[key] = reverse_entry
+
+    return {"seeded": True, "key": key.hex()}
+
+
+def cmd_behavioral_read_link_table(params):
+    """Read RNS.Transport.link_table[link_id] decomposed into its fields.
+
+    The link table is otherwise observable only through what the relay emits;
+    exposing it directly lets a test assert the link_entry an impl actually holds
+    after relaying a LINKREQUEST (next-hop transport id / interface, taken vs
+    remaining hops, validated flag, proof-timeout) and that the timestamp is
+    refreshed when a link-transport DATA packet is repeated (Transport.py:1679).
+
+    Entry layout (IDX_LT_*, Transport.py:3569-3578; insert at :1612-1623):
+      [timestamp, next_hop_transport_id, next_hop_interface, remaining_hops,
+       received_interface, taken_hops, destination_hash, validated, proof_timeout]
+    IDX_LT_NH_IF / IDX_LT_RCVD_IF are interface objects (mapped back to the
+    iface_id the test attached); the rest are surfaced verbatim. Pure read of
+    RNS's own table — nothing is reconstructed here.
+
+    params: handle, link_id (optional hex). With link_id, returns that single
+            entry's {found, ...}; without, returns {entries: [...]} (so a test can
+            discover the link_id key a real relay computed).
+    returns: {found, timestamp, next_hop_transport_id, next_hop_if,
+              next_hop_if_hash, remaining_hops, received_if, received_if_hash,
+              hops, destination_hash, validated, proof_timeout}  OR  {entries:[...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    idx = _idx(_IDX_LT_FALLBACK)
+    table = RNS.Transport.link_table
+
+    def _decompose(key, entry):
+        nh_if_obj = entry[idx["IDX_LT_NH_IF"]]
+        rcvd_if_obj = entry[idx["IDX_LT_RCVD_IF"]]
+        nh_if = _iface_descriptor(inst, nh_if_obj) if nh_if_obj is not None else None
+        rcvd_if = _iface_descriptor(inst, rcvd_if_obj) if rcvd_if_obj is not None else None
+        nh_trid = entry[idx["IDX_LT_NH_TRID"]]
+        dsthash = entry[idx["IDX_LT_DSTHASH"]]
+        return {
+            "link_id": key.hex() if isinstance(key, (bytes, bytearray)) else key,
+            "timestamp": float(entry[idx["IDX_LT_TIMESTAMP"]]),
+            "next_hop_transport_id": nh_trid.hex() if isinstance(nh_trid, (bytes, bytearray)) else None,
+            "next_hop_if": nh_if["iface_id"] if nh_if else None,
+            "next_hop_if_hash": nh_if["hash"] if nh_if else None,
+            "remaining_hops": int(entry[idx["IDX_LT_REM_HOPS"]]),
+            "received_if": rcvd_if["iface_id"] if rcvd_if else None,
+            "received_if_hash": rcvd_if["hash"] if rcvd_if else None,
+            "hops": int(entry[idx["IDX_LT_HOPS"]]),
+            "destination_hash": dsthash.hex() if isinstance(dsthash, (bytes, bytearray)) else None,
+            "validated": bool(entry[idx["IDX_LT_VALIDATED"]]),
+            "proof_timeout": float(entry[idx["IDX_LT_PROOF_TMO"]]),
+        }
+
+    link_id = params.get("link_id")
+    if link_id is not None:
+        key = bytes.fromhex(link_id)
+        if key not in table:
+            return {"found": False}
+        d = _decompose(key, table[key])
+        d["found"] = True
+        return d
+
+    return {"entries": [_decompose(k, v) for k, v in table.items()]}
+
+
+def cmd_behavioral_register_destination(params):
+    """Register a real local IN/SINGLE destination on this Transport instance.
+
+    Constructs an RNS.Destination(identity, IN, SINGLE, app_name, *aspects) from
+    the supplied 64-byte Identity private key. RNS.Destination.__init__ calls
+    Transport.register_destination(self) (Destination.py:196), which appends the
+    destination to Transport.destinations and inserts it into
+    Transport.destinations_map (Transport.py:2415-2426) — exactly the table the
+    inbound announce path consults for the local-destination carve-out
+    (Transport.py:1707-1712). Everything is RNS's own construction/registration;
+    we only retain the object so behavioral_stop can deregister it.
+
+    The destination_hash equals RNS.Destination.hash(identity, app_name,
+    *aspects), so a test can build an announce for the SAME identity+app+aspects
+    (via announce_build) and inject it: because the hash is already a local
+    destination, Transport.inbound must NOT process it into the path/announce
+    tables (route-hijack defense).
+
+    Optional knobs let a test observe inbound DELIVERY decisions
+    (Transport.py:2155-2165): `type` ('single'|'plain'|'group', default 'single')
+    sets the registered destination's type (so a wrong-flag-type packet can be
+    shown to be dropped at the type-match gate); `proof_strategy`
+    ('all'|'none'|'app') calls Destination.set_proof_strategy (so a PROVE_ALL
+    destination's prove()-on-receive() behaviour is observable via the PROOF it
+    emits on drain_tx). A recording packet callback is always attached — it fires
+    only when RNS's own Destination.receive() returns truthy, so the delivered
+    plaintexts (read via behavioral_read_destination_deliveries) are the honest
+    observable for "was this packet delivered".
+
+    params: handle, app_name, aspects (list), identity_seed (64-byte hex; omit
+    for PLAIN), type, proof_strategy
+    returns: {destination_hash}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = list(params.get("aspects", []))
+    dest_type_name = (params.get("type") or "single").lower()
+    proof_strategy = params.get("proof_strategy")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    type_map = {
+        "single": RNS.Destination.SINGLE,
+        "plain": RNS.Destination.PLAIN,
+        "group": RNS.Destination.GROUP,
+    }
+    if dest_type_name not in type_map:
+        raise ValueError(f"unknown destination type: {dest_type_name!r}")
+
+    if dest_type_name == "plain":
+        destination = RNS.Destination(
+            None, RNS.Destination.IN, RNS.Destination.PLAIN, app_name, *aspects
+        )
+    else:
+        seed = bytes.fromhex(params["identity_seed"])
+        if len(seed) != 64:
+            raise ValueError("identity_seed must be 64 bytes (32 enc + 32 sig)")
+        identity = RNS.Identity(create_keys=False)
+        identity.load_private_key(seed)
+        destination = RNS.Destination(
+            identity, RNS.Destination.IN, type_map[dest_type_name], app_name, *aspects
+        )
+
+    deliveries = []
+
+    def _on_packet(message, packet, _store=deliveries):
+        _store.append(bytes(message))
+
+    destination.set_packet_callback(_on_packet)
+
+    if proof_strategy is not None:
+        strat_map = {
+            "all": RNS.Destination.PROVE_ALL,
+            "none": RNS.Destination.PROVE_NONE,
+            "app": RNS.Destination.PROVE_APP,
+        }
+        destination.set_proof_strategy(strat_map[proof_strategy.lower()])
+
+    inst.setdefault("destinations", []).append(destination)
+    inst.setdefault("dest_deliveries", {})[destination.hash] = deliveries
+    return {"destination_hash": destination.hash.hex()}
+
+
+def cmd_behavioral_read_destination_deliveries(params):
+    """Read the plaintexts delivered to a registered destination's recording
+    packet callback (set by behavioral_register_destination). Returns
+    {count, deliveries: [hex]}. The callback fires only when RNS's own
+    Destination.receive() returns truthy, so this is the honest observable for
+    the inbound type-match (Transport.py:2155) and decrypt-success
+    (Transport.py:2157) delivery decisions."""
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["dest"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    deliveries = inst.get("dest_deliveries", {}).get(dest_hash, [])
+    return {"count": len(deliveries), "deliveries": [d.hex() for d in deliveries]}
+
+
+def cmd_behavioral_read_announce_rate(params):
+    """Read RNS.Transport.announce_rate_table[dest] (the inbound announce-rate
+    limiter state, Transport.py:1830-1860).
+
+    Each entry is a dict {"last", "rate_violations", "blocked_until",
+    "timestamps":[...]} built and mutated entirely by Transport.inbound: a new
+    entry on the first should-add announce for a destination on a rate-limited
+    interface, then per-announce timestamp appends, a sliding cap at
+    MAX_RATE_TIMESTAMPS=16, grace-counter increment/decrement, and a
+    blocked_until = last + rate_target + rate_penalty penalty window. This is a
+    pure read of RNS's own table — no rate logic is reimplemented here.
+
+    params: handle, dest (destination hash hex)
+    returns: {found, last, rate_violations, blocked_until, timestamps:[...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    table = RNS.Transport.announce_rate_table
+    if dest not in table:
+        return {"found": False}
+    entry = table[dest]
+    return {
+        "found": True,
+        "last": float(entry["last"]),
+        "rate_violations": int(entry["rate_violations"]),
+        "blocked_until": float(entry["blocked_until"]),
+        "timestamps": [float(t) for t in entry["timestamps"]],
+    }
+
+
+def cmd_behavioral_set_path_expires(params):
+    """Set path_table[dest][IDX_PT_EXPIRES] for deterministic path-replacement
+    tests (Transport.py:1789 path_expires read).
+
+    The larger-hop announce replacement logic (Transport.py:1785-1823) reads the
+    path entry's EXPIRES field (index 3), NOT the TIMESTAMP field that
+    behavioral_set_path_timestamp rewinds. Rewinding EXPIRES into the past makes
+    `now >= path_expires` true, so a subsequent larger-hop announce with a novel
+    random_blob is accepted (branch a). This only assigns a float to RNS's own
+    table entry; no replacement logic is reimplemented.
+
+    params: handle, dest (hex), expires (float epoch seconds)
+    returns: {set}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+    expires = float(params["expires"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    idx = _pt_indices()
+    table = RNS.Transport.path_table
+    if dest not in table:
+        return {"set": False}
+    table[dest][idx["IDX_PT_EXPIRES"]] = expires
+    return {"set": True}
+
+
+def cmd_behavioral_mark_path_unresponsive(params):
+    """Mark a path as unresponsive via real Transport.mark_path_unresponsive
+    (Transport.py:2719-2724).
+
+    Sets Transport.path_states[dest] = STATE_UNRESPONSIVE, which the
+    equal-emission announce-replacement branch reads through
+    Transport.path_is_unresponsive (Transport.py:1818-1823): an announce with
+    larger hops and an emission timestamp EQUAL to the stored path's is accepted
+    only when the existing path was previously marked unresponsive. Delegates
+    entirely to the real staticmethod.
+
+    params: handle, dest (hex)
+    returns: {marked}  (False if there is no path_table entry for dest)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest = bytes.fromhex(params["dest"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    marked = bool(RNS.Transport.mark_path_unresponsive(dest))
+    return {"marked": marked}
+
+
+def cmd_behavioral_request_path(params):
+    """Drive the impl's OWN Transport.request_path and let the test drain the
+    emitted path-request packet (Transport.py:2769-2812).
+
+    Calls the real Transport.request_path(dest, on_interface=iface, tag=...),
+    which builds a PLAIN DATA broadcast packet to the rnstransport.path.request
+    control destination with payload `dest [|| Transport.identity.hash] || tag`
+    (transport_id present only when transport is enabled) and sends it on the
+    given interface. The MockInterface buffers the on-wire bytes (drain_tx), so a
+    test can byte-assert the header flags and payload split. No path-request wire
+    bytes are assembled here — RNS.Packet.pack produces them.
+
+    params: handle, iface_id, dest (hex), tag (optional hex)
+    returns: {tag}  (the request tag actually used, hex)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    dest = bytes.fromhex(params["dest"])
+    tag = bytes.fromhex(params["tag"]) if params.get("tag") else None
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    # If no tag is supplied, RNS mints a random one internally; supply a tag for
+    # deterministic payload-length assertions.
+    used_tag = tag if tag is not None else RNS.Identity.get_random_hash()
+    RNS.Transport.request_path(dest, on_interface=iface, tag=used_tag)
+    return {"tag": used_tag.hex()}
+
+
+def cmd_behavioral_blackhole_identity(params):
+    """Blackhole an identity via real Transport.blackhole_identity
+    (Transport.py:3406-3428).
+
+    Inserts identity_hash into Transport.blackholed_identities (and persists +
+    drops any associated paths, exactly as RNS does). Once present,
+    Identity.validate_announce invalidates and drops any announce whose
+    announced identity hash is blackholed (Identity.py:567-569), so an injected
+    announce from that identity creates no path entry. Delegates to the real
+    staticmethod; _reset_transport_state clears the table between handles.
+
+    Optional `until` (unix timestamp float) and `reason` (str) are passed
+    straight through to Transport.blackhole_identity so the recorded entry
+    carries them, exactly as `rnpath -B --duration/--reason` would
+    (rnpath.py:214-215). This lets a test assert the {source, until, reason}
+    entry schema the /list handler and rnpath consumer rely on.
+
+    params: handle, identity_hash (hex), until (optional float), reason (optional str)
+    returns: {blackholed}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    identity_hash = bytes.fromhex(params["identity_hash"])
+    until = params.get("until")
+    reason = params.get("reason")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    result = RNS.Transport.blackhole_identity(identity_hash, until=until, reason=reason)
+    return {"blackholed": bool(result)}
+
+
+def cmd_behavioral_unblackhole_identity(params):
+    """Lift a blackhole via real Transport.unblackhole_identity (Transport.py:3431).
+
+    Delegates to the real staticmethod, which pops the identity from
+    Transport.blackholed_identities and re-persists the local list. Returns
+    {lifted} (True if it was present, False/None otherwise).
+
+    params: handle, identity_hash (hex)
+    returns: {lifted}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    identity_hash = bytes.fromhex(params["identity_hash"])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    result = RNS.Transport.unblackhole_identity(identity_hash)
+    return {"lifted": bool(result)}
+
+
+def _serialize_blackhole_entry(identity_hash, entry):
+    """Decompose one Transport.blackholed_identities item into a JSON-safe dict.
+
+    Reads the real RNS entry fields straight off the dict RNS populated
+    (entry["source"]/["until"]/["reason"]); no protocol bytes are constructed.
+    """
+    source = entry.get("source")
+    return {
+        "identity_hash": identity_hash.hex(),
+        "source": source.hex() if isinstance(source, (bytes, bytearray)) else None,
+        "until": entry.get("until"),
+        "reason": entry.get("reason"),
+    }
+
+
+def cmd_behavioral_read_blackhole_table(params):
+    """Read RNS.Transport.blackholed_identities as a JSON-safe list.
+
+    Surfaces the live blackhole table (the exact dict the /list request handler
+    returns and that Transport.reload_blackhole / persist_blackhole maintain) so
+    a test can assert the per-entry schema {source, until, reason} and the keys.
+    Reads RNS state only — nothing is reconstructed.
+
+    params: handle
+    returns: {count, entries: [{identity_hash, source, until, reason}, ...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    table = RNS.Transport.blackholed_identities
+    entries = [_serialize_blackhole_entry(h, table[h]) for h in table.copy()]
+    return {"count": len(entries), "entries": entries}
+
+
+def cmd_behavioral_blackhole_list_handler(params):
+    """Invoke the REAL Transport.blackhole_list_handler — the response_generator
+    registered on the rnstransport.info.blackhole '/list' request destination
+    (Transport.py:262, :3514) — and report its result.
+
+    This is the exact callable a remote `rnpath -L` fetch reaches over a Link
+    (Discovery.BlackholeUpdater). Driving it directly (with the handler's real
+    6-arg request signature) exercises the publish path without needing a live
+    wire link. The handler returns Transport.blackholed_identities verbatim, so
+    we report whether the returned object IS that dict plus its serialized
+    entries for schema assertions.
+
+    params: handle
+    returns: {is_blackhole_table, count, entries: [...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    result = RNS.Transport.blackhole_list_handler(
+        "/list", None, None, None, None, None
+    )
+    is_table = result is RNS.Transport.blackholed_identities
+    entries = []
+    if isinstance(result, dict):
+        entries = [_serialize_blackhole_entry(h, result[h]) for h in dict(result)]
+    return {"is_blackhole_table": is_table, "count": len(entries), "entries": entries}
+
+
+def cmd_behavioral_blackhole_reload(params):
+    """Run the real Transport.reload_blackhole() (Transport.py:3453).
+
+    reload_blackhole rescans <configdir>/storage/blackhole/*, loading each
+    trusted source file (filename 'local' => own identity; otherwise a
+    hex source-identity hash that must be in Reticulum.blackhole_sources()),
+    skipping expired (until < now) entries and never overwriting a locally
+    sourced entry, then calls remove_blackholed_paths(). Pure delegation.
+
+    params: handle
+    returns: {count}  (size of Transport.blackholed_identities afterward)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS.Transport.reload_blackhole()
+    return {"count": len(RNS.Transport.blackholed_identities)}
+
+
+def cmd_behavioral_blackhole_clear(params):
+    """Empty the in-memory Transport.blackholed_identities table (NOT the
+    on-disk storage). Lets a test prove that reload_blackhole repopulates it
+    purely from the persisted source files. Mirrors what
+    _reset_transport_state does between handles; exposed so a single test can
+    clear-then-reload deterministically.
+
+    params: handle
+    returns: {cleared}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    RNS.Transport.blackholed_identities.clear()
+    return {"cleared": True}
+
+
+def cmd_behavioral_blackhole_storage_files(params):
+    """List the files RNS keeps under <configdir>/storage/blackhole.
+
+    Reads RNS.Reticulum.blackholepath (the real persistence directory) and
+    returns each filename + size so a test can assert the persistence file
+    naming contract: the local list is 'local', and every fetched/remote source
+    list is named by the hex of its source identity hash
+    (Transport.reload_blackhole filename handling, Transport.py:3457-3465;
+    persist_blackhole writes 'local', Transport.py:3531). Directory listing
+    only — no file contents are decoded here.
+
+    params: handle
+    returns: {dir, files: [{name, size}, ...]}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    files = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            files.append({"name": name, "size": os.path.getsize(full)})
+    return {"dir": path, "files": files}
+
+
+def cmd_behavioral_blackhole_clear_storage(params):
+    """Delete every file under <configdir>/storage/blackhole so a test starts
+    from a clean persistence directory (the dir is process-wide and survives
+    _reset_transport_state, which only clears the in-memory table).
+
+    params: handle
+    returns: {removed}  (number of files unlinked)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    removed = 0
+    for name in os.listdir(path):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            os.remove(full)
+            removed += 1
+    return {"removed": removed}
+
+
+def cmd_behavioral_blackhole_rename_storage(params):
+    """Rename a file inside <configdir>/storage/blackhole.
+
+    The bytes are NEVER touched — only the directory entry is renamed via
+    os.rename. This lets a test repurpose the RNS-written 'local' list (whose
+    umsgpack payload RNS itself produced via persist_blackhole) as a *remote*
+    source file named by a source-identity hex, so reload_blackhole's
+    remote-source path (hex-name validation, trusted-source gating, local
+    precedence) can be exercised without a live fetch link and without the
+    harness ever serializing a blackhole list itself.
+
+    params: handle, src (filename), dst (filename)
+    returns: {renamed}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    src = params["src"]
+    dst = params["dst"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    path = RNS.Reticulum.blackholepath
+    os.rename(os.path.join(path, src), os.path.join(path, dst))
+    return {"renamed": True}
+
+
+def cmd_behavioral_blackhole_set_sources(params):
+    """Replace RNS's trusted blackhole-source list (the identity hashes a node
+    is configured to accept remote blackhole lists from, normally parsed from
+    the `blackhole_sources` config option, Reticulum.py:575-582).
+
+    Mutates the real list returned by RNS.Reticulum.blackhole_sources() in
+    place so reload_blackhole's trusted-source gate (Transport.py:3463 —
+    `if source not in Reticulum.blackhole_sources(): skip`) sees the test's
+    chosen sources. Reads/writes RNS state only.
+
+    params: handle, sources (list of hex identity hashes)
+    returns: {count}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    sources = [bytes.fromhex(s) for s in params.get("sources", [])]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    trusted = RNS.Reticulum.blackhole_sources()
+    trusted.clear()
+    trusted.extend(sources)
+    return {"count": len(trusted)}
+
+
+def cmd_behavioral_hold_and_release_announce(params):
+    """Hold a set of real announce packets on an interface's ingress-control
+    queue, then run ONE release pass and report which destination was released.
+
+    This exposes the lowest-hops-FIRST release decision in
+    Interface.process_held_announces (Interfaces/Interface.py:234-253) without
+    any real clock dependence:
+
+      * Each raw announce is turned into a genuine RNS.Packet exactly as
+        Transport.inbound does (`RNS.Packet(None, raw)` + `packet.unpack()`,
+        Transport.py:1451-1452), its receiving_interface pointed at the mock
+        interface, and handed to the REAL `interface.hold_announce(packet)`
+        (Interface.py:228-232) — the same call Transport.inbound makes at
+        :1704. The harness reimplements no hold/selection logic.
+      * `interface.ic_held_release` is backdated to 0 so the release gate
+        (`time.time() > ic_held_release`) is open with no sleep — the same
+        backdating technique the rest of the suite uses for time-gated jobs.
+      * `interface.process_held_announces()` is then called ONCE. It selects the
+        held announce with the FEWEST hops, pops it from `held_announces`, and
+        re-injects it on a daemon thread. We read `held_announces` keys before
+        and after (the pop is synchronous) to report exactly which destination
+        was released. The re-injection does NOT re-hold the announce: a fresh
+        mock interface has ic_burst_active False and incoming_announce_frequency
+        0, so should_ingress_limit() is False (Interface.py:145-165), the branch
+        that would re-hold it (Transport.py:1703-1704) is not taken.
+
+    params:
+        handle, iface_id, announces (list of raw announce hex)
+    returns:
+        held_before (list of dest_hash hex), held_after (list), released (list),
+        hops ({dest_hash hex: hop count})
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+    announces = params["announces"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    hops_map = {}
+    for raw_hex in announces:
+        raw = bytes.fromhex(raw_hex)
+        # Build the Packet exactly as Transport.inbound does, then hold it via
+        # the real ingress-control API.
+        packet = RNS.Packet(None, raw)
+        if not packet.unpack():
+            raise ValueError("could not unpack supplied announce packet")
+        packet.receiving_interface = iface
+        iface.hold_announce(packet)
+        hops_map[packet.destination_hash.hex()] = int(packet.hops)
+
+    held_before = [dh.hex() for dh in iface.held_announces.keys()]
+    # Open the release gate deterministically (no sleep).
+    iface.ic_held_release = 0
+    iface.process_held_announces()
+    held_after = [dh.hex() for dh in iface.held_announces.keys()]
+    released = [dh for dh in held_before if dh not in held_after]
+
+    return {
+        "held_before": held_before,
+        "held_after": held_after,
+        "released": released,
+        "hops": hops_map,
+    }
+
+
+def _make_recording_announce_handler(aspect_filter, receive_path_responses,
+                                     num_params, raise_on_call, omit_aspect_filter):
+    """Build a real announce-handler object for RNS.Transport.register_announce_handler.
+
+    The object exposes exactly the duck-typed surface RNS requires
+    (Transport.register_announce_handler / Transport.inbound:2034-2087): an
+    `aspect_filter` attribute, an optional `receive_path_responses` attribute,
+    and a `received_announce(...)` callable whose parameter COUNT (3 or 4)
+    selects which RNS dispatch arm fires. RNS itself does all the matching
+    (hash_from_name_and_identity), path-response gating, and threaded dispatch;
+    this handler only RECORDS the values RNS hands it (destination_hash,
+    announced_identity.hash, app_data, announce_packet_hash) — no protocol bytes
+    are reconstructed here.
+    """
+    calls = []
+    lock = threading.Lock()
+
+    def _record(destination_hash, announced_identity, app_data,
+                announce_packet_hash=None):
+        rec = {
+            "destination_hash": destination_hash.hex()
+                if isinstance(destination_hash, (bytes, bytearray)) else None,
+            "announced_identity_hash": getattr(announced_identity, "hash", None).hex()
+                if getattr(announced_identity, "hash", None) is not None else None,
+            "app_data": app_data.hex()
+                if isinstance(app_data, (bytes, bytearray)) else None,
+        }
+        if announce_packet_hash is not None:
+            rec["announce_packet_hash"] = announce_packet_hash.hex() \
+                if isinstance(announce_packet_hash, (bytes, bytearray)) else None
+        with lock:
+            calls.append(rec)
+
+    if num_params == 4:
+        def received_announce(destination_hash, announced_identity, app_data,
+                              announce_packet_hash):
+            _record(destination_hash, announced_identity, app_data,
+                    announce_packet_hash)
+            if raise_on_call:
+                raise RuntimeError("recording announce handler deliberately raised")
+    else:
+        def received_announce(destination_hash, announced_identity, app_data):
+            _record(destination_hash, announced_identity, app_data)
+            if raise_on_call:
+                raise RuntimeError("recording announce handler deliberately raised")
+
+    class _RecordingAnnounceHandler:
+        pass
+
+    handler = _RecordingAnnounceHandler()
+    # Per the rule under test, RNS.Transport.register_announce_handler only
+    # registers a handler that HAS an aspect_filter attribute; omit it to drive
+    # the rejection branch.
+    if not omit_aspect_filter:
+        handler.aspect_filter = aspect_filter
+    if receive_path_responses is not None:
+        handler.receive_path_responses = bool(receive_path_responses)
+    handler.received_announce = received_announce
+    handler._recorded_calls = calls
+    handler._recorded_lock = lock
+    return handler
+
+
+def cmd_behavioral_register_announce_handler(params):
+    """Register a real recording announce-handler on this Transport instance.
+
+    Delegates to RNS.Transport.register_announce_handler (Transport.py:2465) with
+    a duck-typed handler whose received_announce only records the arguments RNS
+    dispatches to it. The dispatch decision (aspect_filter match via
+    Destination.hash_from_name_and_identity, the PATH_RESPONSE/
+    receive_path_responses gate, the 3-vs-4-parameter signature arm, and the
+    per-handler exception isolation) is ENTIRELY RNS's — see Transport.inbound
+    :2034-2087. The test reads back the recorded calls via
+    behavioral_read_announce_handler_calls.
+
+    params: handle, aspect_filter (str|None), receive_path_responses (bool|None),
+            num_params (3|4, default 3), raise_on_call (bool),
+            omit_aspect_filter (bool)
+    returns: {handler_id, registered}  (registered=False iff RNS declined the
+             handler because it lacked an aspect_filter attribute)
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    aspect_filter = params.get("aspect_filter")
+    receive_path_responses = params.get("receive_path_responses")
+    num_params = int(params.get("num_params", 3))
+    raise_on_call = bool(params.get("raise_on_call", False))
+    omit_aspect_filter = bool(params.get("omit_aspect_filter", False))
+
+    handler = _make_recording_announce_handler(
+        aspect_filter, receive_path_responses, num_params, raise_on_call,
+        omit_aspect_filter,
+    )
+    RNS.Transport.register_announce_handler(handler)
+    registered = handler in RNS.Transport.announce_handlers
+
+    handler_id = secrets.token_hex(8)
+    inst.setdefault("announce_handlers", {})[handler_id] = handler
+    return {"handler_id": handler_id, "registered": registered}
+
+
+def cmd_behavioral_read_announce_handler_calls(params):
+    """Return the calls a registered recording announce-handler has received.
+
+    Pure read of the list the handler's received_announce (driven by real RNS
+    dispatch) appended to. See cmd_behavioral_register_announce_handler.
+
+    params: handle, handler_id
+    returns: {calls: [{destination_hash, announced_identity_hash, app_data
+                       [, announce_packet_hash]}], registered}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    handler_id = params["handler_id"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    handler = inst.get("announce_handlers", {}).get(handler_id)
+    if handler is None:
+        raise ValueError(f"Unknown announce handler_id: {handler_id}")
+
+    with handler._recorded_lock:
+        calls = [dict(c) for c in handler._recorded_calls]
+    return {
+        "calls": calls,
+        "registered": handler in RNS.Transport.announce_handlers,
+    }
+
+
 BEHAVIORAL_COMMANDS = {
+    "behavioral_register_destination": cmd_behavioral_register_destination,
+    "behavioral_read_destination_deliveries": cmd_behavioral_read_destination_deliveries,
+    "behavioral_hold_and_release_announce": cmd_behavioral_hold_and_release_announce,
+    "behavioral_read_announce_rate": cmd_behavioral_read_announce_rate,
+    "behavioral_set_path_expires": cmd_behavioral_set_path_expires,
+    "behavioral_mark_path_unresponsive": cmd_behavioral_mark_path_unresponsive,
+    "behavioral_request_path": cmd_behavioral_request_path,
+    "behavioral_blackhole_identity": cmd_behavioral_blackhole_identity,
+    "behavioral_unblackhole_identity": cmd_behavioral_unblackhole_identity,
+    "behavioral_read_blackhole_table": cmd_behavioral_read_blackhole_table,
+    "behavioral_blackhole_list_handler": cmd_behavioral_blackhole_list_handler,
+    "behavioral_blackhole_reload": cmd_behavioral_blackhole_reload,
+    "behavioral_blackhole_clear": cmd_behavioral_blackhole_clear,
+    "behavioral_blackhole_storage_files": cmd_behavioral_blackhole_storage_files,
+    "behavioral_blackhole_clear_storage": cmd_behavioral_blackhole_clear_storage,
+    "behavioral_blackhole_rename_storage": cmd_behavioral_blackhole_rename_storage,
+    "behavioral_blackhole_set_sources": cmd_behavioral_blackhole_set_sources,
     "behavioral_start": cmd_behavioral_start,
     "behavioral_stop": cmd_behavioral_stop,
     "behavioral_attach_mock_interface": cmd_behavioral_attach_mock_interface,
@@ -992,4 +2133,11 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_set_announce_timestamp": cmd_behavioral_set_announce_timestamp,
     "behavioral_force_cull": cmd_behavioral_force_cull,
     "behavioral_detach_interface": cmd_behavioral_detach_interface,
+    "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
+    "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
+    "behavioral_seed_link_table": cmd_behavioral_seed_link_table,
+    "behavioral_seed_reverse_table": cmd_behavioral_seed_reverse_table,
+    "behavioral_read_link_table": cmd_behavioral_read_link_table,
+    "behavioral_register_announce_handler": cmd_behavioral_register_announce_handler,
+    "behavioral_read_announce_handler_calls": cmd_behavioral_read_announce_handler_calls,
 }

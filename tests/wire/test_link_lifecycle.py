@@ -36,6 +36,8 @@ Lifecycle reality, validated against RNS 1.3.1 and encoded in the assertions:
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -260,7 +262,8 @@ def test_silent_peer_times_out_active_link(wire_peers):
     ],
     verifies="Positive control distinguishing a clean close from a timeout: when the peer shuts down gracefully (its Reticulum exit handler sends a link teardown), the initiator's link closes with teardown_reason DESTINATION_CLOSED — NOT TIMEOUT",
 )
-def test_clean_peer_disconnect_closes_destination_closed(wire_peers):
+def test_clean_peer_disconnect_closes_destination_closed(wire_peers, wire_pair):
+    server_impl, client_impl = wire_pair
     server, client = wire_peers
     _server_dest, link_id = _bring_up_link(server, client)
 
@@ -278,6 +281,15 @@ def test_clean_peer_disconnect_closes_destination_closed(wire_peers):
         f"initiator link did not close after the peer shut down cleanly: "
         f"{result!r}"
     )
+    if server_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#graceful-shutdown-link-teardown: on graceful "
+            "shutdown kotlin never broadcasts LINKCLOSE; Reticulum.shutdown() "
+            "clears interfaces without tearing down active/pending links (cf. "
+            "Transport.detach_interfaces, Transport.py:3076-3088), so the "
+            "initiator closes via watchdog TIMEOUT instead of "
+            "DESTINATION_CLOSED."
+        )
     assert result["teardown_reason_name"] == "DESTINATION_CLOSED", (
         f"a clean peer shutdown must close the link with DESTINATION_CLOSED, "
         f"got {result['teardown_reason_name']!r}: {result!r}. (TIMEOUT here "

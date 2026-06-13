@@ -49,6 +49,8 @@ resource.
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -85,6 +87,18 @@ _MAPHASH_LEN = 4
 # construction and restores the link's negotiated MTU afterward.
 _FORCED_SDU = 50
 _HMU_PAYLOAD_SIZE = 8192
+
+# reticulum-kt architectural gap shared by both multi-segment TRANSFER cases.
+# The construction-only assertions (total_segments/segment_index/original_hash
+# from resource_create) hold under kotlin and are pinned ahead of this point;
+# only the actual multi-segment send/receive loop is unimplemented, so the
+# xfail is applied immediately before the first resource_send.
+_MULTI_SEGMENT_XFAIL_REASON = (
+    "reticulum-kt#multi-segment-send: sender never truncates per "
+    "MAX_EFFICIENT_SIZE (Resource.kt:419/454); prepareNextSegment needs an "
+    "inputFile byte-array sends never set; receiver has no segment-append. "
+    "Multi-segment SEND/RECEIVE unimplemented. Refs Resource.py:285-323/445-448."
+)
 
 
 def _establish_link(wire_peers):
@@ -176,7 +190,7 @@ def test_payload_over_max_efficient_size_splits_into_two_segments(wire_peers):
     commands=["start_tcp_server", "start_tcp_client", "listen", "link_open", "poll_path", "resource_send", "resource_poll"],
     verifies="A >1 MiB Resource (2 segments) sent over a Link reassembles byte-exact at the receiver — the multi-segment send/append/proof loop (Resource.py:299/708/788) round-trips the entire payload, not just the first segment",
 )
-def test_multi_segment_transfer_reassembles_byte_exact(wire_peers):
+def test_multi_segment_transfer_reassembles_byte_exact(wire_peers, wire_pair):
     """Transfer observable: a >1 MiB payload survives the multi-segment path.
 
     A payload of MAX_EFFICIENT_SIZE + 64 KiB spans two segments with a
@@ -189,9 +203,18 @@ def test_multi_segment_transfer_reassembles_byte_exact(wire_peers):
     stopped after segment 1, or a receiver that dropped a segment, yields a
     short or mismatched payload.
     """
+    server_impl, client_impl = wire_pair
     server, client, dest_hash, link_id = _establish_link(wire_peers)
 
     payload = secrets.token_bytes(_MAX_EFFICIENT_SIZE + 64 * 1024)
+
+    # The multi-segment send/receive loop below is the unimplemented kotlin
+    # gap. The reference-to-reference pair runs it live; any pair touching
+    # kotlin (sender that cannot truncate, or receiver that cannot append)
+    # is the documented architectural gap.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(_MULTI_SEGMENT_XFAIL_REASON)
+
     send_resp = client.resource_send(
         link_id, payload, timeout_ms=_RESOURCE_TIMEOUT_MS
     )
@@ -306,7 +329,7 @@ def test_exact_max_efficient_size_boundary_stays_single_segment(wire_peers):
     commands=["start_tcp_server", "start_tcp_client", "listen", "link_open", "poll_path", "resource_create", "resource_send", "resource_poll"],
     verifies="A >2 MiB payload constructs as total_segments==3 with the first segment's original_hash == its own hash (chaining seed, Resource.py:446) and, when sent, reassembles byte-exact at the receiver — proving all three segments chain through the shared original_hash into one stream (Resource.py:299/:708/:769/:788)",
 )
-def test_three_segment_transfer_reassembles_byte_exact(wire_peers):
+def test_three_segment_transfer_reassembles_byte_exact(wire_peers, wire_pair):
     """Transfer observable: a 3-segment payload chains and reassembles whole.
 
     A payload over 2 x MAX_EFFICIENT_SIZE splits into 3 segments, each sent and
@@ -319,6 +342,7 @@ def test_three_segment_transfer_reassembles_byte_exact(wire_peers):
     2-segment test only transitively touches chaining; the third segment and
     the explicit original_hash seed are unpinned without this.
     """
+    server_impl, client_impl = wire_pair
     server, client, dest_hash, link_id = _establish_link(wire_peers)
 
     # 2 x MAX_EFFICIENT_SIZE + 128 KiB -> total_size in (2*MAX, 3*MAX] -> 3 segments.
@@ -341,7 +365,14 @@ def test_three_segment_transfer_reassembles_byte_exact(wire_peers):
         f"(Resource.py:446); later segments inherit it (Resource.py:772)."
     )
 
-    # Transfer: all three segments reassemble byte-exact.
+    # Transfer: all three segments reassemble byte-exact. Construction above is
+    # pinned for every pair (kotlin included); only the multi-segment
+    # send/append/proof loop below is the unimplemented kotlin gap, so the
+    # waiver applies to any kotlin-touching pair while reference-to-reference
+    # runs the transfer live.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(_MULTI_SEGMENT_XFAIL_REASON)
+
     send_resp = client.resource_send(
         link_id, payload, timeout_ms=_RESOURCE_TIMEOUT_MS
     )

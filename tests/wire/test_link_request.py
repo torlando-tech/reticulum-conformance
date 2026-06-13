@@ -27,6 +27,8 @@ path is covered separately in test_link_identify.py.
 
 import secrets
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -160,4 +162,73 @@ def test_link_request_large_response_round_trips_as_resource(wire_link_setup):
     assert entries[0]["data"] == request_data.hex(), (
         f"the >MDU request data the handler observed did not match what the "
         f"client sent — the request Resource did not reassemble byte-exact."
+    )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "link_request", "get_request_log",
+    ],
+    verifies=(
+        "A request handler returning a (file, metadata) tuple is answered as a "
+        "metadata-bearing response Resource, NOT a RESPONSE packet "
+        "(Link.py:884-895 / response_resource_concluded:939-945): the requester "
+        "receives the file content byte-exact AND the separate metadata "
+        "un-unpacked (the has_metadata branch), while a normal bytes handler "
+        "answers with no metadata. An impl that umsgpack-wraps a file response, "
+        "drops the metadata, or ships it as a RESPONSE packet diverges observably"
+    ),
+)
+def test_file_response_carries_metadata_as_resource(wire_link_setup, wire_pair):
+    server, client, dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+    server_impl, client_impl = wire_pair
+
+    file_path = "/file"
+    bytes_path = "/bytes"
+    content = secrets.token_bytes(200)
+    metadata = secrets.token_bytes(32)
+    # The reference arm (server on reference) pins the full behaviour below: the
+    # file/metadata Resource branch round-trips content + metadata while a plain
+    # bytes handler carries none. Only a kotlin server diverges, and it does so
+    # at the very first step — registering a file+metadata handler — because the
+    # kotlin Destination request generator returns ByteArray only. xfail the
+    # kotlin server arm immediately before the registration the gap breaks; a
+    # reference server with a kotlin client still runs live.
+    if server_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#request-handler-file-metadata-response-unsupported: "
+            "the kotlin Destination request generator returns ByteArray only; it "
+            "cannot return a (file, metadata) tuple/streamed-file+metadata "
+            "response (Link.py:884-895). Bridge rejects response_file "
+            "(WireTcp.kt:2504)."
+        )
+    server.register_request_handler(
+        dest_hash, file_path, response_file=content, response_metadata=metadata,
+    )
+    # Positive contrast: a normal bytes handler (umsgpack RESPONSE path).
+    server.register_request_handler(dest_hash, bytes_path, response=secrets.token_bytes(48))
+
+    # File response: delivered as a metadata-bearing Resource. Both the content
+    # AND the metadata must round-trip — the metadata is the discriminator that
+    # the file/Resource branch (not the umsgpack packet branch) was taken.
+    fr = client.link_request(link_id, file_path, timeout_ms=15000)
+    assert fr["status"] == "ready", (
+        f"a file-response request did not reach READY: {fr!r}"
+    )
+    assert fr["response"] == content.hex(), (
+        f"the file content did not round-trip byte-exact: {fr!r}"
+    )
+    assert fr["response_metadata"] == metadata.hex(), (
+        f"the response metadata did not round-trip — the file/metadata Resource "
+        f"branch was not taken (a RESPONSE packet or umsgpack wrap carries no "
+        f"metadata): {fr!r}"
+    )
+
+    # Contrast: a normal bytes response carries NO metadata.
+    br = client.link_request(link_id, bytes_path, timeout_ms=10000)
+    assert br["status"] == "ready", f"the bytes-response request did not reach READY: {br!r}"
+    assert br["response_metadata"] is None, (
+        f"a normal bytes response must carry no metadata; metadata is the "
+        f"file-Resource discriminator: {br!r}"
     )

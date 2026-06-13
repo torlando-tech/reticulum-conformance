@@ -231,3 +231,61 @@ def test_identity_encrypt_is_fresh_per_call(sut, reference):
             "identity_decrypt", private_key=priv, ciphertext=enc["ciphertext"]
         )
         assert_hex_equal(dec["plaintext"], plaintext)
+
+
+# ---------------------------------------------------------------------------
+# Identity verification is a total predicate; announce validation never crashes
+# (Opus completeness gaps: verify-boolean, announce-malformed-rejected-no-crash)
+# ---------------------------------------------------------------------------
+
+
+@conformance_case(
+    commands=["identity_from_private_key", "identity_sign", "identity_verify"],
+    verifies="RNS.Identity.validate is a TOTAL boolean predicate: a genuine signature verifies True (positive anchor), but a structurally malformed signature — wrong length (63 bytes, 65 bytes) or empty (0 bytes) — verifies False, returned as a boolean rather than raised. An SUT that throws on a malformed signature instead of rejecting it fails",
+)
+def test_identity_verify_malformed_signature_returns_false(sut, reference):
+    priv = random_hex(64)
+    idn = reference.execute("identity_from_private_key", private_key=priv)
+    message = random_hex(48)
+    sig = sut.execute("identity_sign", private_key=priv, message=message)["signature"]
+    # Positive anchor.
+    assert sut.execute(
+        "identity_verify", public_key=idn["public_key"], message=message, signature=sig
+    )["valid"] is True
+    # Negatives: malformed lengths must all verify False without raising.
+    for bad, why in ((sig[:-2], "63-byte"), (sig + "00", "65-byte"), ("", "0-byte")):
+        v = sut.execute(
+            "identity_verify", public_key=idn["public_key"], message=message, signature=bad
+        )
+        assert v["valid"] is False, f"malformed signature ({why}) must verify False, got {v}"
+
+
+@conformance_case(
+    commands=["announce_build", "announce_validate"],
+    verifies="RNS.Identity.validate_announce rejects malformed announces by returning False and never crashes: a genuine announce validates True (positive anchor), but an announce whose BODY is truncated (signature/key slices fall short) or whose public-key bytes are corrupted validates False — exercising the body-truncation and undecodable-key paths the suite previously only hit at packet unpack",
+)
+def test_announce_validate_rejects_malformed_body(sut):
+    info = sut.execute(
+        "announce_build",
+        private_key=random_hex(64),
+        app_name="conformance",
+        aspects=["identity_malformed"],
+        app_data="",
+        enable_ratchets=False,
+    )
+    raw = bytes.fromhex(info["raw"])
+    # Positive anchor.
+    assert sut.execute("announce_validate", raw=raw.hex())["valid"] is True
+    # Negative: truncated announce bodies (still long enough to unpack as a packet,
+    # but the announce field slices fall short) validate False, no crash.
+    for cut in (5, 40, 80):
+        truncated = raw[:-cut]
+        v = sut.execute("announce_validate", raw=truncated.hex())
+        assert v["valid"] is False, f"truncated announce (-{cut} bytes) must validate False, got {v}"
+    # Negative: corrupt a byte inside the announced public key (data starts at
+    # offset 19 in a HEADER_1 packet) -> derived destination_hash + signature both
+    # fail; validate False without raising.
+    corrupted = bytearray(raw)
+    corrupted[25] ^= 0xFF
+    v = sut.execute("announce_validate", raw=bytes(corrupted).hex())
+    assert v["valid"] is False, f"corrupted-pubkey announce must validate False, got {v}"

@@ -10265,16 +10265,27 @@ def cmd_wire_get_received_packets(params):
     return {"packets": packets, "highest_seq": highest_seq}
 
 
+def cmd_wire_set_race_inducer(params):
+    """Test-instrumentation hook: install a timing race inducer on a seam.
+
+    The Python reference has no equivalent post-prove window to perturb, so this
+    is a no-op that simply echoes the requested seam/delay for cross-impl parity
+    (the kotlin bridge implements a real inducer; tests that drive it skip the
+    non-kotlin receiver). Named (not a lambda) so the delegation audit can
+    statically classify it — it reconstructs no protocol bytes and calls no RNS,
+    so it is GENUINE instrumentation, not handrolled protocol.
+    """
+    return {
+        "seam": params.get("seam"),
+        "delay_ms": int(params.get("delay_ms", 0)),
+    }
+
 
 WIRE_COMMANDS = {
     "wire_send_opportunistic": cmd_wire_send_opportunistic,
     "wire_opportunistic_poll": cmd_wire_opportunistic_poll,
     "wire_get_received_packets": cmd_wire_get_received_packets,
-    "wire_set_race_inducer": lambda params: {
-        # Python reference has no such race; accept + no-op for cross-impl parity.
-        "seam": params.get("seam"),
-        "delay_ms": int(params.get("delay_ms", 0)),
-    },
+    "wire_set_race_inducer": cmd_wire_set_race_inducer,
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
     "wire_start_local_client": cmd_wire_start_local_client,

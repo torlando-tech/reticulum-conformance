@@ -36,7 +36,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCAN_DIRS = ["tests"]
 SCAN_FILES = ["conformance.py", "bridge_client.py"]
 
-KT_ARM_RE = re.compile(r'"([a-z][a-z0-9_]*)"\s*->')
+# A `when` arm may carry MULTIPLE comma-separated literals before `->`
+# (e.g. `"wire_link_request", "wire_link_request_large" -> {`). Match the whole
+# literal group immediately preceding `->`, then pull every literal out of it,
+# so a multi-literal arm counts all its commands (the old single-literal regex
+# only saw the last one, producing a phantom "missing" for the others).
+KT_ARM_RE = re.compile(r'((?:"[a-z][a-z0-9_]*"\s*,\s*)*"[a-z][a-z0-9_]*")\s*->')
+KT_LITERAL_RE = re.compile(r'"([a-z][a-z0-9_]*)"')
 
 
 def suite_commands():
@@ -86,7 +92,9 @@ def kotlin_commands(kt_dir):
             if not f.endswith(".kt"):
                 continue
             with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
-                cmds.update(KT_ARM_RE.findall(fh.read()))
+                text = fh.read()
+            for group in KT_ARM_RE.findall(text):
+                cmds.update(KT_LITERAL_RE.findall(group))
     return cmds
 
 

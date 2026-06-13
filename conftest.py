@@ -192,7 +192,15 @@ def sut_impl_name(request):
     """The impl name this test's `sut` is parametrized with ('reference',
     'kotlin', ...). For impl-keyed xfails: assert the reference arm FIRST,
     then xfail the SUT arm, so the waiver never weakens reference pinning."""
-    return request.node.callspec.params.get("sut_impl", "reference")
+    # `callspec` is None for a non-parametrized item. Every current caller also
+    # requests `sut` (so pytest_generate_tests parametrizes sut_impl and sets
+    # callspec), but guard anyway so a future caller without `sut` cleanly
+    # defaults to "reference" rather than crashing with AttributeError at
+    # collection.
+    callspec = getattr(request.node, "callspec", None)
+    if callspec is None:
+        return "reference"
+    return callspec.params.get("sut_impl", "reference")
 
 
 # Utility functions for tests

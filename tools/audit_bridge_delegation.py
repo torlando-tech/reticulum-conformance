@@ -431,8 +431,9 @@ def classify_handler(
     target it transitively references (the live-instance loaders excepted) — see
     the module docstring for what each classification means.
 
-    Precedence: HANDROLLED > LIVE > REVIEW > GENUINE. HANDROLLED is checked
-    BEFORE LIVE on purpose: protocol reconstruction in this codebase happens
+    Precedence: pinned exceptions (MIRRORED, ADVERSARIAL — honest-by-exception,
+    matched by name first) > HANDROLLED > LIVE > REVIEW > GENUINE. HANDROLLED is
+    checked BEFORE LIVE on purpose: protocol reconstruction in this codebase happens
     inside handlers that *also* touch a live RNS instance, so scoring LIVE on the
     first live: signal would structurally hide exactly the hand-rolling this tool
     exists to catch. The KDF_PROTOCOL_REVIEW override then demotes a few

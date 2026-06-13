@@ -35,6 +35,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _rns_paths import resolve_rns_path  # noqa: E402
 
+# Shared IFAC derivation (this file's directory is on sys.path as the script
+# dir). Single source of truth with pipe_session.py — see integration/ifac_util.py.
+from ifac_util import configure_ifac  # noqa: E402
+
 # Make `import RNS` work in this process.
 sys.path.insert(0, resolve_rns_path())
 
@@ -184,13 +188,13 @@ def main():
     pipe_iface.owner = RNS.Transport
     reticulum._add_interface(pipe_iface, mode=iface_mode)
 
-    # Optional IFAC (Interface Access Code) masking, configured to match
-    # integration/pipe_session.py:_configure_ifac so the in-repo peer and the
-    # Python reference interoperate over an IFAC-protected link.
+    # Optional IFAC (Interface Access Code) masking via the shared derivation in
+    # integration/ifac_util.py, so the in-repo peer and the Python reference
+    # (pipe_session.py) interoperate over an IFAC-protected link with an
+    # identical key.
     ifac_passphrase = os.environ.get("PIPE_PEER_IFAC_PASSPHRASE")
     ifac_netname = os.environ.get("PIPE_PEER_IFAC_NETNAME")
-    if ifac_passphrase is not None or ifac_netname is not None:
-        _configure_ifac(RNS, pipe_iface, ifac_passphrase, ifac_netname)
+    configure_ifac(RNS, pipe_iface, ifac_passphrase, ifac_netname)
 
     handler = _AnnounceHandler(RNS)
     RNS.Transport.register_announce_handler(handler)
@@ -322,33 +326,6 @@ def main():
     else:
         emit({"type": "error", "message": f"Unknown action: {action}"})
         _path_table_dumper(RNS)
-
-
-def _configure_ifac(RNS, iface, passphrase, netname):
-    """Configure IFAC on a pipe interface.
-
-    Mirrors integration/pipe_session.py:_configure_ifac exactly (same HKDF
-    derivation and ifac_size=16) so this peer interoperates with the Python
-    reference over an IFAC-masked link. A non-matching passphrase/netname
-    derives a different key, so the reference rejects the peer's packets.
-    """
-    ifac_origin = b""
-    if netname is not None:
-        ifac_origin += RNS.Identity.full_hash(netname.encode("utf-8"))
-    if passphrase is not None:
-        ifac_origin += RNS.Identity.full_hash(passphrase.encode("utf-8"))
-
-    ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
-    ifac_key = RNS.Cryptography.hkdf(
-        length=64,
-        derive_from=ifac_origin_hash,
-        salt=RNS.Reticulum.IFAC_SALT,
-        context=None,
-    )
-
-    iface.ifac_key = ifac_key
-    iface.ifac_identity = RNS.Identity.from_bytes(ifac_key)
-    iface.ifac_size = 16
 
 
 class _AnnounceHandler:

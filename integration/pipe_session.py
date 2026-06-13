@@ -137,32 +137,13 @@ class PipeSession:
         self.reticulum = RNS.Reticulum(configdir=self._config_path, loglevel=RNS.LOG_CRITICAL)
 
     def _configure_ifac(self, passphrase, netname):
-        """Configure IFAC on the Python-side pipe interface."""
-        if passphrase is None and netname is None:
-            return
-        if self.pipe_iface is None:
-            return
+        """Configure IFAC on the Python-side pipe interface.
 
-        RNS = self.RNS
-
-        # Derive IFAC key exactly as Python Reticulum._add_interface does
-        ifac_origin = b""
-        if netname is not None:
-            ifac_origin += RNS.Identity.full_hash(netname.encode("utf-8"))
-        if passphrase is not None:
-            ifac_origin += RNS.Identity.full_hash(passphrase.encode("utf-8"))
-
-        ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
-        ifac_key = RNS.Cryptography.hkdf(
-            length=64,
-            derive_from=ifac_origin_hash,
-            salt=RNS.Reticulum.IFAC_SALT,
-            context=None,
-        )
-
-        self.pipe_iface.ifac_key = ifac_key
-        self.pipe_iface.ifac_identity = RNS.Identity.from_bytes(ifac_key)
-        self.pipe_iface.ifac_size = 16
+        Delegates to integration/ifac_util.py so the derivation stays byte-for-byte
+        identical to pipe_peer_local.py (shared single source of truth).
+        """
+        from .ifac_util import configure_ifac
+        configure_ifac(self.RNS, self.pipe_iface, passphrase, netname)
 
     def _create_pipe_interface(self):
         """Create StdioPipeInterface connected to subprocess stdin/stdout."""

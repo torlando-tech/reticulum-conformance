@@ -104,6 +104,7 @@ the second peer. The pytest `wire_peers` fixture does exactly this.
 
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import tempfile
@@ -789,8 +790,19 @@ def _pipe_command(read_fifo: str, write_fifo: str) -> str:
     announces + link establishment between two separate RNS processes over
     loopback (the only inter-process channel available to the separate-bridge-
     subprocess wire harness, which has no shared in-process Transport).
+
+    RNS runs this via ``subprocess.Popen(shlex.split(command), ...)`` — NO shell
+    — so the string must tokenize into ``['bash', '-c', <inner script>]``. Each
+    FIFO path is shlex.quote'd inside the inner script (so bash parses paths
+    containing spaces / `'` / `&` / `>` correctly, e.g. a macOS `/var/folders/…`
+    or custom TMPDIR), and the whole inner script is shlex.quote'd so shlex.split
+    keeps it as a single token. Quoting also moves any leading/trailing
+    whitespace inside quotes, so the ``command =`` value written to the RNS .ini
+    keeps clean boundaries. For ordinary mkdtemp paths the result is byte-for-byte
+    the previous ``bash -c 'cat … & cat > …'`` string.
     """
-    return f"bash -c 'cat {read_fifo} & cat > {write_fifo}'"
+    inner = f"cat {shlex.quote(read_fifo)} & cat > {shlex.quote(write_fifo)}"
+    return f"bash -c {shlex.quote(inner)}"
 
 
 def _write_pipe_relay_config(

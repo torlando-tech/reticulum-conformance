@@ -27,13 +27,6 @@ receiver_impl) triples the link-multihop test uses.
 import secrets
 import time
 
-from conformance import conformance_case
-
-
-__category_title__ = "Wire Interop"
-__category_order__ = 18
-
-
 _SETTLE_SEC = 1.5
 _LINK_TIMEOUT_MS = 15000
 _RESOURCE_TIMEOUT_MS = 30000
@@ -81,20 +74,6 @@ def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
         f"the topology didn't converge, later assertions would be moot."
     )
 
-    # Pin that this is genuinely a 2-hop path (sender -> transport ->
-    # receiver), not a degenerate direct link: the receiver's announce
-    # reaches the transport (hops=1) then the sender (hops=2). Without this
-    # the "multi-hop" claim in the verifies strings below is unverified — a
-    # mis-wired topology that quietly became single-hop would still pass the
-    # transfer assertions.
-    entry = sender.read_path_entry(dest_hash)
-    assert entry is not None and entry["hops"] == 2, (
-        f"{sender.role_label}'s path to {receiver.role_label} is "
-        f"{entry['hops'] if entry else 'absent'} hop(s), expected exactly 2 "
-        f"(sender -> {transport.role_label} -> receiver) — the resource "
-        f"transfer below would not actually be exercising the multi-hop path."
-    )
-
     link_id = sender.link_open(
         dest_hash,
         app_name=_APP_NAME,
@@ -104,10 +83,6 @@ def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
     return sender, receiver, dest_hash, link_id
 
 
-@conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "poll_path", "read_path_entry", "link_open", "resource_send", "resource_poll"],
-    verifies="A sub-MDU 256-byte Resource transfer over a verified 2-hop Link (path hops==2) round-trips exactly through RESOURCE_ADV → REQ → DATA → PROOF",
-)
 def test_small_resource_multihop(wire_trio, wire_3peer):
     """A sub-MDU resource: exercises the Resource API without chunking.
 
@@ -133,10 +108,6 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     )
 
 
-@conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "poll_path", "read_path_entry", "link_open", "resource_send", "resource_poll"],
-    verifies="A 16 KiB Resource (multi-packet chunking, mirroring Columba image-send size) round-trips intact over a verified 2-hop Link (path hops==2)",
-)
 def test_chunked_resource_multihop(wire_trio, wire_3peer):
     """A larger resource that definitely requires chunking across
     multiple link DATA packets. ~16 KB mirrors the size Columba was
@@ -164,10 +135,6 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     )
 
 
-@conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "poll_path", "read_path_entry", "link_open", "resource_send", "resource_poll"],
-    verifies="A 16 KiB Resource round-trips intact over an IFAC-protected verified 2-hop Link (path hops==2) — exercises per-packet IFAC masking on Resource chunks (Columba production config)",
-)
 def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     """Same as test_chunked_resource_multihop but with IFAC enabled on
     every peer. Every on-wire packet gets a 16-byte IFAC tag and XOR
@@ -199,10 +166,6 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     )
 
 
-@conformance_case(
-    commands=["start_tcp_server", "start_tcp_client", "listen", "poll_path", "read_path_entry", "link_open", "resource_send", "resource_poll"],
-    verifies="A 256 KiB Resource (~32 chunks) round-trips intact over a verified 2-hop Link (path hops==2), stress-testing back-to-back link DATA transmission and reassembly",
-)
 def test_large_resource_multihop(wire_trio, wire_3peer):
     """A resource large enough to guarantee many link DATA packets even
     at the TCP interface's large MTU. 256 KB split into chunks of

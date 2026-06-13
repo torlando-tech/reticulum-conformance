@@ -108,9 +108,17 @@ def kotlin_commands(kt_dir):
 #     Reticulum._synthesize_interface (reticulum-kt#config-ini-parser).
 #   - wire_mgmt_destinations: kotlin has no probe-responder / remote-management
 #     destination registration (reticulum-kt#kotlin-no-probe-remote-mgmt).
+#   - wire_send_opportunistic / wire_opportunistic_poll: the kotlin conformance
+#     bridge has no opportunistic SINGLE-destination send + receive-proof
+#     observability commands (the reference-only opportunistic-delivery harness).
+#     The tests that use them already skip/xfail on kotlin
+#     (tests/wire/test_opportunistic_proof.py), so this only documents the
+#     command-surface gap (reticulum-kt#wire-opportunistic-send).
 KNOWN_UNIMPLEMENTED = {
     "config_parse_interface": "reticulum-kt#config-ini-parser",
     "wire_mgmt_destinations": "reticulum-kt#kotlin-no-probe-remote-mgmt",
+    "wire_send_opportunistic": "reticulum-kt#wire-opportunistic-send",
+    "wire_opportunistic_poll": "reticulum-kt#wire-opportunistic-send",
 }
 
 

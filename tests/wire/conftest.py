@@ -59,6 +59,7 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("wire_pair", pairs, ids=ids, scope="function")
 
     _parametrize_wire_trio(metafunc)
+    _parametrize_wire_hub(metafunc)
     _parametrize_wire_shared_trio(metafunc)
 
 
@@ -717,6 +718,7 @@ class _WirePeer:
         enable_ratchets: bool = False,
         open_channel: bool = True,
         buffer_stream_ids: list | None = None,
+        proof_strategy: str | None = None,
     ) -> bytes:
         """Register an IN destination that accepts incoming Links.
 
@@ -766,6 +768,8 @@ class _WirePeer:
         # for the multi-reader stream-id filtering test.
         if buffer_stream_ids:
             params["buffer_stream_ids"] = [int(s) for s in buffer_stream_ids]
+        if proof_strategy is not None:
+            params["proof_strategy"] = proof_strategy
         resp = self.bridge.execute("wire_listen", **params)
         dest_hash = bytes.fromhex(resp["destination_hash"])
         self.listen_identities[dest_hash] = {
@@ -777,6 +781,173 @@ class _WirePeer:
             ),
         }
         return dest_hash
+
+    def send_opportunistic(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        data: bytes,
+        timeout_ms: int = 5000,
+    ) -> dict:
+        """Send an opportunistic SINGLE-destination DATA packet and wait
+        for the delivery proof.
+
+        Returns the bridge's response dict:
+          {"sent": bool, "delivered": bool, "status": str}
+        where status is "delivered", "timeout", or "send_failed". The
+        receiver must have a SINGLE destination at `destination_hash`
+        with proof emission enabled — for the Python bridge that means
+        proof_strategy="all" on wire_listen (default is PROVE_NONE).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_send_opportunistic",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            data=data.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def link_open(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        timeout_ms: int = 10000,
+    ) -> bytes:
+        """Open an outbound Link to a remote IN destination."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_link_open",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            timeout_ms=timeout_ms,
+        )
+        return bytes.fromhex(resp["link_id"])
+
+    def set_race_inducer(self, seam: str, delay_ms: int):
+        """Set a test-only race-inducer hook in the production code under test.
+
+        Used to deterministically widen narrow race windows so a regression
+        at a specific seam fails reliably instead of intermittently. Currently
+        instrumented seams (Kotlin only — Python no-ops):
+
+          "post-prove" — sleeps in receiver-side validateRequest after
+                         link.prove() returns, to verify that all bookkeeping
+                         needed for inbound DATA dispatch has completed by the
+                         time prove() returns (the invariant fixed in #54).
+        """
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_set_race_inducer",
+            handle=self.handle,
+            seam=seam,
+            delay_ms=int(delay_ms),
+        )
+
+    def link_send(self, link_id: bytes, data: bytes):
+        assert self.handle, "start_* must be called first"
+        self.bridge.execute(
+            "wire_link_send",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+        )
+
+    def link_poll(self, destination_hash: bytes, timeout_ms: int = 5000) -> list:
+        """Drain all link DATA received on `destination_hash` since last poll.
+
+        Returns ONLY single-packet data that arrived over an established
+        Link to this destination. Opportunistic-DATA delivered directly
+        to the SINGLE destination is buffered separately — drain via
+        `opportunistic_poll`. The split exists so a test that uses both
+        surfaces never accidentally sees the wrong stream.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_link_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("packets", [])]
+
+    def opportunistic_poll(
+        self, destination_hash: bytes, timeout_ms: int = 5000
+    ) -> list:
+        """Drain all opportunistic DATA received on `destination_hash`.
+
+        Counterpart to `link_poll`: returns only DATA packets that
+        arrived as opportunistic delivery (addressed directly to the
+        SINGLE destination, not routed through a Link). Used by
+        opportunistic-delivery tests to confirm the receiver actually
+        saw the payload.
+        """
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_opportunistic_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("packets", [])]
+
+    def resource_send(
+        self, link_id: bytes, data: bytes, timeout_ms: int = 30000
+    ) -> dict:
+        """Send arbitrary-size bytes via the RNS Resource API.
+
+        Returns the bridge's response dict with `success`, `status`,
+        `size`, `timed_out`. Used to exercise multi-packet chunked
+        transfer over a Link (the path LXMF uses for image/file
+        attachments).
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_resource_send",
+            handle=self.handle,
+            link_id=link_id.hex(),
+            data=data.hex(),
+            timeout_ms=timeout_ms,
+        )
+
+    def resource_poll(
+        self, destination_hash: bytes, timeout_ms: int = 30000
+    ) -> list:
+        """Drain all reassembled Resource payloads received on a listener."""
+        assert self.handle, "start_* must be called first"
+        resp = self.bridge.execute(
+            "wire_resource_poll",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            timeout_ms=timeout_ms,
+        )
+        return [bytes.fromhex(p) for p in resp.get("resources", [])]
+
+    def get_received_packets(self, since_seq: int = 0) -> dict:
+        """Return the inbound-tap packet list for this bridge process.
+
+        Every packet that the bridge handed to Transport.inbound — including
+        those that arrived on spawned TCPServerInterface children — is
+        recorded here. Tests use this to prove a hub did NOT forward a
+        packet to a peer that shouldn't have received it.
+
+        Returns:
+          {"packets": [{seq, timestamp_ms, raw_hex, packet_type,
+                        destination_hash_hex, context, interface_name}],
+           "highest_seq": int}
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_get_received_packets",
+            handle=self.handle,
+            since_seq=since_seq,
+        )
 
     def listening_identity(self, destination_hash: bytes) -> dict:
         """Return {identity_hash, public_key} for a destination this peer is
@@ -3005,6 +3176,83 @@ def wire_3peer(wire_trio):
         yield sender, transport, receiver
     finally:
         for peer in (sender, transport, receiver):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
+def _parametrize_wire_hub(metafunc):
+    """Parametrize 4-peer hub-isolation tests over the TRANSPORT impl only.
+
+    Sender/receiver/witness are pinned to the reference so the oracle is
+    stable. What we're proving is: given a known-correct set of endpoints,
+    does the middle hub fan packets out incorrectly? That question is a
+    property of the hub impl alone, so parameterizing across S/R/W would
+    just multiply work without adding signal. Each test runs once per
+    impl under test (e.g. "kotlin-hub", "reference-hub").
+    """
+    if "wire_hub_impl" not in metafunc.fixturenames:
+        return
+    impls = get_impl_list(metafunc.config) or []
+    peers = sorted(set(impls) | {"reference"})
+    ids = [f"{impl}-hub" for impl in peers]
+    metafunc.parametrize("wire_hub_impl", peers, ids=ids, scope="function")
+
+
+@pytest.fixture
+def wire_hub_impl(request):
+    """Impl under test for the middle hub in the 4-peer fixture."""
+    return request.param
+
+
+@pytest.fixture
+def wire_hub_isolation(wire_hub_impl):
+    """Four freshly-spawned bridges arranged as a star through one hub.
+
+    Topology::
+
+              sender (TCPClient, reference)
+                        \\
+                         v
+                transport (TCPServer, wire_hub_impl)
+                        ^ ^
+                       /   \\
+          receiver ---'     '--- witness
+          (TCPClient,           (TCPClient,
+           reference)            reference)
+
+    All three leaves share the transport as their only interface; the
+    transport is the only peer that listens. This is the minimum
+    topology that can distinguish "hub routed correctly to receiver"
+    from "hub incorrectly fanned out to witness too".
+
+    Yields (sender, transport, receiver, witness) as `_WirePeer` objects.
+    Caller is responsible for all start_tcp_* calls — the fixture only
+    spawns bridges and handles teardown.
+    """
+    hub_impl = wire_hub_impl
+    sender_impl = receiver_impl = witness_impl = "reference"
+    bridges = [
+        BridgeClient(resolve_command(sender_impl), env=_env_for(sender_impl)),
+        BridgeClient(resolve_command(hub_impl), env=_env_for(hub_impl)),
+        BridgeClient(resolve_command(receiver_impl), env=_env_for(receiver_impl)),
+        BridgeClient(resolve_command(witness_impl), env=_env_for(witness_impl)),
+    ]
+    sender = _WirePeer(bridges[0], role_label=f"sender({sender_impl})")
+    transport = _WirePeer(bridges[1], role_label=f"transport({hub_impl})")
+    receiver = _WirePeer(bridges[2], role_label=f"receiver({receiver_impl})")
+    witness = _WirePeer(bridges[3], role_label=f"witness({witness_impl})")
+
+    try:
+        yield sender, transport, receiver, witness
+    finally:
+        for peer in (sender, transport, receiver, witness):
             try:
                 peer.stop()
             except Exception:

@@ -223,7 +223,17 @@ ADVERSARIAL_CORRUPTORS: dict[str, str] = {
 # it did, any stray buffer idiom inside the loader would, under the
 # HANDROLLED-before-LIVE precedence, wrongly flip every LIVE handler that touches
 # RNS to HANDROLLED.)
-NO_RECURSE_HELPERS = LIVE_CALLS
+# Reference-bridge observability helpers invoked purely for side-effect by the
+# LIVE wire_start_* path: _install_inbound_tap wraps RNS.Transport.inbound to
+# RECORD every received packet (forwarding to the real inbound), and
+# _record_and_forward is that wrapper body. Their incidental header bit-parsing
+# (packet_type via `raw[0] & 0b11`, for the reference-only wire_get_received_packets
+# observable) is introspection, NOT protocol reconstruction by the command under
+# test — wire_start_* drive a live RNS.Reticulum. So their asm:* signals must not
+# propagate up and falsely flip the live start commands to HANDROLLED. Excluded
+# from transitive recursion, same as the live-instance loaders.
+OBSERVABILITY_HELPERS = {"_install_inbound_tap", "_record_and_forward"}
+NO_RECURSE_HELPERS = LIVE_CALLS | OBSERVABILITY_HELPERS
 
 
 def _dotted(node: ast.AST) -> str | None:

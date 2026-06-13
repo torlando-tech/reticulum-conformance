@@ -110,6 +110,7 @@ import socket
 import tempfile
 import threading
 import time
+from collections import deque
 
 
 _shared_wire_rns = None
@@ -117,6 +118,93 @@ _shared_wire_config_dir = None
 
 _instances = {}
 _instances_lock = threading.Lock()
+
+
+# Inbound packet tap: every frame that enters RNS.Transport.inbound from any
+# interface (including spawned TCPServerInterface children) is buffered here.
+# Used by conformance tests to prove that hub nodes don't fan out packets to
+# peers that shouldn't see them.
+_INBOUND_TAP_CAP = 1024
+_inbound_tap_buffer: deque = deque(maxlen=_INBOUND_TAP_CAP)
+_inbound_tap_seq = 0
+_inbound_tap_lock = threading.Lock()
+_inbound_tap_installed = False
+
+
+def _install_inbound_tap():
+    """Wrap RNS.Transport.inbound to record every received packet.
+
+    Safe to call multiple times; second+ calls are no-ops. Idempotent via
+    _inbound_tap_installed guard so _ensure_wire_rns_started can call it
+    unconditionally.
+    """
+    global _inbound_tap_installed
+    RNS = _get_rns()
+
+    # Read-check-swap under the tap lock so two concurrent callers can't
+    # both capture the original and stack two tap wrappers around it,
+    # which would double-record every packet.
+    with _inbound_tap_lock:
+        if _inbound_tap_installed:
+            return
+        original_inbound = RNS.Transport.inbound
+
+        def _tapped_inbound(raw, interface=None):
+            _record_and_forward(raw, interface, original_inbound)
+
+        RNS.Transport.inbound = _tapped_inbound
+        _inbound_tap_installed = True
+
+
+def _record_and_forward(raw, interface, original_inbound):
+    """Tap body extracted so _install_inbound_tap's critical section stays
+    small and easy to reason about under the lock.
+    """
+    global _inbound_tap_seq
+    try:
+        now_ms = int(time.time() * 1000)
+        packet_type = None
+        dest_hash_hex = None
+        context = None
+        # Header byte layout (RNS wire spec — Packet.py constants):
+        # the low 2 bits of byte 0 encode the packet type
+        # (DATA=0, ANNOUNCE=1, LINKREQUEST=2, PROOF=3). The mask
+        # 0b00000011 captures exactly bits 0-1. Other header flags
+        # (HEADER_TYPE, context flag, etc.) live in the remaining
+        # bits; we don't parse those here — tests that need them
+        # grep `raw_hex` directly.
+        if raw and len(raw) >= 2:
+            header = raw[0]
+            packet_type = header & 0b00000011
+            # Destination hash follows the header (+ optional IFAC bytes —
+            # we skip IFAC parsing since tests that care about dest match
+            # on raw_hex directly). raw[2:18] is dest hash in the no-IFAC
+            # case; best-effort.
+            if len(raw) >= 18:
+                dest_hash_hex = raw[2:18].hex()
+            if len(raw) >= 19:
+                context = raw[18]
+        iface_name = None
+        try:
+            iface_name = str(interface) if interface is not None else None
+        except Exception:
+            iface_name = None
+        with _inbound_tap_lock:
+            _inbound_tap_seq += 1
+            _inbound_tap_buffer.append({
+                "seq": _inbound_tap_seq,
+                "timestamp_ms": now_ms,
+                "raw_hex": raw.hex() if raw else "",
+                "packet_type": packet_type,
+                "destination_hash_hex": dest_hash_hex,
+                "context": context,
+                "interface_name": iface_name,
+            })
+    except Exception:
+        # The tap must never break routing. Swallow and carry on.
+        pass
+    return original_inbound(raw, interface)
+
 
 # Receiver-side ceiling applied to every inbound Resource's decompression bound
 # (RNS default is Resource.AUTO_COMPRESS_MAX_SIZE = 64 MiB, Resource.py:124/:364).
@@ -446,6 +534,7 @@ def _ensure_wire_rns_started(config_dir: str):
         configdir=config_dir,
         loglevel=ll,
     )
+    _install_inbound_tap()
     return _shared_wire_rns
 
 
@@ -1175,6 +1264,7 @@ def cmd_wire_listen(params):
             f"resource_strategy must be 'all', 'none' or 'app' (got {resource_strategy!r})"
         )
     enable_ratchets = bool(params.get("enable_ratchets", False))
+    proof_strategy_str = (params.get("proof_strategy") or "none").lower()
     # open_channel (default True): whether on_link_established calls
     # link.get_channel() on the inbound link. False reproduces a peer with NO
     # local channel, so an inbound CHANNEL-context packet is dropped WITHOUT a
@@ -1199,6 +1289,14 @@ def cmd_wire_listen(params):
         *aspects,
     )
 
+    if proof_strategy_str == "all":
+        destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
+    elif proof_strategy_str != "none":
+        raise ValueError(
+            f"Unsupported proof_strategy={proof_strategy_str!r}; "
+            f"expected 'none' or 'all'"
+        )
+
     # Enable ratchets BEFORE the immediate announce below, mirroring
     # cmd_wire_announce (so the announce carries the latest ratchet public key
     # and the destination owns a real ratchet store).
@@ -1212,6 +1310,7 @@ def cmd_wire_listen(params):
 
     # Per-destination receive buffers.
     recv_buffer = []         # single-packet link data
+    opportunistic_buffer = []  # opportunistic DATA to the SINGLE destination (no Link)
     resource_buffer = []     # completed resources (bytes)
     inbound_links = []        # RNS.Link objects accepted on this destination
     incoming_resources = []   # receiver-side Resource observation records
@@ -1226,6 +1325,13 @@ def cmd_wire_listen(params):
         "error": None,
     }
     recv_lock = threading.Lock()
+
+    # Opportunistic-DATA callback on the SINGLE destination itself (DATA not
+    # routed through a Link). Buffered separately from link recv_buffer.
+    def on_opportunistic_packet(message, _packet):
+        with recv_lock:
+            opportunistic_buffer.append(bytes(message))
+    destination.set_packet_callback(on_opportunistic_packet)
 
     strategy_const = {
         "all": RNS.Link.ACCEPT_ALL,
@@ -1392,6 +1498,7 @@ def cmd_wire_listen(params):
         "destination": destination,
         "identity": identity,
         "recv_buffer": recv_buffer,
+        "opportunistic_buffer": opportunistic_buffer,
         "resource_buffer": resource_buffer,
         "inbound_links": inbound_links,
         "incoming_resources": incoming_resources,
@@ -9994,7 +10101,180 @@ def cmd_wire_inject_raw_frame(params):
     return result
 
 
+def cmd_wire_send_opportunistic(params):
+    """Send an opportunistic SINGLE-destination DATA packet and wait for
+    delivery proof.
+
+    Mirrors what apps like LXMF do for opportunistic delivery: construct
+    an OUT SINGLE destination from a previously-received announce, build
+    a DATA packet (which auto-encrypts via Identity.encrypt), call
+    .send() to get a PacketReceipt, then wait for the receipt to fire
+    DELIVERED (the receiver's auto-proof must arrive and validate).
+
+    Params:
+      handle (str): bridge handle returned by wire_start_tcp_*
+      destination_hash (hex str): 16-byte SINGLE destination hash
+      app_name (str): destination app_name (must match listener)
+      aspects (list[str]): destination aspects (must match listener)
+      data (hex str): plaintext payload (will be encrypted by RNS)
+      timeout_ms (int, default 5000): how long to wait for the receipt
+        to fire DELIVERED before reporting timeout
+
+    Returns:
+      {sent: bool, delivered: bool, status: str}
+        status ∈ {"delivered", "timeout", "send_failed"}
+
+    Note: Identity.recall requires that an announce for `destination_hash`
+    has already been processed by Transport. Receiver should have called
+    wire_listen first, and the caller should poll wire_poll_path before
+    invoking this to make sure the announce has propagated.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data") or "")
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; ensure an "
+            f"announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    delivered = threading.Event()
+
+    def on_delivered(_receipt):
+        delivered.set()
+
+    def on_timeout(_receipt):
+        # Distinguish a CULLED receipt (no proof returned within receipt
+        # timeout) from successful delivery. We deliberately don't set
+        # the event here — main thread also polls receipt.status.
+        pass
+
+    packet = RNS.Packet(out_destination, payload)
+    # Receipt-timeout-budget on the receipt itself: leave RNS's default
+    # in place (it scales with hop count via TIMEOUT_PER_HOP). Our
+    # wait-for-event is what bounds the test wall-clock; if the
+    # receipt times out internally it'll set FAILED/CULLED status which
+    # we observe at the end.
+    receipt = packet.send()
+    if receipt is None or receipt is False:
+        return {"sent": False, "delivered": False, "status": "send_failed"}
+
+    receipt.set_delivery_callback(on_delivered)
+    receipt.set_timeout_callback(on_timeout)
+
+    fired = delivered.wait(timeout=timeout_ms / 1000.0)
+    if fired or receipt.status == RNS.PacketReceipt.DELIVERED:
+        status = "delivered"
+        delivered_flag = True
+    else:
+        # Receipt didn't resolve in our window. The status field will
+        # be SENT (still pending), CULLED (RNS internal timeout), or
+        # FAILED. All three mean "no valid proof arrived".
+        status = "timeout"
+        delivered_flag = False
+
+    # Keep the destination/identity alive for the receipt's lifetime so
+    # GC doesn't tear them down before a late proof arrives.
+    inst["destinations"].append((identity, out_destination))
+
+    return {"sent": True, "delivered": delivered_flag, "status": status}
+
+
+
+def cmd_wire_opportunistic_poll(params):
+    """Poll the opportunistic-DATA buffer for a listening destination.
+
+    Mirrors wire_link_poll but drains opportunistic-DATA packets (DATA
+    packets addressed directly to the SINGLE destination, not routed
+    through a Link). This is the receiver-side observable for
+    opportunistic delivery — counterpart to the sender-side
+    wire_send_opportunistic command.
+
+    Kept as a separate command from wire_link_poll so a single test that
+    uses both surfaces (opens a Link AND receives opportunistic DATA on
+    the same destination) can drain each unambiguously. Existing
+    wire_link_poll callers see no opportunistic traffic, and vice versa.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 5000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        with listener["recv_lock"]:
+            if listener["opportunistic_buffer"]:
+                out = [p.hex() for p in listener["opportunistic_buffer"]]
+                listener["opportunistic_buffer"].clear()
+                return {"packets": out}
+        time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        out = [p.hex() for p in listener["opportunistic_buffer"]]
+        listener["opportunistic_buffer"].clear()
+    return {"packets": out}
+
+
+
+def cmd_wire_get_received_packets(params):
+    """Return packets captured by the inbound tap on this bridge process.
+
+    Params:
+      since_seq (int, default 0): return only packets with seq > since_seq.
+
+    Returns:
+      {packets: [...], highest_seq: int}
+
+    The handle param is ignored — the tap is process-global (matches the
+    process-global RNS singleton). Tests with multiple instances per process
+    can still filter by interface_name if they need to.
+    """
+    since_seq = int(params.get("since_seq", 0))
+    with _inbound_tap_lock:
+        highest_seq = _inbound_tap_seq
+        packets = [p for p in _inbound_tap_buffer if p["seq"] > since_seq]
+    return {"packets": packets, "highest_seq": highest_seq}
+
+
+
 WIRE_COMMANDS = {
+    "wire_send_opportunistic": cmd_wire_send_opportunistic,
+    "wire_opportunistic_poll": cmd_wire_opportunistic_poll,
+    "wire_get_received_packets": cmd_wire_get_received_packets,
+    "wire_set_race_inducer": lambda params: {
+        # Python reference has no such race; accept + no-op for cross-impl parity.
+        "seam": params.get("seam"),
+        "delay_ms": int(params.get("delay_ms", 0)),
+    },
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
     "wire_start_local_client": cmd_wire_start_local_client,

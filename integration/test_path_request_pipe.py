@@ -43,7 +43,7 @@ def target_cmd(request):
     if cmd:
         return cmd
     home = os.path.expanduser("~")
-    swift_peer = os.path.join(home, "repos/reticulum-swift-lib/.build/release/PipePeer")
+    swift_peer = os.path.join(home, "repos/reticulum-swift/.build/release/PipePeer")
     if os.path.exists(swift_peer):
         return swift_peer
     return None

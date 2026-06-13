@@ -327,6 +327,92 @@ _Found 2026-06-10 during the conformance-suite completeness re-evaluation
 
 ---
 
+## 5. `Resource.__advertise_job` can overwrite a concurrent `cancel()` (lost cancellation / continued advertising)
+
+**Affected repo/version:** `markqvist/Reticulum` — RNS 1.3.1 (`RNS/Resource.py`),
+verified also present in the pinned 1.1.9 checkout.
+
+### Root cause
+
+`Resource.__advertise_job` (`RNS/Resource.py:520-541`) runs on a daemon thread.
+After the one-resource-at-a-time spin-wait
+
+```python
+while not self.link.ready_for_new_resource():
+    self.status = Resource.QUEUED
+    sleep(0.25)
+```
+
+it proceeds **unconditionally** — no re-check of `self.status`, no lock:
+
+```python
+self.advertisement_packet.send()
+...
+self.status = Resource.ADVERTISED
+self.retries_left = self.max_adv_retries
+self.link.register_outgoing_resource(self)
+```
+
+`Resource.cancel()` (`:1086-1097`) concurrently does, also unlocked:
+
+```python
+self.status = Resource.FAILED
+...
+self.link.cancel_outgoing_resource(self)
+```
+
+If `cancel()` interleaves with `__advertise_job` after the link becomes ready
+(or while it is exiting the spin loop), `__advertise_job` re-sets
+`status = ADVERTISED` and re-runs `register_outgoing_resource(self)`, silently
+overwriting the `FAILED` set by `cancel()` and re-registering a resource the
+caller already cancelled. The application's cancel callback has fired, yet the
+resource keeps advertising / transferring on the link. The GIL does not help:
+the window spans `send()` (I/O) and multiple method calls, none atomic together.
+
+### Repro
+
+Cancel a queued outgoing resource at the moment its link frees up
+(`link.ready_for_new_resource()` flips true): `cancel()` sets `FAILED`, then the
+daemon `__advertise_job` overwrites it with `ADVERTISED` and re-registers. The
+resource transfers despite the cancellation.
+
+### Suggested fix
+
+Re-check status (or hold a short lock) after the spin-wait, before send/register:
+
+```python
+def __advertise_job(self):
+    self.advertisement_packet = RNS.Packet(...)
+    while not self.link.ready_for_new_resource():
+        self.status = Resource.QUEUED
+        sleep(0.25)
+    if self.status != Resource.QUEUED:   # cancel()/reject() won during the wait
+        return
+    try:
+        ...
+        self.status = Resource.ADVERTISED
+        self.link.register_outgoing_resource(self)
+```
+
+A `threading.Lock` shared with `cancel()` around the guard+register+status-advance
+is the thorough fix.
+
+### Conformance-suite coverage note
+
+reticulum-kt mirrors this path faithfully and is **more** defensive than python
+(it adds `if status != QUEUED return` guards python lacks + `@Volatile status`),
+so its residual window is strictly narrower. Per the port's honesty rule we do
+**not** add a lock kotlin-side that python lacks — that would be a behavioral
+divergence. Tracked in reticulum-kt `port-deviations.md`
+("Resource.advertise spin-wait status guards … lock deliberately NOT added") and
+in reticulum-kt #80's review (Greptile codeReviewId 11045586, P1). Fix upstream
+first, then port the exact structure.
+
+_Found 2026-06-13 while triaging Greptile's review of reticulum-kt #80
+(conformance bridge full command surface)._
+
+---
+
 _Validated against RNS 1.3.1 + LXMF 0.9.9 (`~/.local/lib/python3.14/site-packages`).
 Line numbers refer to those installed sources; cross-check before filing if the
 upstream HEAD has since shifted._

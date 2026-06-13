@@ -38,7 +38,11 @@ import struct
 
 import pytest
 
-from RNS.vendor import umsgpack
+# Standalone u-msgpack-python (the exact library RNS vendors as
+# RNS.vendor.umsgpack; verified byte-identical packb). Imported standalone so
+# this module collects without RNS on the harness sys.path — the conformance
+# job (tests.yml) supplies RNS only to the bridge subprocess, not the harness.
+import umsgpack
 
 from conformance import conformance_case
 

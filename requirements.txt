@@ -1,2 +1,4 @@
 pytest>=7.0
 pygments>=2.18  # syntax highlighting for tools/generate_tests_html.py
+msgpack>=1.0  # INDEPENDENT third-party decoder for cross-checking RNS's encoding (tests/test_discovery_resolver_*.py)
+u-msgpack-python>=2.8  # standalone `import umsgpack` (same lib RNS vendors) for harness-side packb/unpackb without needing RNS on the harness sys.path (tests/wire/test_link2_hooks.py, test_resource_completeness.py)

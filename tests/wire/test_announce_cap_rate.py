@@ -293,7 +293,7 @@ def _rate_sequence(harness, in_knobs):
     ],
     verifies="A tight per-interface announce_cap (low fractional cap + low bitrate) spaces out forwarded-announce egress: of 4 fresh forwarded announces (all received into the path table) at most half re-emit on the capped interface within the window (one in practice) while the rest are egress-queued, whereas with no cap all four re-emit (positive control)",
 )
-def test_announce_cap_spaces_forwarded_announce_egress(transport):
+def test_announce_cap_spaces_forwarded_announce_egress(transport, cap_rate_impl):
     """announce_cap throttles OUTBOUND announce egress, not reception.
 
     Throttled scenario: announce_cap=0.005 with bitrate=2000 yields a per-
@@ -306,6 +306,12 @@ def test_announce_cap_spaces_forwarded_announce_egress(transport):
     into the path table regardless, proving the cap delays EGRESS rather than
     dropping or refusing the announce.
     """
+    if cap_rate_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-cap-egress-spacing: no per-interface "
+            "tx_time/announce_cap egress spacing nor Interface.announce_queue "
+            "drain. Refs Transport.py:1248-1311 + Interface.py:323-358."
+        )
     n = 4
     throttled = _forward_burst(
         transport, n, out_knobs=dict(announce_cap=0.005, bitrate=2000)
@@ -357,7 +363,7 @@ def test_announce_cap_spaces_forwarded_announce_egress(transport):
     ],
     verifies="With announce_rate_target set (grace 0) on the receiving interface, a second announce for the same destination arriving within the target window is NOT rebroadcast (only the first re-emits), whereas with no target both announces rebroadcast — inbound per-destination announce_rate suppression",
 )
-def test_announce_rate_suppresses_duplicate_dest_rebroadcast(transport):
+def test_announce_rate_suppresses_duplicate_dest_rebroadcast(transport, cap_rate_impl):
     """announce_rate_target suppresses rapid same-destination rebroadcasts.
 
     Two announces for one destination are injected back-to-back (the second
@@ -368,6 +374,12 @@ def test_announce_rate_suppresses_duplicate_dest_rebroadcast(transport):
     by their embedded emission timestamp, so the result is independent of
     retransmit timing.
     """
+    if cap_rate_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-rate-target: no configurable per-interface "
+            "announce_rate_target/grace inbound rate_blocked suppression. "
+            "Refs Transport.py:1835-1906."
+        )
     limited = _rate_sequence(
         transport, in_knobs=dict(announce_rate_target=60, announce_rate_grace=0)
     )

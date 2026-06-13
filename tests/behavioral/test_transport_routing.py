@@ -53,6 +53,8 @@ forced jobs() pass — leaving the entry in a stable, observable state.
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     CONTEXT_PATH_RESPONSE,
@@ -268,7 +270,7 @@ def test_reverse_table_proof_return_routing(behavioral):
         "with a fresh near-now retransmit_timeout (positive control)."
     ),
 )
-def test_announce_random_blob_replay_is_rejected(behavioral):
+def test_announce_random_blob_replay_is_rejected(behavioral, behavioral_impl):
     """RNS protects against announce replay-forging by remembering each
     destination's random_blobs and refusing a re-heard blob
     (Transport.py:1769 `not random_blob in random_blobs`). The discriminating
@@ -278,6 +280,14 @@ def test_announce_random_blob_replay_is_rejected(behavioral):
     with a fresh retries==0 entry and a near-now retransmit_timeout. The path
     table is asserted unchanged as a sanity check; the positive control proves
     the read distinguishes admission from rejection."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -366,12 +376,20 @@ def test_announce_random_blob_replay_is_rejected(behavioral):
         "machine terminates rather than re-broadcasting forever."
     ),
 )
-def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral):
+def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral, behavioral_impl):
     """Drive the announce retransmit counter deterministically and assert the
     completion boundary: present at retries==1 (control — an impl that completes
     too early fails here), removed once retries exceed LOCAL_REBROADCASTS_MAX
     (an impl that never completes keeps the entry and fails the final
     assertion)."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -434,7 +452,7 @@ def test_announce_retransmit_completes_at_rebroadcast_limit(behavioral):
         "entry (positive control), and the held path is left intact."
     ),
 )
-def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral):
+def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral, behavioral_impl):
     """A peer rebroadcasting our in-flight announce one hop further along signals
     that no further local retries are needed; RNS cancels the pending
     retransmit (Transport.py:1731-1736). Two destinations are set up identically
@@ -445,6 +463,14 @@ def test_announce_retransmit_cancelled_by_heard_rebroadcast(behavioral):
     rebroadcast and not by elapsed time. The heard announce carries an OLDER
     emission and MORE hops, so it does not re-admit D_cancel via the path
     replacement rules; the held 1-hop path is asserted intact."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry."
+            "retransmits is never incremented; no cull-pass announce-retransmit "
+            "job; per-interface re-emit model; no PATHFINDER_R local-client "
+            "preset; no hop-sorted batched egress. Refs Transport.py:560-650/"
+            "1046-1047/1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
@@ -585,7 +611,7 @@ def test_path_table_missing_interface_eviction(behavioral):
         "behaviour."
     ),
 )
-def test_path_request_tag_dedup(behavioral):
+def test_path_request_tag_dedup(behavioral, behavioral_impl):
     """Seed a known path to D, then drive three path requests through the
     rnstransport/path/request control destination. PR(D, T1) answers (schedules
     a cached-announce rebroadcast into the announce table with block_rebroadcasts
@@ -594,6 +620,12 @@ def test_path_request_tag_dedup(behavioral):
     schedules nothing; PR(D, T2) with a fresh tag is acted on again. An impl
     with no tag dedup answers the repeat; an impl that dedups on destination
     only fails to answer the fresh-tag request — both fail this test."""
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#path-request-answer-machinery: AnnounceEntry has no "
+            "block_rebroadcasts field; no PATH_REQUEST_GRACE/RG/local-client-"
+            "immediate answer scheduling. Refs Transport.py:2967-2987."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")

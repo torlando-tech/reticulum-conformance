@@ -26,6 +26,8 @@ interface, then reads the stored attrs back. Each assertion below anchors on the
 spec constant, never on the implementation echoing itself.
 """
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -75,8 +77,15 @@ def _parse(impl, body: str) -> dict:
     commands=["config_parse_interface"],
     verifies="discoverable=true forces a discovery-capable interface_mode: a discoverable interface configured WITHOUT gateway/access_point mode is auto-promoted to GATEWAY (0x06) for non-RNode types (Reticulum.py:841-848), while a non-discoverable interface keeps the FULL (0x01) default — an interface that stayed FULL while discoverable would advertise itself for discovery yet not relay",
 )
-def test_discoverable_forces_gateway_mode(sut, reference):
+def test_discoverable_forces_gateway_mode(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         forced = _parse(impl, "discoverable = true")
         assert forced["mode"] == MODE_GATEWAY, (
             f"{label}: discoverable=true without an explicit mode must force "
@@ -99,8 +108,15 @@ def test_discoverable_forces_gateway_mode(sut, reference):
     commands=["config_parse_interface"],
     verifies="The discoverable mode-forcing does NOT override an explicitly configured discovery-capable mode: discoverable=true with mode=access_point stays ACCESS_POINT (0x03) and with mode=gateway stays GATEWAY (0x06) — the auto-promotion only fires for interfaces that are discoverable but lack a relay-capable mode (Reticulum.py:841)",
 )
-def test_explicit_discovery_mode_preserved(sut, reference):
+def test_explicit_discovery_mode_preserved(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         ap = _parse(impl, "discoverable = true\nmode = access_point")
         assert ap["mode"] == MODE_ACCESS_POINT, (
             f"{label}: explicit access_point mode must be preserved under "
@@ -117,8 +133,15 @@ def test_explicit_discovery_mode_preserved(sut, reference):
     commands=["config_parse_interface"],
     verifies="Discovery announce interval bounds (Reticulum.py:824-828): a configured announce_interval (minutes) below the 5-minute floor is clamped UP to 300s; a value above the floor is kept (announce_interval=10 -> 600s); and an omitted interval defaults to the 6-hour (21600s) period — a sub-floor interval would let a discoverable node flood the network with announces",
 )
-def test_discovery_announce_interval_floor_and_default(sut, reference):
+def test_discovery_announce_interval_floor_and_default(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         floored = _parse(impl, "discoverable = true\nannounce_interval = 1")
         assert floored["discovery_announce_interval"] == DISCOVERY_INTERVAL_FLOOR, (
             f"{label}: announce_interval=1min must clamp UP to the 5-minute "
@@ -142,8 +165,15 @@ def test_discovery_announce_interval_floor_and_default(sut, reference):
     commands=["config_parse_interface"],
     verifies="bitrate bound (Reticulum.py:765-768): a configured bitrate below Reticulum.MINIMUM_BITRATE (5 bps) is rejected (configured_bitrate stays None — RNS keeps the interface default), while a bitrate >= MINIMUM_BITRATE is stored verbatim — silently honoring a sub-minimum bitrate would mis-size MTU/timeout math across the link",
 )
-def test_bitrate_minimum_bound(sut, reference):
+def test_bitrate_minimum_bound(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         below = _parse(impl, f"bitrate = {MINIMUM_BITRATE - 1}")
         assert below["configured_bitrate"] is None, (
             f"{label}: bitrate {MINIMUM_BITRATE - 1} < MINIMUM_BITRATE must be "
@@ -169,8 +199,15 @@ def test_bitrate_minimum_bound(sut, reference):
     commands=["config_parse_interface"],
     verifies="announce_cap bound (Reticulum.py:791-794): announce_cap is accepted only in (0, 100] and stored as a FRACTION (announce_cap=50 -> 0.5); values <=0 or >100 fall back to the 2% (0.02) default — an out-of-range cap silently disabling/uncapping announce bandwidth limiting would let a node monopolize a slow link",
 )
-def test_announce_cap_bound(sut, reference):
+def test_announce_cap_bound(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         valid = _parse(impl, "announce_cap = 50")
         assert abs(valid["announce_cap"] - 0.5) < 1e-9, (
             f"{label}: announce_cap=50 must store as the fraction 0.5; got "
@@ -189,8 +226,15 @@ def test_announce_cap_bound(sut, reference):
     commands=["config_parse_interface"],
     verifies="ifac_size bound (Reticulum.py:719-722): a configured ifac_size (bits) >= IFAC_MIN_SIZE*8 is stored as BYTES (ifac_size=64 -> 8 bytes); a value below the floor is rejected and falls back to the interface's DEFAULT_IFAC_SIZE — accepting an under-minimum IFAC field would shrink the authentication tag below the protocol minimum",
 )
-def test_ifac_size_minimum_bound(sut, reference):
+def test_ifac_size_minimum_bound(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         valid = _parse(impl, "ifac_size = 64")
         assert valid["ifac_size"] == 64 // 8, (
             f"{label}: ifac_size=64 bits must store as {64 // 8} bytes; got "

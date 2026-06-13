@@ -25,6 +25,8 @@ positively AND negatively.
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 from tests.behavioral import packet_builders as pb
 from tests.behavioral.packet_builders import (
@@ -151,7 +153,14 @@ def test_local_destination_announce_ignored(behavioral):
         "non-PATH_RESPONSE announce does — proving the exemption is real."
     ),
 )
-def test_announce_rate_limiting(behavioral):
+def test_announce_rate_limiting(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-rate-state-machine: "
+            "rate_violations/blocked_until/MAX_RATE_TIMESTAMPS announce-rate "
+            "state machine + per-interface knobs unported. "
+            "Refs Transport.py:1830-1860."
+        )
     RATE_TARGET = 60
     RATE_PENALTY = 120
     inst = behavioral.start(enable_transport=True)

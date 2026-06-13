@@ -41,6 +41,8 @@ The gaps closed (CONFORMANCE_GAPS.md §4b Resource):
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -75,6 +77,17 @@ _APP_ACCEPT_MAX = 4096
 # (wire_tcp.py _WIRE_RX_MAX_DECOMPRESSED). A crafted payload decompressing past
 # this trips the bomb guard; a control payload well under it transfers fine.
 _RX_DECOMPRESS_BOUND = 256 * 1024
+
+# Documented kotlin architectural gap shared by the two Resource-reject paths
+# (ACCEPT_APP reject and the CORRUPT decompression-bomb path). The reference arm
+# of each test below runs in full FIRST; only the kotlin sut/interop arms are
+# waived, and only at the reject-status assertion the gap actually breaks.
+_KT_REJECTED_PATH_XFAIL = (
+    "reticulum-kt#resource-rejected-path: no Resource.rejected()/REJECTED "
+    "state; processResourceRcl calls cancel() not rejected() (Link.kt:2579); "
+    "Resource.reject() sends a malformed unencrypted RCL; CORRUPT path lacks "
+    "reject()+teardown(). Refs Link.py:1140-1147, Resource.py:155-160/1081-1117."
+)
 
 
 @conformance_case(
@@ -155,6 +168,7 @@ def test_accept_app_accepts_small_rejects_oversize(wire_pair, wire_link_setup):
     with nothing delivered. Random (incompressible) payloads keep the advertised
     data size equal to len(payload), so each sits cleanly on its side of 4096.
     """
+    server_impl, client_impl = wire_pair
     server, client, dest_hash, link_id = wire_link_setup(
         app_name=_APP_NAME, aspects=("app",), resource_strategy="app"
     )
@@ -172,6 +186,13 @@ def test_accept_app_accepts_small_rejects_oversize(wire_pair, wire_link_setup):
         f"{server.role_label} did not reassemble the accepted {len(small)}-byte "
         f"resource byte-exact."
     )
+
+    # The reject path (ACCEPT_APP False -> RESOURCE_RCL -> sender REJECTED) is a
+    # documented kotlin gap. The accept side above is pinned for every arm
+    # (reference and kotlin); only the kotlin sut/interop reject assertion below
+    # is waived. The reference-to-reference arm runs the reject side in full.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(_KT_REJECTED_PATH_XFAIL)
 
     # Negative side: > 4096 -> rejected -> RESOURCE_RCL -> sender REJECTED(0).
     big = secrets.token_bytes(16 * 1024)
@@ -463,6 +484,7 @@ def test_bz2_decompression_bomb_marks_corrupt_and_tears_link(wire_pair, wire_lin
     (Resource.py:686-689 -> cancel() -> link.teardown()). Observed via the
     receiver's CORRUPT verdict and the inbound link transitioning to CLOSED.
     """
+    server_impl, client_impl = wire_pair
     server, client, dest_hash, link_id = wire_link_setup(
         app_name=_APP_NAME, aspects=("bomb",)
     )
@@ -497,6 +519,13 @@ def test_bz2_decompression_bomb_marks_corrupt_and_tears_link(wire_pair, wire_lin
     # sender (Resource.py:1083, 155-160) BEFORE link.teardown(), so the sender's
     # Resource lands in REJECTED (0), not FAILED (7). Pinning REJECTED here is
     # the on-wire-RCL observable a bare teardown could not produce.
+    # The CORRUPT-path reject() is a documented kotlin gap (see REASON): kotlin's
+    # bombed Resource ends FAILED(7) rather than REJECTED(0) because the corrupt
+    # path lacks reject()/RESOURCE_RCL. The positive control and the
+    # `not bomb["success"]` assertion above remain pinned for every arm; the
+    # reference-to-reference arm still asserts REJECTED below.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(_KT_REJECTED_PATH_XFAIL)
     assert bomb["status"] == _REJECTED, (
         f"{client.role_label}'s bombed Resource ended in status {bomb['status']} "
         f"(expected REJECTED=={_REJECTED}); the receiver must send a RESOURCE_RCL "

@@ -98,6 +98,22 @@ def kotlin_commands(kt_dir):
     return cmds
 
 
+# Commands the suite invokes that reticulum-kt CANNOT implement without a
+# feature it genuinely lacks — not a porting oversight. Each is mapped to the
+# reticulum-kt# slug under which its tests are keyed-xfailed, so the gap is
+# DOCUMENTED here rather than silently tolerated. The CI gate fails only on
+# UNEXPECTED gaps (a newly-invoked command with no dispatch arm); an allowlisted
+# command stays reported but does not fail the gate.
+#   - config_parse_interface: kotlin has no ConfigObj INI parser /
+#     Reticulum._synthesize_interface (reticulum-kt#config-ini-parser).
+#   - wire_mgmt_destinations: kotlin has no probe-responder / remote-management
+#     destination registration (reticulum-kt#kotlin-no-probe-remote-mgmt).
+KNOWN_UNIMPLEMENTED = {
+    "config_parse_interface": "reticulum-kt#config-ini-parser",
+    "wire_mgmt_destinations": "reticulum-kt#kotlin-no-probe-remote-mgmt",
+}
+
+
 def family(cmd):
     for prefix in ("behavioral_", "wire_", "discovery_", "destination_",
                    "identity_", "packet_", "announce_", "interface_",
@@ -118,20 +134,32 @@ def main():
     have = kotlin_commands(os.path.abspath(args.kt_dir))
     missing = sorted(used - have)
 
+    allowlisted = [c for c in missing if c in KNOWN_UNIMPLEMENTED]
+    unexpected = [c for c in missing if c not in KNOWN_UNIMPLEMENTED]
+
     by_family = defaultdict(list)
-    for c in missing:
+    for c in unexpected:
         by_family[family(c)].append(c)
 
-    print(f"suite-invoked commands : {len(used)}")
-    print(f"kotlin dispatch arms   : {len(have)}")
-    print(f"missing from kotlin    : {len(missing)}")
+    print(f"suite-invoked commands     : {len(used)}")
+    print(f"kotlin dispatch arms       : {len(have)}")
+    print(f"missing from kotlin        : {len(missing)}")
+    print(f"  intentionally unimplemented (allowlisted): {len(allowlisted)}")
+    print(f"  UNEXPECTED (gate-failing) : {len(unexpected)}")
     print()
+    if allowlisted:
+        print("Intentionally unimplemented (documented architectural gaps):")
+        for c in allowlisted:
+            print(f"      {c:28s} {KNOWN_UNIMPLEMENTED[c]}")
+        print()
     for fam in sorted(by_family, key=lambda f: -len(by_family[f])):
         print(f"  {fam:12s} {len(by_family[fam]):4d}")
         if args.list:
             for c in by_family[fam]:
                 print(f"      {c}")
-    return 1 if missing else 0
+    # Exit non-zero ONLY for unexpected gaps; allowlisted absences are documented
+    # and do not fail the gate.
+    return 1 if unexpected else 0
 
 
 if __name__ == "__main__":

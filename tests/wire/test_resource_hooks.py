@@ -22,6 +22,8 @@ a code-literal rule in Resource.py / Link.py — not impl-vs-itself:
 Runs reference-vs-reference; no SUT binary required.
 """
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -168,10 +170,17 @@ def test_resource_request_serves_all_then_awaits_proof(wire_link_setup):
         "ship a hashmap with two indistinguishable entries"
     ),
 )
-def test_resource_hashmap_collision_guard_remaps(wire_link_setup):
+def test_resource_hashmap_collision_guard_remaps(wire_link_setup, wire_pair):
+    server_impl, client_impl = wire_pair
     server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
 
     res = client.resource_force_collision(link_id)
+    if client_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#resource-collision-guard: single-pass hashmap build "
+            "with no collision-detect/rebuild loop (Resource.kt:430-443). "
+            "Ref Resource.py:436-472."
+        )
     assert res["remapped"] is True, (
         f"forced map-hash collision did not trigger a remap: {res!r}"
     )

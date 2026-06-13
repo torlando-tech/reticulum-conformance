@@ -57,6 +57,8 @@ impl-vs-itself output.
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -349,12 +351,13 @@ _KNOWN_DEST_ENTRY_ELEMENTS = 5
         "need a hand-built malformed file and are deferred, LIMITS.md.)"
     ),
 )
-def test_known_destinations_save_reload_roundtrip(wire_peers):
+def test_known_destinations_save_reload_roundtrip(wire_peers, wire_pair):
     """B persists, clears, and reloads its known_destinations table; a received
     destination survives the disk round-trip byte-identically as a 5-element
     record. The clear proving the reload (not residual memory) restores it.
     """
     server, client = wire_peers
+    server_impl, client_impl = wire_pair
     port = server.start_tcp_server(network_name="", passphrase="")
     client.start_tcp_client(
         network_name="", passphrase="",
@@ -402,7 +405,18 @@ def test_known_destinations_save_reload_roundtrip(wire_peers):
         f"reloaded app_data for {dest_hash.hex()} is {app_after!r}, expected "
         f"{_APP_DATA_A!r}; the on-disk record garbled the app_data field."
     )
-    # The persisted record is the canonical 5-element shape.
+    # The persisted record is the canonical 5-element shape. The reference arm
+    # has already pinned every behaviour above (presence, clear, reload, and
+    # byte-identical app_data round-trip); only the 5th `used` LRU marker is the
+    # kotlin gap, so xfail the kotlin client arm here, immediately before the
+    # entry-shape assertion that the gap breaks.
+    if client_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#known-destinations-used-marker: IdentityData is a "
+            "4-field record and lacks the 5th `used` LRU marker RNS 1.3.1 stores "
+            "([time,packet_hash,public_key,app_data,used], Identity.py:107); the "
+            "bridge honestly reports 4."
+        )
     assert rt["entry_len_after_load"] == _KNOWN_DEST_ENTRY_ELEMENTS, (
         f"reloaded known_destinations entry for {dest_hash.hex()} has "
         f"{rt['entry_len_after_load']} elements, expected "

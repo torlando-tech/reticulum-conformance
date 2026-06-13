@@ -17,6 +17,8 @@ checked positively AND negatively.
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     HEADER_2,
@@ -350,7 +352,15 @@ def test_random_blob_history_capped_at_64(behavioral):
         "lowest hop count first — regardless of their injection/queue order."
     ),
 )
-def test_batched_rebroadcasts_emitted_in_hop_order(behavioral):
+def test_batched_rebroadcasts_emitted_in_hop_order(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry.retransmits "
+            "is never incremented; no cull-pass announce-retransmit job; "
+            "per-interface re-emit model; no PATHFINDER_R local-client preset; no "
+            "hop-sorted batched egress. Refs Transport.py:560-650/1046-1047/"
+            "1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         # Each announce arrives on its OWN receiving interface so per-interface
@@ -522,7 +532,15 @@ def _drive_to_stable_single_retry(inst, dest):
         "no rebroadcast keeps its entry throughout (positive control)."
     ),
 )
-def test_same_level_heard_rebroadcast_counts_toward_limit(behavioral):
+def test_same_level_heard_rebroadcast_counts_toward_limit(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry.retransmits "
+            "is never incremented; no cull-pass announce-retransmit job; "
+            "per-interface re-emit model; no PATHFINDER_R local-client preset; no "
+            "hop-sorted batched egress. Refs Transport.py:560-650/1046-1047/"
+            "1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")

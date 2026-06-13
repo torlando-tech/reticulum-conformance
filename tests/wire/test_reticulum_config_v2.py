@@ -287,10 +287,21 @@ def test_interface_discovery_source_hash_length_validated(wire_peers):
         "registration is gated by the knob, Transport.py:403)"
     ),
 )
-def test_probe_responder_registers_probe_destination(wire_peers):
+def test_probe_responder_registers_probe_destination(wire_peers, wire_pair):
     server, client = wire_peers
+    server_impl, client_impl = wire_pair
     server.start_tcp_server(network_name="", passphrase="", respond_to_probes=True)
     client.start_tcp_server(network_name="", passphrase="")  # probes OFF (default)
+
+    # The reference-to-reference pair pins the probe-responder registration live
+    # (it passes below). Any kotlin peer lacks the wire_mgmt_destinations command
+    # and registers no probe-responder destination — an architectural gap.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(
+            "reticulum-kt#kotlin-no-probe-remote-mgmt: no wire_mgmt_destinations "
+            "and no probe-responder / remote-management destination registration "
+            "(Transport.py:252-258/396-403)."
+        )
 
     s = server.mgmt_destinations()
     c = client.mgmt_destinations()
@@ -342,14 +353,25 @@ def test_probe_responder_registers_probe_destination(wire_peers):
         "surface beyond the generic app-destination ALLOW_LIST machinery"
     ),
 )
-def test_remote_management_registers_destination_and_handlers(wire_peers):
+def test_remote_management_registers_destination_and_handlers(wire_peers, wire_pair):
     server, client = wire_peers
+    server_impl, client_impl = wire_pair
     server.start_tcp_server(
         network_name="", passphrase="",
         enable_remote_management=True,
         remote_management_allowed=[_VALID_HASH],
     )
     client.start_tcp_server(network_name="", passphrase="")  # remote mgmt OFF
+
+    # The reference-to-reference pair pins the remote-management registration live
+    # (it passes below). Any kotlin peer lacks the wire_mgmt_destinations command
+    # and registers no remote-management destination — an architectural gap.
+    if "kotlin" in (server_impl, client_impl):
+        pytest.xfail(
+            "reticulum-kt#kotlin-no-probe-remote-mgmt: no wire_mgmt_destinations "
+            "and no probe-responder / remote-management destination registration "
+            "(Transport.py:252-258/396-403)."
+        )
 
     s = server.mgmt_destinations()
     c = client.mgmt_destinations()

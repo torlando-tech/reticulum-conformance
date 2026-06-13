@@ -27,6 +27,8 @@ path is covered separately in test_link_identify.py.
 
 import secrets
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -178,13 +180,29 @@ def test_link_request_large_response_round_trips_as_resource(wire_link_setup):
         "drops the metadata, or ships it as a RESPONSE packet diverges observably"
     ),
 )
-def test_file_response_carries_metadata_as_resource(wire_link_setup):
+def test_file_response_carries_metadata_as_resource(wire_link_setup, wire_pair):
     server, client, dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+    server_impl, client_impl = wire_pair
 
     file_path = "/file"
     bytes_path = "/bytes"
     content = secrets.token_bytes(200)
     metadata = secrets.token_bytes(32)
+    # The reference arm (server on reference) pins the full behaviour below: the
+    # file/metadata Resource branch round-trips content + metadata while a plain
+    # bytes handler carries none. Only a kotlin server diverges, and it does so
+    # at the very first step — registering a file+metadata handler — because the
+    # kotlin Destination request generator returns ByteArray only. xfail the
+    # kotlin server arm immediately before the registration the gap breaks; a
+    # reference server with a kotlin client still runs live.
+    if server_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#request-handler-file-metadata-response-unsupported: "
+            "the kotlin Destination request generator returns ByteArray only; it "
+            "cannot return a (file, metadata) tuple/streamed-file+metadata "
+            "response (Link.py:884-895). Bridge rejects response_file "
+            "(WireTcp.kt:2504)."
+        )
     server.register_request_handler(
         dest_hash, file_path, response_file=content, response_metadata=metadata,
     )

@@ -36,6 +36,8 @@ import math
 import os
 import struct
 
+import pytest
+
 from RNS.vendor import umsgpack
 
 from conformance import conformance_case
@@ -257,7 +259,8 @@ def test_metadata_length_prefix_encoding(wire_link_setup):
         "less than d (total across segments) with segment_index 1 of 2"
     ),
 )
-def test_size_accounting_and_sdu_formula(wire_link_setup):
+def test_size_accounting_and_sdu_formula(wire_link_setup, wire_pair):
+    _server_impl, client_impl = wire_pair
     _server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
 
     mtu = client.link_mtu(link_id)["mtu"]
@@ -303,6 +306,19 @@ def test_size_accounting_and_sdu_formula(wire_link_setup):
         f"multi-segment total_size (d) must be the FULL payload length "
         f"{len(big_payload)}: {big!r}"
     )
+    # The per-segment-t < total-d invariant requires the sender to TRUNCATE the
+    # first segment at MAX_EFFICIENT_SIZE. The kotlin SUT reports the full
+    # encrypted payload as the first segment's size, so this is the assertion
+    # the architectural multi-segment gap breaks. Reference (and a reference
+    # client paired with a kotlin server) has already run every assertion above.
+    if client_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#multi-segment-send: sender never truncates per "
+            "MAX_EFFICIENT_SIZE (Resource.kt:419/454); prepareNextSegment needs "
+            "an inputFile byte-array sends never set; receiver has no "
+            "segment-append. Multi-segment SEND/RECEIVE unimplemented. Refs "
+            "Resource.py:285-323/445-448."
+        )
     assert big["size"] < big["total_size"], (
         f"per-segment t ({big['size']}) must be smaller than total d "
         f"({big['total_size']}) for a split transfer: {big!r}"

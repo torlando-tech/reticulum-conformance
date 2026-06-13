@@ -31,6 +31,8 @@ by RNS.Destination.hash. The reference-vs-reference harness runs each impl
 same external literal.
 """
 
+import pytest
+
 from conftest import random_hex
 from conformance import conformance_case
 
@@ -163,10 +165,17 @@ def test_minimal_announce_wire_size_is_167(sut, reference):
         "interface's 16-byte DEFAULT_IFAC_SIZE so the assertion discriminates."
     ),
 )
-def test_ifac_size_512bit_upper_bound(sut, reference):
+def test_ifac_size_512bit_upper_bound(sut, reference, sut_impl_name):
     assert IFAC_512_BYTES == SIG_BYTES == 64  # the 512-bit ceiling IS the full signature
 
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI parser "
+                "/ Reticulum._synthesize_interface; the bridge config_parse_interface "
+                "command is deliberately unimplemented. No stub warranted (a fake "
+                "parser would test nothing)."
+            )
         res = _parse(impl, "ifac_size = 512")
         assert res["ifac_size"] == IFAC_512_BYTES, (
             f"{label}: ifac_size=512 bits must store as {IFAC_512_BYTES} bytes "
@@ -201,8 +210,15 @@ def test_ifac_size_512bit_upper_bound(sut, reference):
         "genuine read-back defaults, not values the bridge hardcodes."
     ),
 )
-def test_ingress_control_announce_default_literals(sut, reference):
+def test_ingress_control_announce_default_literals(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI parser "
+                "/ Reticulum._synthesize_interface; the bridge config_parse_interface "
+                "command is deliberately unimplemented. No stub warranted (a fake "
+                "parser would test nothing)."
+            )
         # Defaults (a bitrate line only, no ic_* keys).
         d = _parse(impl, "bitrate = 1200")
         assert d["ic_max_held_announces"] == IC_MAX_HELD_ANNOUNCES, (

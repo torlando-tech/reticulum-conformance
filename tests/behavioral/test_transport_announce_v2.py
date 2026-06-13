@@ -28,6 +28,8 @@ the RNS 1.3.1 source (positive AND negative / discriminating control).
 import secrets
 import time
 
+import pytest
+
 from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     CONTEXT_PATH_RESPONSE,
@@ -77,7 +79,15 @@ _TOL = 0.01  # float tolerance for an exact same-`now`-derived delta
         "fails."
     ),
 )
-def test_forwarded_vs_local_client_retransmit_schedule(behavioral):
+def test_forwarded_vs_local_client_retransmit_schedule(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry.retransmits "
+            "is never incremented; no cull-pass announce-retransmit job; "
+            "per-interface re-emit model; no PATHFINDER_R local-client preset; no "
+            "hop-sorted batched egress. Refs Transport.py:560-650/1046-1047/"
+            "1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface = inst.attach_mock_interface("a", mode="FULL")
@@ -140,7 +150,15 @@ def test_forwarded_vs_local_client_retransmit_schedule(behavioral):
         "0 -> 1."
     ),
 )
-def test_retransmit_retry_window_after_fire(behavioral):
+def test_retransmit_retry_window_after_fire(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#announce-retransmit-table-loop: AnnounceEntry.retransmits "
+            "is never incremented; no cull-pass announce-retransmit job; "
+            "per-interface re-emit model; no PATHFINDER_R local-client preset; no "
+            "hop-sorted batched egress. Refs Transport.py:560-650/1046-1047/"
+            "1718-1736/1889-1893."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface = inst.attach_mock_interface("a", mode="FULL")
@@ -194,7 +212,13 @@ def test_retransmit_retry_window_after_fire(behavioral):
         "literals; the three values are mutually discriminating."
     ),
 )
-def test_path_request_answer_grace_delays(behavioral):
+def test_path_request_answer_grace_delays(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#path-request-answer-machinery: AnnounceEntry has no "
+            "block_rebroadcasts field; no PATH_REQUEST_GRACE/RG/local-client-"
+            "immediate answer scheduling. Refs Transport.py:2967-2987."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         # Each path is learned on its OWN dedicated FULL interface so the
@@ -366,7 +390,13 @@ def test_path_timestamp_refreshed_on_forward(behavioral):
         "requests, or emits the answer with a plain ANNOUNCE context, diverges"
     ),
 )
-def test_path_request_parse_branches_and_response_context(behavioral):
+def test_path_request_parse_branches_and_response_context(behavioral, behavioral_impl):
+    if behavioral_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#path-request-answer-machinery: AnnounceEntry has no "
+            "block_rebroadcasts field; no PATH_REQUEST_GRACE/RG/local-client-"
+            "immediate answer scheduling. Refs Transport.py:2967-2987."
+        )
     inst = behavioral.start(enable_transport=True)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")

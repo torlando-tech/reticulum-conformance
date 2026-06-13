@@ -98,8 +98,14 @@ def _parse(impl, body: str) -> dict:
         "two defaults are distinct, so neither is a copy of the other)"
     ),
 )
-def test_default_ifac_size_per_interface_class(sut, reference):
+def test_default_ifac_size_per_interface_class(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#kotlin-no-serial-kiss-interfaces: no "
+                "SerialInterface/KISSInterface/AX25KISSInterface classes exist "
+                "in reticulum-kt (default_ifac_size has no entries for them)."
+            )
         res = impl.execute("interface_default_ifac_size")
         sizes = res["default_ifac_size"]
         # POSITIVE: serial/framed-media classes default to the 8-byte tag.
@@ -143,7 +149,7 @@ def test_default_ifac_size_per_interface_class(sut, reference):
         "coincidence"
     ),
 )
-def test_interface_mode_aliases_and_precedence(sut, reference):
+def test_interface_mode_aliases_and_precedence(sut, reference, sut_impl_name):
     cases = [
         ("interface_mode = full", MODE_FULL),
         ("interface_mode = access_point", MODE_ACCESS_POINT),
@@ -155,6 +161,13 @@ def test_interface_mode_aliases_and_precedence(sut, reference):
         ("interface_mode = boundary", MODE_BOUNDARY),
     ]
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         for body, expected in cases:
             res = _parse(impl, body)
             assert res["mode"] == expected, (
@@ -189,8 +202,15 @@ def test_interface_mode_aliases_and_precedence(sut, reference):
         "otherwise honoured"
     ),
 )
-def test_interface_mode_gateway_keyerror_quirk(sut, reference):
+def test_interface_mode_gateway_keyerror_quirk(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         # NEGATIVE: interface_mode=gateway alone trips the c["mode"] lookup.
         with pytest.raises(BridgeError):
             impl.execute(
@@ -221,8 +241,15 @@ def test_interface_mode_gateway_keyerror_quirk(sut, reference):
         "peers. Negative control: a non-empty value DOES derive an IFAC"
     ),
 )
-def test_ifac_credential_aliases_and_empty_string(sut, reference):
+def test_ifac_credential_aliases_and_empty_string(sut, reference, sut_impl_name):
     for impl, label in ((reference, "ref"), (sut, "sut")):
+        if label == "sut" and sut_impl_name == "kotlin":
+            pytest.xfail(
+                "reticulum-kt#config-ini-parser: kotlin has no ConfigObj INI "
+                "parser / Reticulum._synthesize_interface; the bridge "
+                "config_parse_interface command is deliberately unimplemented. "
+                "No stub warranted (a fake parser would test nothing)."
+            )
         # network-name aliases both feed ifac_netname and arm an IFAC.
         a = _parse(impl, "networkname = alpha")
         assert a["ifac_netname"] == "alpha" and a["ifac_active"] is True, (

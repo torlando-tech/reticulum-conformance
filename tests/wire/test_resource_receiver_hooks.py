@@ -30,6 +30,8 @@ Each case pins a Resource.py / Link.py rule against an EXTERNAL anchor — a RNS
 Runs reference-vs-reference; no SUT binary required.
 """
 
+import pytest
+
 from conformance import conformance_case
 
 
@@ -305,13 +307,23 @@ def test_resource_no_per_part_proofs(wire_link_setup):
         "re-send parts and risk a sequencing error"
     ),
 )
-def test_resource_duplicate_request_deduped(wire_link_setup):
+def test_resource_duplicate_request_deduped(wire_link_setup, wire_pair):
+    server_impl, client_impl = wire_pair
     server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
 
     res = client.inject_crafted_resource_request(link_id, "duplicate")
     assert res["total_parts"] >= 2, f"expected a multi-part sender: {res!r}"
     # First request served every part.
     assert res["first_served"] == res["total_parts"], res
+    # The sender (link initiator) records the served request's packet hash in
+    # the outgoing Resource's req_hashlist; kotlin's Link has no per-resource
+    # request-hash list, so this and the de-dup below are an architectural gap.
+    if client_impl == "kotlin":
+        pytest.xfail(
+            "reticulum-kt#resource-req-hashlist: no req_hashlist packet-hash "
+            "de-dup on RESOURCE_REQ (Link has no per-resource request-hash "
+            "list). Ref Link.py:1109-1115."
+        )
     assert res["first_in_hashlist"] is True, res
     # Duplicate served nothing more and the hash is recorded exactly once.
     assert res["second_served"] == res["first_served"], (

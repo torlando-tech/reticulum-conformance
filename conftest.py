@@ -96,12 +96,22 @@ def pytest_configure(config):
 
 
 def get_impl_list(config):
-    """Get list of implementations to test."""
+    """Get list of implementations to test.
+
+    Returns the impls to parametrize `sut` over. `--reference-only` is the
+    EXPLICIT escape that makes the reference its own SUT (a sanity run);
+    `--impl=X` selects one impl. With neither flag, the default is every
+    registered non-reference impl whose bridge is actually built on disk —
+    which may be EMPTY. An empty default result is NOT silently mapped to
+    reference (that was the false-confidence hole, V3 §7.4); pytest_generate_tests
+    hard-fails on it so a certification run can never self-certify by accident.
+    """
     impl = config.getoption("--impl")
     if impl:
         return [impl]
     if config.getoption("--reference-only"):
-        return []
+        # Explicit operator choice: run the reference as its own SUT.
+        return ["reference"]
     # Default: test every registered implementation (except reference) whose
     # bridge binary/JAR is actually present on disk. The existence gate applies
     # uniformly to all non-reference impls (swift, kotlin, microreticulum, ...):
@@ -136,8 +146,23 @@ def pytest_generate_tests(metafunc):
     if "sut" in metafunc.fixturenames:
         impls = get_impl_list(metafunc.config)
         if not impls:
-            # reference-only mode: use reference as SUT
-            impls = ["reference"]
+            # No --impl, no --reference-only, and no built bridge on disk. Do
+            # NOT silently fall back to reference-as-SUT — that lets a
+            # certification run self-certify (V3 §7.4). Hard-fail with an
+            # actionable message; --reference-only is the explicit escape for a
+            # reference-vs-reference sanity run.
+            checked = ", ".join(
+                f"{name} ({resolve_command(name).split()[-1]})"
+                for name in BRIDGE_COMMANDS
+                if name != "reference"
+            )
+            raise pytest.UsageError(
+                "No system-under-test bridge resolved: --impl was not given, "
+                "--reference-only was not set, and no registered bridge is built "
+                f"on disk (checked: {checked}). A certification run must target a "
+                "real implementation. Pass --impl=<name>, build a bridge, or pass "
+                "--reference-only to explicitly run reference-as-SUT."
+            )
         metafunc.parametrize("sut_impl", impls, indirect=True, scope="session")
 
 

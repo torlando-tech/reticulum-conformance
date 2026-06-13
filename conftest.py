@@ -146,6 +146,20 @@ def pytest_generate_tests(metafunc):
     if "sut" in metafunc.fixturenames:
         impls = get_impl_list(metafunc.config)
         if not impls:
+            # Collection-only passes execute NO tests, so they need no SUT
+            # bridge: the @conformance_case drift guard
+            # (tools/check_conformance_decorated.py) and the TESTS.md generator
+            # (tools/generate_tests_md.py) both run `pytest --collect-only` with
+            # no --impl and may run where no bridge is built (e.g. the `honesty`
+            # CI job, which installs no bridge). §7.4's anti-self-certification
+            # gate is about RUNS, not metadata enumeration — so exempt
+            # --collect-only and parametrize a harmless placeholder (never spawned
+            # under --collect-only) so test items still generate for the guard.
+            if metafunc.config.getoption("collectonly", False):
+                metafunc.parametrize(
+                    "sut_impl", ["reference"], indirect=True, scope="session"
+                )
+                return
             # No --impl, no --reference-only, and no built bridge on disk. Do
             # NOT silently fall back to reference-as-SUT — that lets a
             # certification run self-certify (V3 §7.4). Hard-fail with an

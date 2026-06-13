@@ -19,7 +19,13 @@ on:
 jobs:
   conformance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The job runs TWO full-suite passes (--impl=kotlin then --reference-only),
+    # each ~hundreds of wire/link/resource tests that legitimately WAIT on
+    # protocol timers (announce throttle windows, link watchdog/keepalive). With
+    # pytest-xdist (-n auto, added below) the combined wall time is ~30 min;
+    # this ceiling leaves headroom for slower runners / CI variance. (Was 20,
+    # which only ever covered ~half of a single serial pass.)
+    timeout-minutes: 50
 
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +71,7 @@ jobs:
         # also a hard RNS runtime dependency, so installing it makes the
         # reference bridge's `import RNS` exercise the same provider real
         # deployments use, rather than only the pure-Python fallback.
-        run: pip install pytest cryptography msgpack u-msgpack-python
+        run: pip install pytest pytest-xdist cryptography msgpack u-msgpack-python
 
       - name: Assert RNS/LXMF versions match audited ground truth (1.3.1 / 0.9.9)
         # Reads __version__ from the pinned checkouts' _version.py — the
@@ -124,7 +130,12 @@ jobs:
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         # The legacy `--ignore=tests/lxmf` was a no-op — tests/lxmf/ no longer
         # exists in this repo — so it has been dropped (L18).
-        run: python3 -m pytest tests/ --impl=kotlin -v --tb=short
+        # -n auto: pytest-xdist parallelism. The wire/link/resource tests mostly
+        # idle-wait on protocol timers, so parallel workers overlap those waits
+        # (~2.5x faster on the slow subset; ephemeral bridge ports make it
+        # race-safe). Verified 0 failures under -n on the timing-sensitive
+        # watchdog/keepalive/throttle tests.
+        run: python3 -m pytest tests/ --impl=kotlin -n auto -v --tb=short
 
       - name: Run reference-only baseline
         # Sanity check: the Python reference should always pass every
@@ -135,4 +146,4 @@ jobs:
         env:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        run: python3 -m pytest tests/ --reference-only -v --tb=short
+        run: python3 -m pytest tests/ --reference-only -n auto -v --tb=short

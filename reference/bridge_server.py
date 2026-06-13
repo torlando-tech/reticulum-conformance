@@ -3991,6 +3991,21 @@ def handle_request(request):
 
 def main():
     """Main server loop."""
+    # Pre-warm the submodule imports that wire/channel/buffer handlers pull in
+    # lazily (`from RNS.Channel import ...`, `from RNS.Buffer import ...`). RNS
+    # fires link/transport callbacks on background threads; if such a thread
+    # first-imports RNS.Channel at the same instant a handler does, CPython's
+    # import lock raises `_frozen_importlib._DeadlockError` — observed as a flaky
+    # ~1-in-1200 reference-side failure ("deadlock detected by
+    # _ModuleLock('RNS.Channel')"). Forcing the first import here, single-threaded
+    # before any RNS thread spawns, removes the race. Best-effort: a resolution
+    # failure must not abort the bridge — the lazy imports remain the fallback.
+    try:
+        import RNS.Channel  # noqa: F401
+        import RNS.Buffer  # noqa: F401
+    except Exception:
+        pass
+
     # Signal ready
     print("READY", flush=True)
 

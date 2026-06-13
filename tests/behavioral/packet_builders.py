@@ -337,6 +337,10 @@ def _promote_to_header2(raw: bytes, transport_id: bytes) -> bytes:
             f"got {len(transport_id)}"
         )
     flags = raw[0]
+    # transport_type is a 1-bit field at bit 4 (RNS Packet.py:249,
+    # `(flags & 0b00010000) >> 4`); bit 5 is the separate context_flag and bit 6
+    # is header_type. So clear ONLY bit 4 here — do NOT widen this to ~(3 << 4),
+    # which would also zero bit 5 and clobber context_flag.
     flags = (flags & ~(1 << 6)) | (HEADER_2 << 6)
     flags = (flags & ~(1 << 4)) | (TRANSPORT_TRANSPORT << 4)
     hops = raw[1]

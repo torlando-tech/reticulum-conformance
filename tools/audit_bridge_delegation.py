@@ -33,14 +33,27 @@ Classification (per bridge command handler, by AST analysis):
              protocol-specific knowledge (e.g. an HKDF call whose salt is a
              link id). The AST heuristic can't see that; flagged for a human.
 
+  MIRRORED   Faithfully reproduces a piece of RNS logic RNS does NOT expose as a
+             callable (the inline HDLC/KISS receive de-escape). Honest by
+             exception: constants are read off live RNS and the tests are
+             known-answer round-trips against the GENUINE forward primitive.
+             Tiny, documented (MIRRORS_RNS_RECEIVE) and rot-guarded; NOT counted
+             dishonest. Anything reconstructing protocol bytes that is NOT pinned
+             here is still HANDROLLED.
+
   DEAD       Defined but shadowed by a later def of the same name, or
              registered in no COMMANDS dict. Dead weight, not callable.
 
 A test is DISHONEST if any command in its @conformance_case(commands=...) is
-HANDROLLED (or REVIEW). Wire-test commands use _WirePeer method names; those
-resolve to wire_* commands, which are all LIVE.
+HANDROLLED, REVIEW, or UNKNOWN. Wire/behavioral tests use _*Peer method names
+that drop the module prefix; those resolve to wire_*/behavioral_* commands and
+inherit that command's real classification. A token that resolves to nothing is
+UNKNOWN (never optimistically LIVE).
 
-Run:  python tools/audit_bridge_delegation.py
+main() returns a non-zero exit status if ANY command is HANDROLLED/REVIEW/UNKNOWN,
+ANY test is dishonest, or ANY override-set pin is stale — so CI can fail on it.
+
+Run:  python tools/audit_bridge_delegation.py            # exit 1 on any violation
       python tools/audit_bridge_delegation.py --verbose   # per-command evidence
 """
 
@@ -83,11 +96,15 @@ HASH_PRIMITIVES = {"cmd_sha256", "cmd_sha512", "cmd_truncated_hash"}
 # getting from real RNS, not hardcoding. The heuristic genuinely cannot see
 # this; listing them here keeps the audit honest instead of silently passing
 # them. Each is a candidate for conversion to a live-instance command.
-KDF_PROTOCOL_REVIEW = {
-    "cmd_link_derive_key",     # salt = link_id, context = None, len by mode — RNS.Link.
-    "cmd_ifac_derive_key",     # salt = IFAC_SALT — RNS interface authentication.
-    "cmd_ratchet_derive_key",  # salt = identity_hash — RNS ratchet KDF.
-}
+#
+# Currently empty: the previous entries (cmd_link_derive_key, cmd_ifac_derive_key,
+# cmd_ratchet_derive_key) named handlers that no longer exist — that KDF logic is
+# now driven through live RNS commands. Stale names here are worse than useless:
+# REVIEW could never be emitted, so the whole-program "a test using a REVIEW
+# command is dishonest" guard silently became dead code. build_command_index now
+# *validates* that every name below resolves to a real handler (fails the audit
+# otherwise), so this set can't rot unnoticed again.
+KDF_PROTOCOL_REVIEW: set[str] = set()
 
 # Handlers that hand-roll a composite by applying a real primitive and then
 # slicing a protocol-specific portion out of the result — e.g. IFAC is "the
@@ -95,10 +112,44 @@ KDF_PROTOCOL_REVIEW = {
 # the "take last N bytes" rule is RNS interface logic. A lone slice of a
 # primitive's output is too noisy a signal to detect by AST without false
 # positives, so these are pinned by hand.
-HEURISTIC_MISS_HANDROLLED = {
-    "cmd_ifac_compute",  # ifac = ed25519_sign(packet)[-ifac_size:]
-    "cmd_ifac_verify",   # recomputes the same and compares
+#
+# Currently empty: the previous entries (cmd_ifac_compute, cmd_ifac_verify) named
+# handlers that no longer exist. Like KDF_PROTOCOL_REVIEW above, the names here
+# are validated against real handlers by build_command_index.
+HEURISTIC_MISS_HANDROLLED: set[str] = set()
+
+# Handlers that faithfully MIRROR a piece of RNS receive-path logic that RNS
+# does not expose as a standalone callable. RNS's de-framing (HDLC/KISS
+# de-escape) lives INLINE inside each interface read loop (e.g.
+# TCPInterface.py:389-391 does two literal frame.replace(...) calls); there is no
+# RNS.*.deframe() to delegate to, unlike the forward direction (TCPInterface.HDLC
+# .escape / KISSInterface.KISS.escape are real exposed staticmethods, used by the
+# GENUINE hdlc_escape/kiss_escape commands). These handlers reproduce RNS's exact
+# inverse using constants read off the live RNS interface classes, and the tests
+# that use them are KNOWN-ANSWER round-trips: deframe(FLAG + RNS.escape(x) + FLAG)
+# must equal the original x (ground truth), framed via the GENUINE forward
+# primitive — so they are NOT "tests of the bridge's own reimplementation."
+# This set is deliberately tiny and is rot-guarded (build_command_index fails the
+# audit if any name here stops backing a real handler), so it cannot silently
+# accumulate the way the previous override sets did. Anything NOT listed here that
+# reconstructs protocol bytes is still HANDROLLED and fails the build.
+MIRRORS_RNS_RECEIVE: dict[str, str] = {
+    "cmd_hdlc_deframe": "RNS exposes no standalone HDLC de-escape; mirrors "
+                        "TCPInterface.py:389-391 inverse-of-HDLC.escape, "
+                        "constants read off RNS; round-trip KAT vs RNS HDLC.escape.",
+    "cmd_kiss_deframe": "RNS exposes no standalone KISS de-escape; mirrors "
+                        "KISSInterface read-loop TFEND/TFESC un-transpose, "
+                        "constants read off RNS; round-trip KAT vs RNS KISS.escape.",
 }
+
+# Live-instance accessors / RNS loaders. A handler that *calls* one of these is
+# definitionally driving real RNS (it earns a live: signal). Their bodies are
+# bridge infrastructure for loading and reusing the RNS singleton — not protocol
+# reconstruction — so the helper-recursion pass does NOT descend into them. (If
+# it did, any stray buffer idiom inside the loader would, under the
+# HANDROLLED-before-LIVE precedence, wrongly flip every LIVE handler that touches
+# RNS to HANDROLLED.)
+NO_RECURSE_HELPERS = LIVE_CALLS
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -122,18 +173,45 @@ def _is_int_const(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, int)
 
 
-def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
-    """Return (classification, evidence-signals, called-cmd-handlers).
+def _annotation_node_ids(func: ast.AST) -> set[int]:
+    """id()s of every AST node sitting inside a type annotation in `func`.
 
-    Pure AST analysis of the function body — see the module docstring for what
-    each classification means. Precedence: LIVE > HANDROLLED > GENUINE, then
-    the KDF_PROTOCOL_REVIEW override demotes a few GENUINE-looking handlers.
-    The called-cmd-handlers set feeds the transitive pass in parse_module: a
-    handler that calls a handrolled handler is itself handrolled.
+    Annotations are the one place a bitwise operator appears without being a
+    real bit-twiddle: PEP-604 `str | None` parses as `BinOp(BitOr)`. Skipping
+    annotation subtrees during signal extraction kills that false positive at
+    the root (no per-operator special-casing) and is robust for return,
+    parameter, and variable (`x: T = ...`) annotations alike.
+    """
+    excluded: set[int] = set()
+    roots: list[ast.AST] = []
+    for node in ast.walk(func):
+        if isinstance(node, ast.AnnAssign) and node.annotation is not None:
+            roots.append(node.annotation)
+        elif isinstance(node, ast.arg) and node.annotation is not None:
+            roots.append(node.annotation)
+        elif isinstance(node, ast.FunctionDef) and node.returns is not None:
+            roots.append(node.returns)
+    for root in roots:
+        for sub in ast.walk(root):
+            excluded.add(id(sub))
+    return excluded
+
+
+def _scan_function(
+    func: ast.FunctionDef, funcs_by_name: dict, suppress_hashlib: bool
+) -> tuple[set[str], set[str], set[str]]:
+    """Scan ONE function body. Returns (signals, called-cmd-handlers, helper-refs).
+
+    helper-refs are names of *non-cmd_* module functions referenced in the body
+    — whether called (`_helper()`) or passed by reference as a thread/callback
+    target (`Thread(target=_helper)`). classify_handler folds the signals of
+    those helpers in, so protocol logic factored out of a cmd_ handler into a
+    private helper or thread target is still attributed to the handler.
     """
     signals: set[str] = set()
     called_cmds: set[str] = set()
-    is_hash_primitive = func.name in HASH_PRIMITIVES
+    helper_refs: set[str] = set()
+    excluded = _annotation_node_ids(func)
 
     # Track which local names hold bytes — propagating from hex_to_bytes(...)
     # inputs through slices and bytes-concatenation assignments. Used by two
@@ -176,6 +254,8 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
                         changed = True
 
     for node in ast.walk(func):
+        if id(node) in excluded:
+            continue
         if isinstance(node, ast.Call):
             callee = _dotted(node.func)
             if callee in LIVE_CALLS:
@@ -184,12 +264,38 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
                 signals.add("asm:struct")
             if callee in ("umsgpack.packb", "umsgpack.unpackb"):
                 signals.add("asm:umsgpack")
-            if callee and callee.startswith("hashlib.") and not is_hash_primitive:
+            if callee and callee.startswith("hashlib.") and not suppress_hashlib:
                 signals.add("asm:hashlib")
             if callee and callee.startswith("cmd_"):
                 called_cmds.add(callee)
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "replace":
-                signals.add("asm:replace")
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr == "replace":
+                    signals.add("asm:replace")
+                # int wire-serialization: `n.to_bytes(2, "big")` /
+                # `int.from_bytes(buf, "big")`. Exclude RNS/LXMF-rooted calls —
+                # `RNS.Identity.from_bytes(...)` is real delegation, not a
+                # hand-rolled integer codec.
+                elif attr in ("to_bytes", "from_bytes"):
+                    root = callee.split(".")[0] if callee else None
+                    if root not in ("RNS", "LXMF"):
+                        signals.add("asm:intbytes")
+                # b"".join(parts) assembles a wire buffer by hand. Only fires on
+                # a *bytes-constant* separator — "".join (str) and
+                # os.path.join (Attribute receiver) are excluded.
+                elif (
+                    attr == "join"
+                    and isinstance(node.func.value, ast.Constant)
+                    and isinstance(node.func.value.value, bytes)
+                ):
+                    signals.add("asm:join")
+            # bytearray(...) / bytes([...]) buffer construction.
+            if callee == "bytearray":
+                signals.add("asm:bytesbuf")
+            elif callee == "bytes" and len(node.args) == 1 and isinstance(
+                node.args[0], (ast.List, ast.ListComp, ast.Tuple)
+            ):
+                signals.add("asm:bytesbuf")
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             names = (
                 [a.name for a in node.names]
@@ -198,8 +304,19 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
             )
             if any(n.split(".")[0] in ("RNS", "LXMF") for n in names):
                 signals.add("live:import")
-        elif isinstance(node, ast.Name) and node.id in LIVE_GLOBALS:
-            signals.add("live:global")
+        elif isinstance(node, ast.Name):
+            if node.id in LIVE_GLOBALS:
+                signals.add("live:global")
+            # Reference to another module function (called or passed by
+            # reference). Non-cmd_ helpers are recursed into by
+            # classify_handler; cmd_ delegation is handled by the transitive
+            # pass; the live-instance loaders are deliberately not descended.
+            if (
+                node.id in funcs_by_name
+                and not node.id.startswith("cmd_")
+                and node.id not in NO_RECURSE_HELPERS
+            ):
+                helper_refs.add(node.id)
         elif (
             isinstance(node, ast.Subscript)
             and isinstance(node.slice, ast.Slice)
@@ -207,8 +324,13 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
             and node.value.id in hex_locals
         ):
             signals.add("asm:fieldslice")
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.op, (ast.LShift, ast.RShift, ast.BitOr,
+                                    ast.BitAnd, ast.BitXor)):
+                signals.add("asm:bitop")
         elif isinstance(node, ast.BinOp):
-            if isinstance(node.op, (ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd)):
+            if isinstance(node.op, (ast.LShift, ast.RShift, ast.BitOr,
+                                    ast.BitAnd, ast.BitXor)):
                 signals.add("asm:bitop")
             elif isinstance(node.op, ast.Add):
                 terms = _flatten_add(node)
@@ -223,35 +345,89 @@ def classify_handler(func: ast.FunctionDef) -> tuple[str, set[str], set[str]]:
                 ):
                     signals.add("asm:concat")
 
-    if any(s.startswith("live:") for s in signals):
-        return "LIVE", signals, called_cmds
+    return signals, called_cmds, helper_refs
+
+
+def classify_handler(
+    func: ast.FunctionDef, funcs_by_name: dict
+) -> tuple[str, set[str], set[str]]:
+    """Return (classification, evidence-signals, called-cmd-handlers).
+
+    Pure AST analysis of the handler body *and* every non-cmd_ helper / thread
+    target it transitively references (the live-instance loaders excepted) — see
+    the module docstring for what each classification means.
+
+    Precedence: pinned exception (MIRRORED — honest-by-exception, matched by
+    name first) > HANDROLLED > LIVE > REVIEW > GENUINE. HANDROLLED is checked
+    BEFORE LIVE on purpose: protocol reconstruction in this codebase happens
+    inside handlers that *also* touch a live RNS instance, so scoring LIVE on the
+    first live: signal would structurally hide exactly the hand-rolling this tool
+    exists to catch. The KDF_PROTOCOL_REVIEW override then demotes a few
+    GENUINE-looking handlers; both override sets are validated against real
+    handlers in build_command_index.
+
+    The called-cmd-handlers set feeds the transitive pass in parse_module: a
+    handler that calls a handrolled cmd_ handler is itself handrolled.
+    """
+    suppress_hashlib = func.name in HASH_PRIMITIVES
+    signals: set[str] = set()
+    called_cmds: set[str] = set()
+
+    # Breadth-first over the handler and the non-cmd_ helpers it references,
+    # folding every scanned function's signals together. visited is keyed by
+    # function name (cycle guard for mutually-recursive helpers).
+    visited: set[str] = {func.name}
+    queue: list[ast.FunctionDef] = [func]
+    while queue:
+        fn = queue.pop()
+        fsig, fcmds, frefs = _scan_function(fn, funcs_by_name, suppress_hashlib)
+        signals |= fsig
+        called_cmds |= fcmds
+        for ref in frefs:
+            if ref not in visited:
+                visited.add(ref)
+                target = funcs_by_name.get(ref)
+                if target is not None:
+                    queue.append(target)
+
+    if func.name in MIRRORS_RNS_RECEIVE:
+        return "MIRRORED", signals | {"pinned:mirrors-rns-receive"}, called_cmds
     if func.name in HEURISTIC_MISS_HANDROLLED:
         return "HANDROLLED", signals | {"pinned:primitive-then-slice"}, called_cmds
     if any(s.startswith("asm:") for s in signals):
         return "HANDROLLED", signals, called_cmds
+    if any(s.startswith("live:") for s in signals):
+        return "LIVE", signals, called_cmds
     if func.name in KDF_PROTOCOL_REVIEW:
         return "REVIEW", signals | {"pinned:kdf-params"}, called_cmds
     return "GENUINE", signals, called_cmds
 
 
 def parse_module(path: Path):
-    """Parse one command-module file. Returns (handlers, registry, dead).
+    """Parse one command-module file. Returns (handlers, registry, dead, funcs).
 
     handlers: {funcname: (classification, signals)} — last def of each name wins
               (Python semantics), so a shadowed earlier def never appears here.
     registry: {command_name: funcname} from the module's *_COMMANDS dict.
     dead:     [funcname] — functions shadowed by a later def of the same name.
+    funcs:    {funcname: FunctionDef} for EVERY function in the module — the
+              helper map classify_handler recurses through (last def wins).
     """
     tree = ast.parse(path.read_text(), filename=str(path))
     defs: dict[str, list[ast.FunctionDef]] = defaultdict(list)
+    funcs_by_name: dict[str, ast.FunctionDef] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("cmd_"):
-            defs[node.name].append(node)
+        if isinstance(node, ast.FunctionDef):
+            funcs_by_name[node.name] = node  # last def of a name wins
+            if node.name.startswith("cmd_"):
+                defs[node.name].append(node)
 
     handlers: dict[str, tuple[str, set[str]]] = {}
     called: dict[str, set[str]] = {}
     for name, nodes in defs.items():
-        classification, signals, called_cmds = classify_handler(nodes[-1])
+        classification, signals, called_cmds = classify_handler(
+            nodes[-1], funcs_by_name
+        )
         handlers[name] = (classification, signals)
         called[name] = called_cmds
 
@@ -284,21 +460,25 @@ def parse_module(path: Path):
             for key, val in zip(node.value.keys, node.value.values):
                 if isinstance(key, ast.Constant) and isinstance(val, ast.Name):
                     registry[key.value] = val.id
-    return handlers, registry, dead
+    return handlers, registry, dead, funcs_by_name
 
 
 def build_command_index():
     """Classify every registered bridge command across all command modules.
 
-    Returns (commands, dead_handlers):
+    Returns (commands, dead_handlers, override_rot):
       commands: {command_name: (classification, funcname, module, signals)}
       dead_handlers: {module: [funcname, ...]}
+      override_rot: sorted [name] in an override set that no real handler backs
+                    (stale pins → fail the audit; see main()).
     """
     commands: dict[str, tuple] = {}
     dead_handlers: dict[str, list[str]] = {}
+    all_handlers: set[str] = set()
     for filename in COMMAND_MODULES:
         path = REPO_ROOT / "reference" / filename
-        handlers, registry, dead = parse_module(path)
+        handlers, registry, dead, _funcs = parse_module(path)
+        all_handlers.update(handlers)
         dead_handlers[filename] = sorted(dead)
         for cmd_name, funcname in registry.items():
             classification, signals = handlers.get(funcname, ("DEAD", set()))
@@ -309,26 +489,39 @@ def build_command_index():
         for funcname in handlers:
             if funcname not in registered_funcs and funcname not in dead:
                 dead_handlers[filename].append(f"{funcname} (unregistered)")
-    return commands, dead_handlers
+
+    # Override-set integrity: every pinned name MUST back a real handler.
+    # A stale name silently disables its branch (REVIEW could never be emitted
+    # once KDF_PROTOCOL_REVIEW rotted), which is exactly how part of "0
+    # dishonest" became vacuously true. Surface stale pins so main() can fail.
+    override_rot = sorted(
+        (KDF_PROTOCOL_REVIEW | HEURISTIC_MISS_HANDROLLED | set(MIRRORS_RNS_RECEIVE))
+        - all_handlers
+    )
+    return commands, dead_handlers, override_rot
 
 
-def resolve_command(
-    name: str, commands: dict, test_relpath: str, live_backed_dirs: tuple[str, ...]
-) -> tuple[str, str]:
+def resolve_command(name: str, commands: dict) -> tuple[str, str]:
     """Resolve a @conformance_case command token to (classification, resolved).
 
     Tests under tests/ (root) name bridge commands directly. Tests under
-    tests/wire, tests/lxmf and tests/behavioral name _*Peer methods, which are
-    thin wrappers over command modules verified all-LIVE at startup — so a
-    token there that doesn't resolve directly is a peer helper over LIVE
-    commands, not dishonesty. Anything else is genuinely UNKNOWN (loud).
+    tests/wire and tests/behavioral name _*Peer methods that drop the module
+    prefix (`inject` → `behavioral_inject`, `listen` → `wire_listen`); resolve
+    those by trying the `wire_` and `behavioral_` prefixes against the real
+    registry, so the token inherits its backing command's *actual*
+    classification.
+
+    A token that resolves to nothing is genuinely UNKNOWN (loud) — never
+    optimistically LIVE. The previous version returned LIVE for any unresolved
+    token under tests/wire|behavioral, which meant the honesty metric was
+    computed over optimistically-defaulted input and could never surface a
+    typo'd or removed command.
     """
     if name in commands:
         return commands[name][0], name
-    if f"wire_{name}" in commands:
-        return commands[f"wire_{name}"][0], f"wire_{name}"
-    if any(test_relpath.startswith(d) for d in live_backed_dirs):
-        return "LIVE", f"{name} (peer method over LIVE commands)"
+    for prefix in ("wire_", "behavioral_"):
+        if f"{prefix}{name}" in commands:
+            return commands[f"{prefix}{name}"][0], f"{prefix}{name}"
     return "UNKNOWN", name
 
 
@@ -340,12 +533,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    commands, dead_handlers = build_command_index()
+    commands, dead_handlers, override_rot = build_command_index()
 
-    # The peer-method shortcut in resolve_command is only safe for test dirs
-    # whose backing command module contributes nothing but LIVE commands.
-    # Verify that invariant rather than assuming it.
-    live_backed_dirs: list[str] = []
+    # Diagnostic: the wire/behavioral command modules are expected to be
+    # all-LIVE. If one ever contributes a HANDROLLED/REVIEW/DEAD command, the
+    # short-prefix peer-method tokens in its test dir resolve to that (now
+    # non-LIVE) command — warn so it's visible. The command itself is already
+    # counted in by_class below and fails the audit on its own.
     for filename, test_dir in (
         ("wire_tcp.py", "tests/wire/"),
         ("behavioral_transport.py", "tests/behavioral/"),
@@ -354,12 +548,10 @@ def main() -> int:
             cls for _n, (cls, _fn, mod, _sig) in commands.items() if mod == filename
         }
         dishonest = module_classes & {"HANDROLLED", "REVIEW", "DEAD"}
-        if module_classes and not dishonest:
-            live_backed_dirs.append(test_dir)
-        else:
-            print(f"  WARNING: {filename} contributes {sorted(dishonest)} commands "
-                  f"— {test_dir} tokens will fall through to UNKNOWN", file=sys.stderr)
-    live_backed_dirs = tuple(live_backed_dirs)
+        if dishonest:
+            print(f"  WARNING: {filename} contributes {sorted(dishonest)} command(s) "
+                  f"— {test_dir} peer tokens may resolve to non-LIVE commands",
+                  file=sys.stderr)
 
     by_class: dict[str, list[str]] = defaultdict(list)
     for name, (classification, *_rest) in commands.items():
@@ -370,7 +562,7 @@ def main() -> int:
     print("=" * 78)
     print()
     total = len(commands)
-    for cls in ("GENUINE", "LIVE", "HANDROLLED", "REVIEW", "DEAD", "UNKNOWN"):
+    for cls in ("GENUINE", "LIVE", "MIRRORED", "HANDROLLED", "REVIEW", "DEAD", "UNKNOWN"):
         n = len(by_class.get(cls, []))
         if n:
             print(f"  {cls:11s} {n:3d}  ({n / total * 100:4.1f}% of {total} registered commands)")
@@ -400,6 +592,21 @@ def main() -> int:
             print(f"    - {name}  [{commands[name][1]}]")
     print()
 
+    # --- MIRRORED: justified faithful copies of non-exposed RNS receive logic ---
+    if by_class.get("MIRRORED"):
+        print("-" * 78)
+        print("MIRRORED COMMANDS (faithful copy of RNS logic RNS exposes no callable for)")
+        print("-" * 78)
+        print("  Honest by exception: round-trip KAT against the GENUINE forward")
+        print("  primitive; constants read off live RNS. Not counted as dishonest.")
+        for name in sorted(by_class["MIRRORED"]):
+            funcname = commands[name][1]
+            justification = MIRRORS_RNS_RECEIVE.get(funcname, "")
+            print(f"    - {name}  [{funcname}]")
+            if justification:
+                print(f"        {justification}")
+        print()
+
     if args.verbose:
         print("-" * 78)
         print("PER-COMMAND EVIDENCE")
@@ -414,7 +621,7 @@ def main() -> int:
     print("=" * 78)
     print("TEST HONESTY BY CATEGORY")
     print("=" * 78)
-    print("  A test is DISHONEST if any command it uses is HANDROLLED/REVIEW —")
+    print("  A test is DISHONEST if any command it uses is HANDROLLED/REVIEW/UNKNOWN —")
     print("  it is testing the bridge's reimplementation, not the real impl.")
     print()
 
@@ -429,8 +636,7 @@ def main() -> int:
         for rel_path, rows in files:
             for fn_name, case in rows:
                 verdicts = [
-                    resolve_command(c, commands, rel_path, live_backed_dirs)
-                    for c in case.commands
+                    resolve_command(c, commands) for c in case.commands
                 ]
                 bad = [
                     (resolved, cls)
@@ -464,6 +670,37 @@ def main() -> int:
             print(f"    {fn_name}")
             print(f"        {rel_path} -> {offenders}")
     print()
+
+    # --- exit status: non-zero on ANY honesty violation -------------------
+    # This is what lets CI fail the build. A clean suite (every command LIVE
+    # or GENUINE, every test honest, no stale override pins) returns 0; any
+    # HANDROLLED/REVIEW/UNKNOWN command, any dishonest test, or any rotted
+    # override pin returns 1.
+    failures: list[str] = []
+    for cls in ("HANDROLLED", "REVIEW", "UNKNOWN"):
+        n = len(by_class.get(cls, []))
+        if n:
+            failures.append(f"{n} {cls} command(s): {', '.join(sorted(by_class[cls]))}")
+    if grand_dishonest:
+        failures.append(f"{grand_dishonest} dishonest test(s)")
+    if override_rot:
+        failures.append(
+            "stale override-set pin(s) backing no handler: "
+            + ", ".join(override_rot)
+        )
+
+    if failures:
+        print("=" * 78)
+        print("AUDIT FAILED")
+        print("=" * 78)
+        for f in failures:
+            print(f"  - {f}")
+        print()
+        return 1
+
+    print("=" * 78)
+    print("AUDIT PASSED  (every command LIVE/GENUINE, every test honest)")
+    print("=" * 78)
     return 0
 
 

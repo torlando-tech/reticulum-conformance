@@ -18,10 +18,25 @@ import os
 import json
 import traceback
 
-# Add RNS Cryptography to path directly (bypass RNS __init__.py)
-rns_path = os.environ.get('PYTHON_RNS_PATH', '../../../Reticulum')
-# Convert to absolute path
-rns_path = os.path.abspath(rns_path)
+# Add RNS Cryptography to path directly (bypass RNS __init__.py).
+#
+# Resolve the upstream RNS location through the shared `_rns_paths` helper
+# (repo root) instead of a hardcoded `../../../Reticulum` default. This
+# guarantees the GENUINE crypto primitives loaded standalone below come from
+# the SAME RNS that the LIVE handlers import via `_get_full_rns()` — closing
+# the version-skew trap where, run bare (no PYTHON_RNS_PATH), the two halves of
+# the bridge would load different RNS versions (e.g. an old 1.1.3 sibling vs a
+# pip-installed 1.3.1). `_rns_paths.resolve_rns_path()` still honours
+# PYTHON_RNS_PATH first, then a sibling checkout, then the importable install.
+# (N-M9)
+_BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_BRIDGE_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from _rns_paths import resolve_rns_path
+
+rns_path = resolve_rns_path()
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'Cryptography'))
 sys.path.insert(0, rns_path)
 
@@ -323,6 +338,46 @@ def cmd_aes_decrypt(params):
     }
 
 
+def cmd_aes_256_cbc_encrypt(params):
+    """Raw AES-256-CBC block-cipher encryption — NO padding.
+
+    Delegates to real RNS.Cryptography.AES.AES_256_CBC.encrypt, routing
+    through RNS's own provider dispatch (PYCA or the internal pure-Python
+    AES, whichever the install selected). This is the bare block cipher: the
+    plaintext MUST already be a multiple of the 16-byte AES block size, and
+    the ciphertext is exactly the same length as the plaintext (no PKCS7
+    growth). Distinct from `aes_encrypt`, which is the PKCS7+CBC composite
+    that RNS's Token layer uses and which grows the input to the next block
+    boundary. RNS does no padding in AES.py itself (AES.py:77-95); padding
+    lives only in Token.py. (N-M2)
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_256_CBC as _RNS_AES_256_CBC
+    plaintext = hex_to_bytes(params['plaintext'])
+    key = hex_to_bytes(params['key'])
+    iv = hex_to_bytes(params['iv'])
+    return {
+        'ciphertext': bytes_to_hex(_RNS_AES_256_CBC.encrypt(plaintext, key, iv))
+    }
+
+
+def cmd_aes_256_cbc_decrypt(params):
+    """Raw AES-256-CBC block-cipher decryption — NO unpadding.
+
+    Delegates to real RNS.Cryptography.AES.AES_256_CBC.decrypt. Returns the
+    raw decrypted blocks verbatim; it does NOT strip PKCS7 padding (that is
+    `aes_decrypt`'s job). Round-trips `aes_256_cbc_encrypt` byte-for-byte.
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_256_CBC as _RNS_AES_256_CBC
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    key = hex_to_bytes(params['key'])
+    iv = hex_to_bytes(params['iv'])
+    return {
+        'plaintext': bytes_to_hex(_RNS_AES_256_CBC.decrypt(ciphertext, key, iv))
+    }
+
+
 def cmd_token_encrypt(params):
     """Encrypt plaintext into an RNS Token (Fernet-like: AES-256-CBC + HMAC).
 
@@ -526,14 +581,21 @@ def cmd_destination_hash(params):
 
 
 def cmd_truncated_hash(params):
-    """Compute truncated hash (first 16 bytes of SHA256)."""
-    data = hex_to_bytes(params['data'])
-    full_hash = hashlib.sha256(data).digest()
-    truncated = full_hash[:16]
+    """Compute the RNS truncated hash of arbitrary data.
 
+    Delegates to real RNS.Identity.truncated_hash, which is
+    full_hash(data)[:TRUNCATED_HASHLENGTH//8] (16 bytes in RNS 1.3.1). The
+    previous implementation hardcoded `sha256(data)[:16]`; byte-identical
+    today, but it would silently fail to track an RNS change to the hash
+    algorithm or TRUNCATED_HASHLENGTH constant. full_hash is also reported,
+    sourced from RNS.Identity.full_hash, so nothing about the length or the
+    digest is hardcoded here.
+    """
+    RNS = _get_full_rns()
+    data = hex_to_bytes(params['data'])
     return {
-        'hash': bytes_to_hex(truncated),
-        'full_hash': bytes_to_hex(full_hash)
+        'hash': bytes_to_hex(RNS.Identity.truncated_hash(data)),
+        'full_hash': bytes_to_hex(RNS.Identity.full_hash(data)),
     }
 
 
@@ -561,15 +623,30 @@ def cmd_packet_build(params):
     which hand-assembled the header and bit-packed the flags byte. RNS only
     produces a packet's wire format through Packet.pack() against a real
     Destination — there is no "format these arbitrary header fields" entry
-    point. dest_type selects the destination kind (which sets the
-    destination_type flag bits and decides whether the payload is encrypted:
-    PLAIN carries the payload in the clear so the wire bytes round-trip
-    exactly, SINGLE encrypts non-announce data so only the header bytes do).
+    point. dest_type selects the destination kind ('plain', 'single' or
+    'group'), which sets the destination_type flag bits and decides whether the
+    payload is encrypted: PLAIN carries the payload in the clear so the wire
+    bytes round-trip exactly, SINGLE encrypts non-announce data with the
+    recipient identity so only the header bytes do, and GROUP encrypts
+    non-announce data with a symmetric Token key (same "header-only" round-trip
+    as SINGLE).
 
-    HEADER_2 (transport-relayed) DATA packets are not buildable here — RNS
-    only produces them inside Transport while relaying, so their wire format
-    is covered by the live multi-hop tests in
-    tests/wire/test_link_multihop.py, not synthetically.
+    header_type selects the wire header format and accepts either the
+    human-friendly numbers 1 / 2 (default 1 = HEADER_1) or the strings
+    "HEADER_1" / "HEADER_2":
+
+      * HEADER_1 (default) — the normal single-hop header (flags, hops,
+        destination_hash, context, payload).
+      * HEADER_2 — the transport-relayed header that carries a 16-byte
+        transport_id between the hops byte and the destination_hash. RNS
+        only assembles a HEADER_2 packet through Packet.pack() for ANNOUNCE
+        packets (Packet.py:220-229), so HEADER_2 requires packet_type ==
+        ANNOUNCE and a 16-byte `transport_id` param; any other packet_type
+        is rejected with a clear error rather than crashing on RNS's
+        internal "must have a transport ID" / unset-ciphertext path. The
+        returned `hash` excludes the transport_id (Packet.get_hash masks it
+        out, Packet.py:356-360) so a HEADER_2 announce hashes identically to
+        its HEADER_1 equivalent — which the conformance tests assert. (N-M10)
     """
     RNS = _get_full_rns()
     dest_type = params.get('dest_type', 'plain')
@@ -579,6 +656,39 @@ def cmd_packet_build(params):
     transport_type = int(params.get('transport_type', RNS.Transport.BROADCAST))
     hops = int(params.get('hops', 0))
     data = hex_to_bytes(params.get('data', ''))
+
+    # Resolve header_type from the human "1"/"2" or "HEADER_1"/"HEADER_2"
+    # convention to the RNS constant. (RNS values are HEADER_1=0, HEADER_2=1,
+    # which would collide with the human "1"; the param is the human form.)
+    header_type_param = params.get('header_type', 1)
+    header_type_map = {
+        1: RNS.Packet.HEADER_1, 2: RNS.Packet.HEADER_2,
+        "1": RNS.Packet.HEADER_1, "2": RNS.Packet.HEADER_2,
+        "HEADER_1": RNS.Packet.HEADER_1, "HEADER_2": RNS.Packet.HEADER_2,
+    }
+    if header_type_param not in header_type_map:
+        raise ValueError(
+            f"unsupported header_type: {header_type_param!r} "
+            "(use 1 / 2 or 'HEADER_1' / 'HEADER_2')"
+        )
+    header_type = header_type_map[header_type_param]
+
+    transport_id = None
+    if header_type == RNS.Packet.HEADER_2:
+        if packet_type != RNS.Packet.ANNOUNCE:
+            raise ValueError(
+                "HEADER_2 packets are only buildable for ANNOUNCE packet_type "
+                f"({RNS.Packet.ANNOUNCE}); RNS.Packet.pack only assembles a "
+                "HEADER_2 header for announces (Packet.py:220-229)."
+            )
+        if 'transport_id' not in params or params['transport_id'] is None:
+            raise ValueError("HEADER_2 packets require a 16-byte transport_id")
+        transport_id = hex_to_bytes(params['transport_id'])
+        if len(transport_id) != RNS.Identity.TRUNCATED_HASHLENGTH // 8:
+            raise ValueError(
+                f"transport_id must be {RNS.Identity.TRUNCATED_HASHLENGTH // 8} "
+                f"bytes, got {len(transport_id)}"
+            )
 
     if dest_type == 'plain':
         destination = RNS.Destination(
@@ -590,9 +700,25 @@ def cmd_packet_build(params):
             RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
             "conformance", "packet",
         )
+    elif dest_type == 'group':
+        # GROUP destinations are symmetric-key. RNS forbids an outbound
+        # destination of any non-PLAIN type without identity material
+        # (Destination.py:178-179), and the GROUP encrypt path raises unless a
+        # symmetric key exists (Destination.py:601-609), so build with an
+        # Identity and call create_keys() to mint the Token key before pack().
+        # The GROUP destination_type bits (RNS.Destination.GROUP == 0x01) are
+        # set by get_packed_flags from destination.type (Packet.py:173); a DATA
+        # packet's payload is then encrypted by destination.encrypt, exactly as
+        # for SINGLE, so only the header bytes round-trip through unpack().
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP,
+            "conformance", "packet",
+        )
+        destination.create_keys()
     else:
         raise ValueError(
-            f"unsupported dest_type: {dest_type!r} (use 'plain' or 'single')"
+            f"unsupported dest_type: {dest_type!r} "
+            "(use 'plain', 'single' or 'group')"
         )
 
     packet = RNS.Packet(
@@ -600,7 +726,8 @@ def cmd_packet_build(params):
         packet_type=packet_type,
         context=context,
         transport_type=transport_type,
-        header_type=RNS.Packet.HEADER_1,
+        header_type=header_type,
+        transport_id=transport_id,
         context_flag=context_flag,
         create_receipt=False,
     )
@@ -622,6 +749,10 @@ def cmd_packet_build(params):
         'destination_type': parsed.destination_type,
         'packet_type': parsed.packet_type,
         'destination_hash': bytes_to_hex(parsed.destination_hash),
+        'transport_id': (
+            bytes_to_hex(parsed.transport_id)
+            if parsed.transport_id is not None else None
+        ),
         'context': parsed.context,
         'data': bytes_to_hex(parsed.data),
         'hash': bytes_to_hex(parsed.get_hash()),
@@ -943,6 +1074,87 @@ def cmd_bz2_decompress(params):
         'decompressed': bytes_to_hex(decompressed),
         'size': len(decompressed)
     }
+
+
+# ============================================================================
+# Interface framing (HDLC / KISS deframing)
+# ============================================================================
+# These commands reverse the on-the-wire framing RNS applies in its serial /
+# TCP interfaces, so a conformance test can frame a payload with RNS's own
+# escaping and confirm an implementation recovers the exact original bytes.
+# Both use the real RNS framing classes for their constants and the documented
+# inverse of RNS's own send-side escape — there is no separate "deframe" entry
+# point in RNS (the receive logic is inlined in each interface's read loop), so
+# the un-stuffing here mirrors the exact byte-replacements those loops perform
+# (e.g. TCPInterface.py:389-391).
+
+
+def cmd_hdlc_deframe(params):
+    """Strip HDLC framing and reverse byte-stuffing from a framed payload.
+
+    Reverses RNS's HDLC framing (the framing TCPInterface uses:
+    FLAG + HDLC.escape(data) + FLAG). Extracts the bytes between the first two
+    FLAG (0x7E) delimiters, then undoes the byte-stuffing with the exact two
+    replacements RNS's TCP read loop performs (TCPInterface.py:389-391):
+    ESC+(FLAG^0x20) -> FLAG, then ESC+(ESC^0x20) -> ESC. Constants are read
+    off the real RNS.Interfaces.TCPInterface.HDLC class, so a change to FLAG /
+    ESC / ESC_MASK upstream is tracked rather than hardcoded.
+    """
+    RNS = _get_full_rns()
+    from RNS.Interfaces.TCPInterface import HDLC
+    framed = hex_to_bytes(params['framed'])
+    start = framed.find(HDLC.FLAG)
+    if start == -1:
+        raise ValueError("no HDLC FLAG (0x7E) delimiter found in framed input")
+    end = framed.find(HDLC.FLAG, start + 1)
+    if end == -1:
+        raise ValueError("unterminated HDLC frame: only one FLAG delimiter")
+    frame = framed[start + 1:end]
+    frame = frame.replace(
+        bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG])
+    )
+    frame = frame.replace(
+        bytes([HDLC.ESC, HDLC.ESC ^ HDLC.ESC_MASK]), bytes([HDLC.ESC])
+    )
+    return {'data': bytes_to_hex(frame)}
+
+
+def cmd_kiss_deframe(params):
+    """Strip KISS framing and reverse the TFEND/TFESC transpose.
+
+    Reverses RNS's KISS framing (the framing KISSInterface uses:
+    FEND + CMD_DATA + KISS.escape(data) + FEND). Extracts the bytes between
+    the first two FEND (0xC0) delimiters, verifies the leading command byte is
+    CMD_DATA (0x00), then undoes the transpose with the inverse of RNS's
+    send-side escape: FESC+TFEND -> FEND, then FESC+TFESC -> FESC. Constants
+    are read off the real RNS.Interfaces.KISSInterface.KISS class.
+    """
+    RNS = _get_full_rns()
+    from RNS.Interfaces.KISSInterface import KISS
+    framed = hex_to_bytes(params['framed'])
+    start = framed.find(KISS.FEND)
+    if start == -1:
+        raise ValueError("no KISS FEND (0xC0) delimiter found in framed input")
+    end = framed.find(KISS.FEND, start + 1)
+    if end == -1:
+        raise ValueError("unterminated KISS frame: only one FEND delimiter")
+    inner = framed[start + 1:end]
+    if len(inner) < 1:
+        raise ValueError("empty KISS frame: no command byte")
+    command = inner[0]
+    if command != KISS.CMD_DATA:
+        raise ValueError(
+            f"unexpected KISS command byte {command:#04x}, expected "
+            f"CMD_DATA ({KISS.CMD_DATA:#04x})"
+        )
+    payload = inner[1:]
+    payload = payload.replace(
+        bytes([KISS.FESC, KISS.TFEND]), bytes([KISS.FEND])
+    )
+    payload = payload.replace(
+        bytes([KISS.FESC, KISS.TFESC]), bytes([KISS.FESC])
+    )
+    return {'data': bytes_to_hex(payload)}
 
 
 
@@ -1780,117 +1992,6 @@ def cmd_rns_set_proof_strategy(params):
     return {'set': True, 'strategy': strategy_name}
 
 
-# ─── Local Client Reader ───────────────────────────────────────────
-# Raw TCP socket that connects to Kotlin's LocalServerInterface as a passive
-# packet reader. Used by E2E tests to inspect forwarded announce headers.
-
-_local_client_socket = None
-_local_client_thread = None
-_local_client_packets = []      # list of bytes (deframed packets)
-_local_client_lock = __import__('threading').Lock()
-_local_client_running = False
-
-
-def _local_client_read_loop(sock):
-    """Background thread: read HDLC-framed packets from the socket."""
-    import socket as _socket
-    global _local_client_running
-    buf = bytearray()
-    in_frame = False
-
-    try:
-        while _local_client_running:
-            try:
-                chunk = sock.recv(4096)
-            except _socket.timeout:
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break
-
-            for b in chunk:
-                if b == HDLC_FLAG:
-                    if in_frame and len(buf) > 0:
-                        # End of frame — unescape and store
-                        unescaped = bytearray()
-                        i = 0
-                        while i < len(buf):
-                            if buf[i] == HDLC_ESC and i + 1 < len(buf):
-                                unescaped.append(buf[i + 1] ^ HDLC_ESC_MASK)
-                                i += 2
-                            else:
-                                unescaped.append(buf[i])
-                                i += 1
-                        with _local_client_lock:
-                            _local_client_packets.append(bytes(unescaped))
-                    # Start new frame
-                    buf = bytearray()
-                    in_frame = True
-                elif in_frame:
-                    buf.append(b)
-    except Exception:
-        pass
-    finally:
-        _local_client_running = False
-
-
-def cmd_local_client_connect(params):
-    """Connect a raw TCP socket to a LocalServerInterface as a passive reader.
-
-    params:
-        host (str): hostname (default '127.0.0.1')
-        port (int): TCP port
-    returns:
-        connected (bool)
-    """
-    import socket
-    import threading
-
-    global _local_client_socket, _local_client_thread
-    global _local_client_packets, _local_client_running
-
-    host = params.get('host', '127.0.0.1')
-    port = int(params['port'])
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    sock.connect((host, port))
-    sock.settimeout(1.0)        # non-blocking-ish for read loop
-
-    _local_client_socket = sock
-    _local_client_running = True
-    with _local_client_lock:
-        _local_client_packets.clear()
-
-    _local_client_thread = threading.Thread(
-        target=_local_client_read_loop, args=(sock,), daemon=True
-    )
-    _local_client_thread.start()
-
-    return {'connected': True}
-
-
-def cmd_local_client_disconnect(params):
-    """Close the local client socket."""
-    global _local_client_socket, _local_client_thread, _local_client_running
-
-    _local_client_running = False
-
-    if _local_client_socket:
-        try:
-            _local_client_socket.close()
-        except Exception:
-            pass
-        _local_client_socket = None
-
-    if _local_client_thread:
-        _local_client_thread.join(timeout=2.0)
-        _local_client_thread = None
-
-    return {'disconnected': True}
-
-
 # Command dispatcher
 COMMANDS = {
     'x25519_generate': cmd_x25519_generate,
@@ -1907,6 +2008,8 @@ COMMANDS = {
     'pkcs7_unpad': cmd_pkcs7_unpad,
     'aes_encrypt': cmd_aes_encrypt,
     'aes_decrypt': cmd_aes_decrypt,
+    'aes_256_cbc_encrypt': cmd_aes_256_cbc_encrypt,
+    'aes_256_cbc_decrypt': cmd_aes_256_cbc_decrypt,
     'token_encrypt': cmd_token_encrypt,
     'token_decrypt': cmd_token_decrypt,
     'token_verify_hmac': cmd_token_verify_hmac,
@@ -1935,6 +2038,9 @@ COMMANDS = {
     # Compression operations
     'bz2_compress': cmd_bz2_compress,
     'bz2_decompress': cmd_bz2_decompress,
+    # Interface framing (HDLC / KISS deframing)
+    'hdlc_deframe': cmd_hdlc_deframe,
+    'kiss_deframe': cmd_kiss_deframe,
     'rns_start': cmd_rns_start,
     'rns_stop': cmd_rns_stop,
     # Live RNS protocol operations (link, resource, ratchet)
@@ -1962,9 +2068,6 @@ COMMANDS = {
     'rns_clear_request_responses': cmd_rns_clear_request_responses,
     # Proof strategy
     'rns_set_proof_strategy': cmd_rns_set_proof_strategy,
-    # Local client reader (raw socket for E2E announce forwarding tests)
-    'local_client_connect': cmd_local_client_connect,
-    'local_client_disconnect': cmd_local_client_disconnect,
 }
 
 # Behavioral conformance commands (black-box Transport tests).

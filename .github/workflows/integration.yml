@@ -1,0 +1,103 @@
+name: Conformance Integration (python-only)
+
+# Runs the in-process integration suite (integration/) against real Python RNS
+# with NO external Swift/Kotlin binary (--python-only): the reference plays
+# every node. Before this workflow the 34-test integration domain ran in no CI
+# at all and was silently dormant — 0 passed under --python-only (N-H3).
+#
+# A bare `pytest` exit code is NOT a sufficient gate here: an all-skipped run
+# exits 0 and would look green while testing nothing. The guard below parses
+# the JUnit results and fails unless at least MIN_PASSED tests actually PASSED
+# (and zero failed/errored), so an all-skip OR all-error run is RED.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration-python-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (RNS/LXMF pinned to audited ground truth)
+        run: pip install pytest "rns==1.3.1" "lxmf==0.9.9"
+
+      - name: Assert RNS/LXMF versions match audited ground truth
+        run: |
+          python3 - <<'PY'
+          import sys
+          import RNS, LXMF
+          print(f"RNS {RNS.__version__}, LXMF {LXMF.__version__}")
+          errs = []
+          if RNS.__version__ != "1.3.1":
+              errs.append(f"RNS {RNS.__version__} != 1.3.1")
+          if LXMF.__version__ != "0.9.9":
+              errs.append(f"LXMF {LXMF.__version__} != 0.9.9")
+          if errs:
+              print("::error::not running against audited ground truth: " + "; ".join(errs))
+              sys.exit(1)
+          print("OK: RNS 1.3.1 / LXMF 0.9.9")
+          PY
+
+      - name: Run integration suite (--python-only) with min-passed guard
+        env:
+          # Minimum number of tests that must actually PASS. This is a coverage
+          # FLOOR, not a failure mask: the guard below fails the job on ANY
+          # failed/errored test independently (see `if failures or errors`), so
+          # MIN_PASSED can never let a failing test through. Its job is to catch
+          # *dormancy* — pytest exits 0 when every test is skipped, so an all-skip
+          # (or now a mostly-skip) run would otherwise look green while testing
+          # little. Set to 30: below the full integration count (~34-36) to leave
+          # buffer for any tests that legitimately skip on this CI runner, but
+          # high enough that a partial-dormancy regression (most tests silently
+          # skipping again) turns the job RED. Re-check against an actual CI pass
+          # count and raise further toward the full count if all tests run here.
+          MIN_PASSED: "30"
+        run: |
+          rc=0
+          python3 -m pytest integration/ --python-only -q \
+            --junitxml=integration-results.xml || rc=$?
+          echo "pytest exit code: $rc"
+          python3 - <<'PY'
+          import os, sys
+          import xml.etree.ElementTree as ET
+
+          MIN = int(os.environ.get("MIN_PASSED", "1"))
+          path = "integration-results.xml"
+          if not os.path.exists(path):
+              print("::error::pytest produced no JUnit XML — the suite did not run.")
+              sys.exit(1)
+
+          root = ET.parse(path).getroot()
+          suites = root.findall(".//testsuite")
+          if not suites and root.tag == "testsuite":
+              suites = [root]
+          tests = failures = errors = skipped = 0
+          for s in suites:
+              tests += int(s.get("tests", 0))
+              failures += int(s.get("failures", 0))
+              errors += int(s.get("errors", 0))
+              skipped += int(s.get("skipped", 0))
+          passed = tests - failures - errors - skipped
+          print(f"integration --python-only: {passed} passed, {failures} failed, "
+                f"{errors} errors, {skipped} skipped (of {tests} collected)")
+
+          if failures or errors:
+              print(f"::error::{failures} failed / {errors} errored.")
+              sys.exit(1)
+          if passed < MIN:
+              print(f"::error::only {passed} passed (need >= MIN_PASSED={MIN}); "
+                    f"an all-skip/all-error integration run must be RED.")
+              sys.exit(1)
+          print(f"OK: {passed} passed (>= MIN_PASSED={MIN}), 0 failed/errored.")
+          PY

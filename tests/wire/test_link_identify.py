@@ -66,9 +66,9 @@ def _bring_up_link(server, client):
 
 @conformance_case(
     commands=[
-        "start_tcp_server", "start_tcp_client", "listen", "link_open",
-        "register_request_handler", "link_identify", "link_request",
-        "get_request_log",
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "link_identify",
+        "link_request", "get_request_log",
     ],
     verifies="ALLOW_ALL request handler observes a non-None remote_identity when the requester called Link.identify first — the field handlers gate auth on. An impl that drops remote_identity through the request pipeline breaks every ALLOW_LIST handler (LXMF lxmd propagation sync etc.)",
 )
@@ -105,11 +105,11 @@ def test_identified_request_surfaces_remote_identity(wire_peers):
 
 @conformance_case(
     commands=[
-        "start_tcp_server", "start_tcp_client", "listen", "link_open",
-        "register_request_handler", "link_identify", "link_request",
-        "get_request_log",
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "identity_from_private_key",
+        "link_identify", "link_request", "get_request_log",
     ],
-    verifies="ALLOW_LIST request handler positive control: when the identified requester's identity_hash is in the destination's allowed_list, RNS runs the handler and routes the response back",
+    verifies="ALLOW_LIST request handler positive control: when the identified requester's identity_hash is in the destination's allowed_list, RNS runs the handler exactly once and routes the handler's exact registered response bytes back to the requester",
 )
 def test_allow_list_admits_listed_identity(wire_peers):
     server, client = wire_peers
@@ -137,6 +137,15 @@ def test_allow_list_admits_listed_identity(wire_peers):
         f"ALLOW_LIST request from listed identity did not complete READY: "
         f"status={result['status']!r}"
     )
+    # The response RNS routed back must be exactly the handler's registered
+    # payload (L11). status==ready alone does not prove the right bytes came
+    # through — an impl that admits the request but returns the wrong/empty
+    # response would otherwise pass.
+    assert bytes.fromhex(result["response"]) == response_payload, (
+        f"ALLOW_LIST handler ran but the routed response did not match the "
+        f"registered payload: got {result['response']!r}, expected "
+        f"{response_payload.hex()!r}"
+    )
     entries = server.get_request_log(server_dest, _PATH)
     assert len(entries) == 1, (
         f"expected handler to run once for listed identity, got "
@@ -146,9 +155,9 @@ def test_allow_list_admits_listed_identity(wire_peers):
 
 @conformance_case(
     commands=[
-        "start_tcp_server", "start_tcp_client", "listen", "link_open",
-        "register_request_handler", "link_identify", "link_request",
-        "get_request_log",
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "identity_from_private_key",
+        "link_identify", "link_request", "get_request_log",
     ],
     verifies="ALLOW_LIST request handler negative control: when the identified requester's identity_hash is NOT in the destination's allowed_list, RNS rejects the request before the handler runs (request fails or times out) AND the handler's invocation log stays empty. An impl that runs the handler regardless of allow_list silently bypasses propagation-node auth.",
 )

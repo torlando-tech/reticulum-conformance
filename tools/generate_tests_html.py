@@ -307,20 +307,31 @@ def _resolve_direct_fixtures(item) -> list[tuple[str, str, str]]:
         func = getattr(fdef, "func", None)
         if func is None:
             continue
+        # Skip pytest-internal pseudo-fixtures. Directly-parametrized params
+        # (e.g. @pytest.mark.parametrize("mode", ...)) appear in the fixture
+        # registry backed by `_pytest.python.get_direct_param_fixture_func`.
+        # They are not project fixtures, and inspect.getsourcefile resolves
+        # them to an absolute install path — rendering them embeds a
+        # machine-specific path (`/opt/homebrew/...`, `site-packages/...`)
+        # in the committed HTML, making it non-reproducible (N-M15).
+        if (getattr(func, "__module__", "") or "").split(".", 1)[0] == "_pytest":
+            continue
         try:
             src = _extract_fixture_source(func)
             src_file = inspect.getsourcefile(func) or ""
         except (OSError, TypeError):
             continue
+        if not src_file:
+            continue
         try:
-            rel = (
-                Path(src_file).resolve().relative_to(REPO_ROOT).as_posix()
-                if src_file
-                else "(unknown)"
-            )
+            rel = Path(src_file).resolve().relative_to(REPO_ROOT).as_posix()
         except ValueError:
-            # source lives outside the repo (e.g. pytest plugin)
-            rel = src_file
+            # Source lives outside the repo (pytest plugin, stdlib,
+            # site-packages). Skip rather than emit an absolute path: that
+            # would embed a machine-specific location and break the
+            # reproducibility guarantee this generator is meant to provide
+            # (N-M15).
+            continue
         out.append((name, src, rel))
     return out
 
@@ -388,6 +399,23 @@ def _cmd_chips(commands: tuple[str, ...]) -> str:
 
 def _plural(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _display_path(p: Path) -> str:
+    """Render `p` relative to REPO_ROOT when possible, else its resolved
+    absolute form.
+
+    `Path.relative_to(REPO_ROOT)` raises `ValueError` for paths outside the
+    repo and for bare-relative paths (a relative path is never relative to an
+    absolute one). Resolving first lets bare-relative `--output` values work
+    when run from inside the repo, and the fallback keeps a custom out-of-repo
+    `--output` from crashing the generator after it has already written the
+    file (L16) — important for CI regen-and-diff.
+    """
+    try:
+        return p.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(p.resolve())
 
 
 # ── CSS / JS ──────────────────────────────────────────────────────────
@@ -1005,7 +1033,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--output", type=Path, default=DEFAULT_OUTPUT,
-        help=f"output path (default: {DEFAULT_OUTPUT.relative_to(REPO_ROOT)})",
+        help=f"output path (default: {_display_path(DEFAULT_OUTPUT)})",
     )
     args = parser.parse_args()
 
@@ -1027,7 +1055,7 @@ def main() -> int:
                 decorated += 1
         print(
             f"Wrote {decorated} decorated tests ({len(items)} collected items) "
-            f"to {args.output.relative_to(REPO_ROOT)}",
+            f"to {_display_path(args.output)}",
             file=sys.stderr,
         )
 

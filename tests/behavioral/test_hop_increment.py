@@ -28,7 +28,8 @@ __category_order__ = 19
 
 
 @conformance_case(
-    commands=["start", "attach_mock_interface", "inject", "drain_tx"],
+    commands=["start", "attach_mock_interface", "inject", "drain_tx",
+              "announce_build"],
     verifies="An announce received with wire_hops=N is re-emitted on another interface with hops=N+1 (the per-hop +1 increment rule)",
 )
 def test_hop_increment_on_receive(behavioral):
@@ -94,21 +95,29 @@ def test_hop_increment_on_receive(behavioral):
 
 
 @conformance_case(
-    commands=["start", "attach_mock_interface", "inject", "drain_tx"],
-    verifies="With enable_transport=False and no local clients, received announces are NOT re-emitted on any other interface (the transport gate enforces)",
+    commands=["start", "attach_mock_interface", "inject", "drain_tx",
+              "read_path_table", "announce_build"],
+    verifies="With enable_transport=False and no local clients, a received announce is still PROCESSED (its destination is learned into the path table at hops=1) but is NOT re-emitted on any interface — the transport gate suppresses retransmit, not announce intake",
 )
 def test_hop_increment_when_transport_disabled(behavioral):
     """With enable_transport=False and no local clients, Transport should NOT
-    re-emit received announces on any other interface. (This is the gate
-    Python `Transport.py:1741` and reticulum-kt's corresponding line enforce.)
-    """
+    re-emit received announces on any other interface (the retransmit gate at
+    `Transport.py:1884`, which reticulum-kt's corresponding line enforces).
+
+    Positive control (re-audit M20): the same announce IS still admitted to the
+    path table. The path_table write (`Transport.py:2011-2012`) is NOT gated by
+    `enable_transport` — only the announce_table retransmit is — so a correct
+    impl learns the destination while staying silent. Asserting the path WAS
+    learned proves the "no re-emit" result is the transport gate at work, not
+    the announce being silently dropped (which would make the negative
+    assertions vacuous)."""
     inst = behavioral.start(enable_transport=False)
     try:
         iface_a = inst.attach_mock_interface("a", mode="FULL")
         iface_b = inst.attach_mock_interface("b", mode="FULL")
 
         announcer_private = secrets.token_bytes(64)
-        raw, _dest, _pub = build_announce_from_destination(
+        raw, dest, _pub = build_announce_from_destination(
             behavioral.bridge,
             identity_private_key=announcer_private,
             app_name="testapp",
@@ -127,9 +136,23 @@ def test_hop_increment_when_transport_disabled(behavioral):
         # going to emit at all, it has done so before we drain.
         time.sleep(3.0)
 
+        # Negative: no re-broadcast on any interface.
         assert first_announce(inst.drain_tx(iface_a)) is None
         assert first_announce(inst.drain_tx(iface_b)) is None, (
             "Announce was rebroadcast with transport disabled and no local clients"
+        )
+
+        # Positive control: the announce WAS received and its path learned.
+        # If it had instead been ignored/dropped, the negative assertions above
+        # would pass vacuously.
+        pt = inst.read_path_table(dest)
+        assert pt["found"], (
+            "transport-disabled node did not learn the announced destination — "
+            "the 'no re-emit' assertions above would be vacuous (M20)"
+        )
+        assert pt["hops"] == 1, (
+            f"learned path should be 1 hop (wire 0 + receive increment), "
+            f"got {pt['hops']}"
         )
     finally:
         behavioral.cleanup()

@@ -35,6 +35,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _rns_paths import resolve_rns_path  # noqa: E402
 
+# Shared IFAC derivation (this file's directory is on sys.path as the script
+# dir). Single source of truth with pipe_session.py — see integration/ifac_util.py.
+from ifac_util import configure_ifac  # noqa: E402
+
 # Make `import RNS` work in this process.
 sys.path.insert(0, resolve_rns_path())
 
@@ -183,6 +187,14 @@ def main():
     pipe_iface = _create_pipe_interface(RNS, sys.stdin.buffer, sys.stdout.buffer, "StdioPipe")
     pipe_iface.owner = RNS.Transport
     reticulum._add_interface(pipe_iface, mode=iface_mode)
+
+    # Optional IFAC (Interface Access Code) masking via the shared derivation in
+    # integration/ifac_util.py, so the in-repo peer and the Python reference
+    # (pipe_session.py) interoperate over an IFAC-protected link with an
+    # identical key.
+    ifac_passphrase = os.environ.get("PIPE_PEER_IFAC_PASSPHRASE")
+    ifac_netname = os.environ.get("PIPE_PEER_IFAC_NETNAME")
+    configure_ifac(RNS, pipe_iface, ifac_passphrase, ifac_netname)
 
     handler = _AnnounceHandler(RNS)
     RNS.Transport.register_announce_handler(handler)
@@ -341,10 +353,15 @@ def _path_table_dumper(RNS):
             entries = []
             for dest_hash in RNS.Transport.path_table:
                 entry = RNS.Transport.path_table[dest_hash]
+                # RNS path_table entry layout (Transport.py:326):
+                #   [timestamp, received_from, hops, expires, random_blobs,
+                #    receiving_interface, announce_packet_hash]
+                expires = entry[3] if len(entry) > 3 else None
                 entries.append({
                     "destination_hash": dest_hash.hex(),
                     "hops": entry[2],
                     "next_hop": entry[1].hex() if isinstance(entry[1], bytes) else str(entry[1]),
+                    "expired": (time.time() > expires) if expires is not None else False,
                 })
             current = json.dumps(entries, sort_keys=True)
             if current != last_dump:
@@ -359,6 +376,10 @@ def _create_pipe_interface(RNS, pin, pout, name="StdioPipe"):
     from RNS.Interfaces.Interface import Interface as BaseInterface
 
     class StreamPipeInterface(BaseInterface):
+        # RNS 1.3.1 Reticulum._add_interface reads interface.DEFAULT_IFAC_SIZE
+        # (Reticulum.py:1050); the base Interface defines no default. Match
+        # PipeInterface.DEFAULT_IFAC_SIZE (8) so _add_interface doesn't raise.
+        DEFAULT_IFAC_SIZE = 8
         FLAG = 0x7E
         ESC = 0x7D
         ESC_MASK = 0x20

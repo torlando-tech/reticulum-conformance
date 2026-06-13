@@ -96,8 +96,8 @@ class TestIFACAnnounce:
             "wrong IFAC passphrase should cause validation failure"
         )
 
-    def test_python_announce_with_ifac_to_swift(self, session):
-        """Python announces with IFAC, Swift peer in listen mode receives it."""
+    def test_python_announce_with_ifac_to_target(self, session):
+        """Python announces with IFAC; matching-IFAC target validates and receives it."""
         session.start(
             peer_action="listen",
             peer_ifac_passphrase="secret",
@@ -108,22 +108,23 @@ class TestIFACAnnounce:
         ready = session.wait_for_ready(timeout=20)
         assert ready is not None, "Target did not emit 'ready'"
 
-        # Python announces
+        # Python announces over the IFAC-masked interface.
         dest, identity = session.python_announce()
         dest_hash_hex = dest.hash.hex()
 
-        # Python should have its own path (local destination)
-        # The key test is that the announce went through IFAC masking on the
-        # Python side and the Swift side could validate it via IFAC.
-        # Since the Swift PipePeer doesn't emit announce_received events yet,
-        # we verify the reverse direction: Python sends IFAC-protected packets
-        # and the Swift side doesn't crash or reject the connection.
-        # The matching IFAC test (test_announce_with_matching_ifac) already
-        # proves Swift->Python works. This test proves the IFAC masking on
-        # Python's process_outgoing works correctly (no crash/hang).
-        time.sleep(3)
-        # If we get here without the subprocess crashing, the test passes.
-        # The subprocess should still be alive.
+        # The target (matching IFAC) must validate the IFAC mask on Python's
+        # process_outgoing output and actually deliver the announce — a real
+        # receipt, not just "the subprocess didn't crash". A wrong IFAC mask on
+        # either side would cause the target to drop the packet and emit nothing.
+        msg = session.wait_for_announce_received(dest_hash=dest_hash_hex, timeout=15)
+        assert msg is not None, (
+            f"Target did not receive Python's IFAC-protected announce for {dest_hash_hex}"
+        )
+        assert msg["identity_hash"] == identity.hash.hex(), (
+            f"Target recalled wrong identity: {msg['identity_hash']} != {identity.hash.hex()}"
+        )
+        assert msg["hops"] == 1, f"Expected 1 hop over direct pipe, got {msg['hops']}"
+        # And the link is intact.
         assert session.process.poll() is None, (
-            "Swift PipePeer crashed when receiving IFAC-protected announce from Python"
+            "Target crashed when receiving IFAC-protected announce from Python"
         )

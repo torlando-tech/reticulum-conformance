@@ -76,6 +76,40 @@ def _plural(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
 
+def _display_path(p: Path) -> str:
+    """Render `p` relative to REPO_ROOT when possible, else its resolved
+    absolute form.
+
+    `Path.relative_to(REPO_ROOT)` raises `ValueError` for paths outside the
+    repo and for bare-relative paths (a relative path is never relative to an
+    absolute one). Resolving first lets bare-relative `--output` values work
+    when run from inside the repo, and the fallback keeps a custom out-of-repo
+    `--output` from crashing the generator after it has already written the
+    file (L16) — important for CI regen-and-diff.
+    """
+    try:
+        return p.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(p.resolve())
+
+
+def _md_cell(text: str) -> str:
+    """Escape `text` for safe inclusion in a single Markdown table cell.
+
+    A literal `|` would start a new column and a newline would terminate the
+    row, corrupting the whole table. We escape pipes as `\\|` and fold any
+    newline into a `<br>` (GFM renders it as a line break inside the cell).
+    Latent today (no verifies string or command currently contains either),
+    but keeps the generator correct if one ever does (L17).
+    """
+    return (
+        text.replace("|", "\\|")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "<br>")
+    )
+
+
 def _categorize(items):
     """Group decorated items by (order, title) → per-file rows.
 
@@ -152,10 +186,11 @@ def render(items) -> str:
             out.append("|---|------|--------------|-----------------|")
             for fn_name, case in rows:
                 sub_idx += 1
-                cmds = (", ".join(f"`{c}`" for c in case.commands)
+                cmds = (", ".join(f"`{_md_cell(c)}`" for c in case.commands)
                         if case.commands else "—")
                 out.append(
-                    f"| {cat_idx}.{sub_idx} | `{fn_name}` | {cmds} | {case.verifies} |"
+                    f"| {cat_idx}.{sub_idx} | `{_md_cell(fn_name)}` | {cmds} "
+                    f"| {_md_cell(case.verifies)} |"
                 )
             out.append("")
 
@@ -173,7 +208,7 @@ def main() -> int:
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
-        help=f"output path (default: {DEFAULT_OUTPUT.relative_to(REPO_ROOT)})",
+        help=f"output path (default: {_display_path(DEFAULT_OUTPUT)})",
     )
     args = parser.parse_args()
 
@@ -198,7 +233,7 @@ def main() -> int:
                 decorated += 1
         print(
             f"Wrote {decorated} decorated tests ({len(items)} collected items) "
-            f"to {args.output.relative_to(REPO_ROOT)}",
+            f"to {_display_path(args.output)}",
             file=sys.stderr,
         )
 

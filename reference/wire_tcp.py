@@ -41,6 +41,60 @@ Commands:
   wire_read_path_random_hash(handle, destination_hash)
     -> {found: bool, random_hash: hex}
     Extract the 10-byte random_hash segment of the cached announce.
+
+  --- Resource (segmentation / HMU / compression coverage) ---
+  wire_resource_create(handle, link_id, data, force_sdu=None,
+                       include_parts=True, auto_compress=True)
+    -> {hash, truncated_hash, random_hash, expected_proof, hashmap, num_parts,
+        total_segments, segment_index, encrypted, compressed, split, size,
+        total_size, sdu, parts?}
+    Builds a real RNS.Resource (advertise=False) and reads its attributes.
+    force_sdu forces >74 parts (HMU threshold); a >1 MiB payload yields
+    total_segments>1; a compressible payload yields compressed=True.
+
+  --- Link lifecycle (status / STALE / teardown / keepalive) ---
+  wire_link_status(handle, link_id)
+    -> {status, status_name, teardown_reason, teardown_reason_name,
+        no_inbound_for_ms, last_keepalive_ago_ms, keepalive_s, stale_time_s, rtt}
+  wire_link_set_watchdog(handle, link_id, keepalive_s=None, stale_time_s=None)
+    -> {keepalive_s, stale_time_s}   (compress timings; keepalive_s>=stale_time_s
+       forces a deterministic ACTIVE->STALE->CLOSED/TIMEOUT teardown)
+  wire_link_await_status(handle, link_id, target_status, timeout_ms=15000)
+    -> link_status fields + {reached: bool}   (>= ordering; STALE also matches CLOSED)
+  wire_link_teardown(handle, link_id) -> {torn_down: bool}   (graceful initiator close)
+  wire_listener_link_status(handle, destination_hash, timeout_ms=0)
+    -> link_status fields + {found, link_count}   (receiver-side inbound link)
+  wire_set_proof_strategy(handle, destination_hash, strategy)
+    -> {strategy, proof_strategy}   (strategy in {"all","app","none"})
+
+  --- Channel (out-of-order / duplicate / window) ---
+  wire_channel_inject(handle, link_id, envelopes=[{sequence:int, data:hex}])
+    -> {injected: [int]}   (feeds crafted envelopes into Channel._receive)
+  wire_channel_received(handle, link_id) -> {messages: [hex]}   (delivery order)
+  wire_channel_window(handle, link_id)
+    -> {window, window_min, window_max, window_flexibility,
+        next_rx_sequence, next_sequence, rx_ring, tx_ring}
+
+  --- GROUP destination symmetric crypto ---
+  wire_group_create(handle, app_name, aspects=[], key=None)
+    -> {destination_hash, key}
+  wire_group_encrypt(handle, destination_hash, plaintext) -> {ciphertext}
+  wire_group_decrypt(handle, destination_hash, ciphertext)
+    -> {plaintext: hex|None, decrypted: bool}
+
+  --- Identity ratchet crypto (enforce_ratchets rejection) ---
+  wire_identity_keypair() -> {private_key, public_key, hash}
+  wire_ratchet_keypair() -> {private_key, public_key}   (X25519)
+  wire_identity_encrypt(public_key, plaintext, ratchet_pub=None) -> {ciphertext}
+  wire_identity_decrypt(private_key, ciphertext, ratchets=[], enforce_ratchets=False)
+    -> {plaintext: hex|None, decrypted: bool}
+
+  --- IFAC (issue-29 golden vector via genuine RNS) ---
+  wire_ifac_compute(handle, packet_data, ifac_size=None)
+    -> {ifac_key, ifac_size, signature, ifac}
+    Reads the live interface's RNS-derived ifac_identity/ifac_key and signs
+    packet_data (Transport.transmit's exact computation).
+
   wire_stop(handle) -> {stopped: bool}
 
 Each bridge process hosts at most one wire RNS singleton. Attempting a second
@@ -50,6 +104,7 @@ the second peer. The pytest `wire_peers` fixture does exactly this.
 
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import tempfile
@@ -62,6 +117,36 @@ _shared_wire_config_dir = None
 
 _instances = {}
 _instances_lock = threading.Lock()
+
+# Receiver-side ceiling applied to every inbound Resource's decompression bound
+# (RNS default is Resource.AUTO_COMPRESS_MAX_SIZE = 64 MiB, Resource.py:124/:364).
+# Lowered here so the bz2 decompression-bomb guard (Resource.py:686-689) can be
+# tripped by a SINGLE-segment crafted payload (a Resource only splits above
+# MAX_EFFICIENT_SIZE ~= 1 MiB, and each segment decompresses to <= that, so the
+# bound MUST sit below 1 MiB to be trippable without splitting). 256 KiB keeps
+# the bomb cheap/bounded. SAFE for the existing suite: every current wire
+# transfer either sends incompressible random bytes (compressed=False, the
+# decompressor never runs) or a sub-KiB compressible payload — all far below
+# this ceiling, so legitimate transfers are unaffected.
+_WIRE_RX_MAX_DECOMPRESSED = 256 * 1024
+
+# Resource status code -> name (Resource.py:142-152). Note REJECTED == NONE == 0
+# upstream; a sender whose Resource was RESOURCE_RCL-rejected lands here at 0.
+_RESOURCE_STATUS_NAMES = {
+    0x00: "NONE",
+    0x01: "QUEUED",
+    0x02: "ADVERTISED",
+    0x03: "TRANSFERRING",
+    0x04: "AWAITING_PROOF",
+    0x05: "ASSEMBLING",
+    0x06: "COMPLETE",
+    0x07: "FAILED",
+    0x08: "CORRUPT",
+}
+
+# Fixed stream id used by the Buffer (RawChannelReader/Writer) streaming path on
+# both peers — a Channel is per-Link, so a single shared stream id suffices.
+_WIRE_BUFFER_STREAM_ID = 0
 
 
 def _get_rns():
@@ -310,6 +395,20 @@ def cmd_wire_start_tcp_server(params):
     passphrase = params.get("passphrase") or ""
     bind_port = int(params.get("bind_port", 0))
     share_instance = bool(params.get("share_instance", False))
+    # enable_transport (default True) lets a test bring up a transport-DISABLED
+    # shared master — the rnsd default posture, and the only way to exercise R3
+    # (CONFORMANCE_GAPS.md §3): local-client forwarding BYPASSES transport_enabled
+    # (Transport.py:1536/:1884/:2172/:2254). With this False + share_instance=True,
+    # an attached local client's announces/links must still reach a TCP peer even
+    # though Reticulum.transport_enabled() is False on the master; an impl that
+    # gates local-client forwarding on transport_enabled black-holes them.
+    enable_transport = bool(params.get("enable_transport", True))
+    # fixed_mtu pins the TCPInterface to a small fixed link MTU
+    # (TCPInterface.py:110-116: disables AUTOCONFIGURE_MTU, sets HW_MTU). Both
+    # peers of a link must use the same value so the negotiated link SDU stays
+    # small on BOTH ends — the only way a modest Resource chunks into >74 parts
+    # and drives the real on-wire HMU handshake. Must be >= Reticulum.MTU (500).
+    fixed_mtu = params.get("fixed_mtu")
     share_instance_type = params.get("share_instance_type")
     if share_instance_type is not None:
         share_instance_type = str(share_instance_type).lower()
@@ -354,6 +453,8 @@ def cmd_wire_start_tcp_server(params):
         "    listen_ip = 127.0.0.1\n"
         f"    listen_port = {bind_port}\n"
     )
+    if fixed_mtu is not None:
+        iface_block += f"    fixed_mtu = {int(fixed_mtu)}\n"
     _write_ifac_ini(
         config_dir,
         "Wire TCP Server",
@@ -367,6 +468,7 @@ def cmd_wire_start_tcp_server(params):
         shared_instance_port=shared_instance_port,
         instance_control_port=instance_control_port,
         rpc_key=rpc_key_hex,
+        enable_transport=enable_transport,
     )
 
     RNS = _get_rns()
@@ -388,12 +490,19 @@ def cmd_wire_start_tcp_server(params):
             "shared_instance_port": shared_instance_port,
             "instance_control_port": instance_control_port,
             "rpc_key": rpc_key_hex,
+            "enable_transport": enable_transport,
         }
 
     response = {
         "handle": handle,
         "port": bind_port,
         "identity_hash": identity_hash.hex(),
+        # Surface the resolved transport posture so a test can assert it took
+        # (and so wire_start_tcp_server(enable_transport=False) is self-
+        # documenting in logs). RNS.Reticulum.transport_enabled() is the
+        # ground-truth observable a test should pin, but echoing the config
+        # value here lets the fixture record it without a second round-trip.
+        "transport_enabled": bool(enable_transport),
     }
     if share_instance:
         response["instance_name"] = instance_name
@@ -508,6 +617,8 @@ def cmd_wire_start_tcp_client(params):
     target_host = params["target_host"]
     target_port = int(params["target_port"])
     mode = _normalize_mode(params.get("mode"))
+    # fixed_mtu: pin the link MTU small on this end too (must match the server's).
+    fixed_mtu = params.get("fixed_mtu")
 
     config_dir = tempfile.mkdtemp(prefix="rns_wire_client_")
     iface_block = (
@@ -516,6 +627,8 @@ def cmd_wire_start_tcp_client(params):
         f"    target_host = {target_host}\n"
         f"    target_port = {target_port}\n"
     )
+    if fixed_mtu is not None:
+        iface_block += f"    fixed_mtu = {int(fixed_mtu)}\n"
     _write_ifac_ini(
         config_dir,
         "Wire TCP Client",
@@ -544,18 +657,212 @@ def cmd_wire_start_tcp_client(params):
     return {"handle": handle, "identity_hash": identity_hash.hex()}
 
 
+def _pipe_command(read_fifo: str, write_fifo: str) -> str:
+    """Build the PipeInterface `command` that bridges this peer to another via
+    a pair of named FIFOs.
+
+    PipeInterface writes RNS's OUTGOING bytes to the spawned command's STDIN
+    and reads INCOMING bytes from its STDOUT. So the command must:
+      - copy STDIN (RNS outgoing) into `write_fifo` (this peer -> other peer)
+      - copy `read_fifo` (other peer -> this peer) into STDOUT (RNS incoming)
+    The peer on the other end uses the same template with read/write swapped,
+    so the two FIFOs cross-connect the two processes. Validated to carry
+    announces + link establishment between two separate RNS processes over
+    loopback (the only inter-process channel available to the separate-bridge-
+    subprocess wire harness, which has no shared in-process Transport).
+
+    RNS runs this via ``subprocess.Popen(shlex.split(command), ...)`` — NO shell
+    — so the string must tokenize into ``['bash', '-c', <inner script>]``. Each
+    FIFO path is shlex.quote'd inside the inner script (so bash parses paths
+    containing spaces / `'` / `&` / `>` correctly, e.g. a macOS `/var/folders/…`
+    or custom TMPDIR), and the whole inner script is shlex.quote'd so shlex.split
+    keeps it as a single token. Quoting also moves any leading/trailing
+    whitespace inside quotes, so the ``command =`` value written to the RNS .ini
+    keeps clean boundaries. For ordinary mkdtemp paths the result is byte-for-byte
+    the previous ``bash -c 'cat … & cat > …'`` string.
+    """
+    inner = f"cat {shlex.quote(read_fifo)} & cat > {shlex.quote(write_fifo)}"
+    return f"bash -c {shlex.quote(inner)}"
+
+
+def _write_pipe_relay_config(
+    config_dir: str,
+    pipe_iface_name: str,
+    read_fifo: str,
+    write_fifo: str,
+    tcp_listen_port: int | None,
+    network_name: str,
+    passphrase: str,
+    enable_transport: bool,
+):
+    """Write an RNS config with a PipeInterface and (optionally) a
+    TCPServerInterface in the SAME instance — the mixed interface-type relay
+    used to exercise the in-transit link-MTU strip (CONFORMANCE_GAPS.md §2c).
+
+    When tcp_listen_port is None this is a pipe-ONLY leaf peer (the A end);
+    when set, this is the relay (the B middle) bridging a PipeInterface (to A)
+    and a TCPServerInterface (to C). PipeInterface inherits Interface's
+    AUTOCONFIGURE_MTU=False / FIXED_MTU=False, so a LINKREQUEST forwarded OUT
+    the pipe has its 3-byte LINK_MTU_SIZE signalling field stripped.
+    """
+    os.makedirs(config_dir, exist_ok=True)
+    ifac_lines = ""
+    if network_name:
+        ifac_lines += f"      network_name = {network_name}\n"
+    if passphrase:
+        ifac_lines += f"      passphrase = {passphrase}\n"
+
+    pipe_block = (
+        f"  [[{pipe_iface_name}]]\n"
+        "    type = PipeInterface\n"
+        "    enabled = Yes\n"
+        f"    command = {_pipe_command(read_fifo, write_fifo)}\n"
+        f"{ifac_lines}"
+    )
+    tcp_block = ""
+    if tcp_listen_port is not None:
+        tcp_block = (
+            f"  [[{pipe_iface_name} TCP]]\n"
+            "    type = TCPServerInterface\n"
+            "    enabled = Yes\n"
+            "    listen_ip = 127.0.0.1\n"
+            f"    listen_port = {tcp_listen_port}\n"
+            f"{ifac_lines}"
+        )
+
+    transport_value = "Yes" if enable_transport else "No"
+    with open(os.path.join(config_dir, "config"), "w") as f:
+        f.write(
+            "[reticulum]\n"
+            f"  enable_transport = {transport_value}\n"
+            "  share_instance = No\n"
+            "  respond_to_probes = No\n\n"
+            "[interfaces]\n"
+            f"{pipe_block}"
+            f"{tcp_block}"
+        )
+
+
+def cmd_wire_start_pipe_peer(params):
+    """Bring up RNS with a single PipeInterface bridged to a peer via FIFOs.
+
+    The leaf (A) end of the mixed pipe<->TCP relay topology. read_fifo and
+    write_fifo are named-FIFO paths the test fixture created; the peer on the
+    other end of the pipe (the relay) uses the same two FIFOs with read/write
+    swapped. enable_transport defaults False (a leaf host, not a transport
+    node). Returns {handle, identity_hash}.
+    """
+    network_name = params.get("network_name") or ""
+    passphrase = params.get("passphrase") or ""
+    read_fifo = params["read_fifo"]
+    write_fifo = params["write_fifo"]
+    enable_transport = bool(params.get("enable_transport", False))
+
+    config_dir = tempfile.mkdtemp(prefix="rns_wire_pipe_")
+    _write_pipe_relay_config(
+        config_dir,
+        pipe_iface_name="Wire Pipe Peer",
+        read_fifo=read_fifo,
+        write_fifo=write_fifo,
+        tcp_listen_port=None,
+        network_name=network_name,
+        passphrase=passphrase,
+        enable_transport=enable_transport,
+    )
+
+    RNS = _get_rns()
+    rns = _ensure_wire_rns_started(config_dir)
+    identity_hash = RNS.Transport.identity.hash
+
+    handle = secrets.token_hex(8)
+    with _instances_lock:
+        _instances[handle] = {
+            "rns": rns,
+            "config_dir": config_dir,
+            "identity_hash": identity_hash,
+            "role": "pipe_peer",
+            "destinations": [],
+        }
+    return {"handle": handle, "identity_hash": identity_hash.hex()}
+
+
+def cmd_wire_start_pipe_tcp_relay(params):
+    """Bring up RNS as a transport relay bridging a PipeInterface (to A) and a
+    TCPServerInterface (to C) — the mixed interface-type middle node B.
+
+    A LINKREQUEST arriving on one interface and forwarded out the other crosses
+    interface types. When forwarded OUT the PipeInterface (which does not
+    support MTU autoconfiguration), RNS strips the 3-byte LINK_MTU_SIZE
+    signalling field (Transport.py:1593-1600) so the destination's link falls
+    back to Reticulum.MTU (500). enable_transport defaults True (this node MUST
+    be a transport node to forward). If bind_port=0 a free TCP port is
+    allocated. Returns {handle, port, identity_hash}.
+    """
+    network_name = params.get("network_name") or ""
+    passphrase = params.get("passphrase") or ""
+    read_fifo = params["read_fifo"]
+    write_fifo = params["write_fifo"]
+    bind_port = int(params.get("bind_port", 0))
+    enable_transport = bool(params.get("enable_transport", True))
+    if bind_port == 0:
+        bind_port = _allocate_free_port()
+
+    config_dir = tempfile.mkdtemp(prefix="rns_wire_piperelay_")
+    _write_pipe_relay_config(
+        config_dir,
+        pipe_iface_name="Wire Pipe Relay",
+        read_fifo=read_fifo,
+        write_fifo=write_fifo,
+        tcp_listen_port=bind_port,
+        network_name=network_name,
+        passphrase=passphrase,
+        enable_transport=enable_transport,
+    )
+
+    RNS = _get_rns()
+    rns = _ensure_wire_rns_started(config_dir)
+    identity_hash = RNS.Transport.identity.hash
+
+    handle = secrets.token_hex(8)
+    with _instances_lock:
+        _instances[handle] = {
+            "rns": rns,
+            "config_dir": config_dir,
+            "identity_hash": identity_hash,
+            "role": "pipe_tcp_relay",
+            "port": bind_port,
+            "destinations": [],
+        }
+    return {
+        "handle": handle,
+        "port": bind_port,
+        "identity_hash": identity_hash.hex(),
+    }
+
+
 def cmd_wire_announce(params):
     """Create a fresh destination and announce it on all attached interfaces.
 
     Each announce uses a newly-generated Identity (separate from the
     Transport identity). That's the common pattern in production apps
     and avoids conflating the announcer with the interface operator.
+
+    enable_ratchets (bool, default False): enable per-destination ratchets
+    (Destination.enable_ratchets, Destination.py:466-489) BEFORE announcing,
+    so the announce carries the latest ratchet public key (context flag set,
+    Destination.py:284-287/:310-311) and the destination grows a real ratchet
+    store. This is the "A enables ratchets + announces" precondition for the
+    destination-level ratchet gaps (latest_ratchet_id / rotation-interval /
+    retained-cap / file-roundtrip). A unique ratchet file is created under the
+    instance config dir; the destination object (with its live ratchet state)
+    is reachable by hash via the wire_*_ratchet* commands below.
     """
     RNS = _get_rns()
     handle = params["handle"]
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
     app_data_hex = params.get("app_data") or ""
+    enable_ratchets = bool(params.get("enable_ratchets", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -571,16 +878,29 @@ def cmd_wire_announce(params):
         *aspects,
     )
 
+    ratchets_enabled = False
+    if enable_ratchets:
+        ratchets_path = os.path.join(
+            inst.get("config_dir") or tempfile.gettempdir(),
+            f"ratchets_{destination.hash.hex()}_{secrets.token_hex(4)}",
+        )
+        ratchets_enabled = bool(destination.enable_ratchets(ratchets_path))
+
     app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
     destination.announce(app_data=app_data)
     # Keep a reference so the destination/identity aren't GC'd before the
     # TX loop picks up the announce packet.
     inst["destinations"].append((identity, destination))
 
-    return {
+    response = {
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
     }
+    if enable_ratchets:
+        response["ratchets_enabled"] = ratchets_enabled
+        response["current_ratchet_id"] = _current_ratchet_id(destination)
+        response["ratchet_count"] = len(destination.ratchets) if destination.ratchets is not None else 0
+    return response
 
 
 def cmd_wire_poll_path(params):
@@ -618,18 +938,26 @@ def cmd_wire_identity_recall(params):
     Delegates to real RNS.Identity.recall — the same static method apps
     (Columba's NomadNet browser, Sideband's conversation lookup, LXMF's
     LXMessage source/destination resolution) call after observing an
-    announce. Returns the recalled identity's public_key (and hash) when
-    found, or {found: False} when the destination hash is unknown to this
-    instance (no announce received).
+    announce. Returns the recalled identity's public_key, hash, and the
+    last-heard app_data (Identity.py:138/:149/:161-174) when found, or
+    {found: False} when the hash is unknown to this instance (no announce
+    received) — which is also the recall_app_data(unknown) -> None case.
+
+    from_identity_hash (bool, default False): when True, `destination_hash`
+    is interpreted as an IDENTITY hash and RNS.Identity.recall searches
+    known_destinations by identity hash instead (Identity.py:129-141). The
+    recalled identity's app_data is surfaced in both modes.
 
     Optionally polls Transport.has_path first, so the test can express
     "wait until the announce has been received, then recall." Without the
-    poll the caller would have to sleep on raw timing.
+    poll the caller would have to sleep on raw timing. The path poll is
+    skipped for from_identity_hash (has_path keys on destination hashes).
     """
     RNS = _get_rns()
     handle = params["handle"]
     target_hash = bytes.fromhex(params["destination_hash"])
     timeout_ms = int(params.get("timeout_ms", 0))
+    from_identity_hash = bool(params.get("from_identity_hash", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -639,7 +967,7 @@ def cmd_wire_identity_recall(params):
     deadline = time.time() + (timeout_ms / 1000.0)
     identity = None
     while True:
-        identity = RNS.Identity.recall(target_hash)
+        identity = RNS.Identity.recall(target_hash, from_identity_hash=from_identity_hash)
         if identity is not None:
             break
         if time.time() >= deadline:
@@ -647,32 +975,74 @@ def cmd_wire_identity_recall(params):
         time.sleep(0.05)
 
     if identity is None:
-        return {"found": False}
+        return {"found": False, "app_data": None}
+    # identity.app_data is the last-heard app_data RNS.Identity.recall copies
+    # off the known_destinations entry (Identity.py:138/:149/:156); it equals
+    # RNS.Identity.recall_app_data(destination_hash) for the dest-hash path.
+    app_data = getattr(identity, "app_data", None)
     return {
         "found": True,
         "public_key": identity.get_public_key().hex(),
         "hash": identity.hash.hex(),
+        "app_data": app_data.hex() if isinstance(app_data, (bytes, bytearray)) else None,
     }
+
+
+_RESOURCE_APP_ACCEPT_MAX_SIZE = 4096  # ACCEPT_APP boundary (advertised data size)
 
 
 def cmd_wire_listen(params):
     """Register an IN SINGLE destination that accepts incoming Links.
 
     On link establishment, attach a packet callback that buffers received
-    bytes into an in-memory queue keyed by destination_hash. Also accept
-    any Resource transfers on the link and buffer their reassembled data.
-    Tests poll via wire_link_poll (single-packet data) or
-    wire_resource_poll (completed resources).
+    bytes into an in-memory queue keyed by destination_hash, set the inbound
+    Link's Resource accept strategy, and wire up the receiver-side
+    observation hooks the §4b Resource/Channel/Buffer gaps need:
 
-    Intended for the receiver-side peer in multi-hop link tests. The
-    sender uses wire_link_open to establish the link, then either
-    wire_link_send (single packet) or wire_resource_send (arbitrary-size
-    data chunked via the Resource API).
+      * resource accept strategy (`resource_strategy` param, default 'all'):
+        - 'all'  -> RNS.Link.ACCEPT_ALL (every Resource accepted).
+        - 'none' -> RNS.Link.ACCEPT_NONE (no parts flow; sender ends FAILED).
+        - 'app'  -> RNS.Link.ACCEPT_APP with a deterministic predicate: accept
+          iff the advertised uncompressed data size (ResourceAdvertisement.d)
+          is <= _RESOURCE_APP_ACCEPT_MAX_SIZE (4096). A larger Resource is
+          rejected (RESOURCE_RCL -> sender status REJECTED, Link.py:1094/:1140).
+      * a resource_started hook that captures every inbound Resource, lowers
+        its decompression bound to _WIRE_RX_MAX_DECOMPRESSED (so the bz2-bomb
+        guard can trip cheaply) and counts the HMU handshake observables
+        (hmu_requests_sent / hashmap_updates_received) — read via
+        wire_resource_receiver_status.
+      * a Channel on the inbound link with a recording handler, so the peer
+        PROVES received CHANNEL packets (Link.py:1165-1173) — required for
+        wire_channel_send delivery/window growth — and delivered messages are
+        observable via wire_channel_received.
+      * a RawChannelReader (Buffer) on the inbound link's Channel that
+        reassembles a StreamDataMessage stream and detects the MAX_CHUNK_LEN
+        decompression-bomb abort — read via wire_buffer_received.
+
+    enable_ratchets (bool, default False): enable per-destination ratchets
+    (Destination.enable_ratchets, Destination.py:466-489) on the IN SINGLE
+    destination BEFORE its immediate announce, exactly as cmd_wire_announce
+    does — so the listening destination carries the latest ratchet public key
+    and grows a real ratchet store. This lets the destination-level ratchet
+    observables (wire_read_ratchets / wire_destination_latest_ratchet_id /
+    wire_rotate_ratchet / wire_set_ratchet_interval / wire_set_retained_ratchets
+    / wire_ratchet_file_roundtrip) operate on a destination that also accepts
+    Links. Default False leaves the destination non-ratcheted (unchanged).
+
+    Tests poll via wire_link_poll (single-packet data), wire_resource_poll
+    (completed resource payloads), wire_resource_receiver_status (inbound
+    Resource state), wire_channel_received, or wire_buffer_received.
     """
     RNS = _get_rns()
     handle = params["handle"]
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
+    resource_strategy = str(params.get("resource_strategy") or "all").lower()
+    if resource_strategy not in ("all", "none", "app"):
+        raise ValueError(
+            f"resource_strategy must be 'all', 'none' or 'app' (got {resource_strategy!r})"
+        )
+    enable_ratchets = bool(params.get("enable_ratchets", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -688,33 +1058,157 @@ def cmd_wire_listen(params):
         *aspects,
     )
 
+    # Enable ratchets BEFORE the immediate announce below, mirroring
+    # cmd_wire_announce (so the announce carries the latest ratchet public key
+    # and the destination owns a real ratchet store).
+    ratchets_enabled = False
+    if enable_ratchets:
+        ratchets_path = os.path.join(
+            inst.get("config_dir") or tempfile.gettempdir(),
+            f"ratchets_{destination.hash.hex()}_{secrets.token_hex(4)}",
+        )
+        ratchets_enabled = bool(destination.enable_ratchets(ratchets_path))
+
     # Per-destination receive buffers.
     recv_buffer = []         # single-packet link data
     resource_buffer = []     # completed resources (bytes)
+    inbound_links = []        # RNS.Link objects accepted on this destination
+    incoming_resources = []   # receiver-side Resource observation records
+    channel_received = []     # decoded Channel message payloads (bytes)
+    buffer_state = {          # Buffer (RawChannelReader) stream reassembly state
+        "reader": None,
+        "aborted": False,
+        "error": None,
+    }
     recv_lock = threading.Lock()
 
+    strategy_const = {
+        "all": RNS.Link.ACCEPT_ALL,
+        "none": RNS.Link.ACCEPT_NONE,
+        "app": RNS.Link.ACCEPT_APP,
+    }[resource_strategy]
+
+    def on_resource_concluded(resource):
+        # Capture the reassembled payload + metadata for the matching
+        # incoming-resource record (the final-segment conclusion callback).
+        payload = None
+        if getattr(resource, "status", None) == RNS.Resource.COMPLETE:
+            data_blob = resource.data
+            if hasattr(data_blob, "read"):
+                try:
+                    data_blob.seek(0)
+                except Exception:
+                    pass
+                payload = data_blob.read()
+            else:
+                payload = bytes(data_blob)
+            with recv_lock:
+                resource_buffer.append(payload)
+        meta = getattr(resource, "metadata", None)
+        with recv_lock:
+            for rec in incoming_resources:
+                if rec["resource"] is resource:
+                    if payload is not None:
+                        rec["data"] = payload
+                    if isinstance(meta, (bytes, bytearray)):
+                        rec["metadata"] = bytes(meta)
+                    break
+
+    def on_resource_started(resource):
+        # Lower the decompression bound so the bz2-bomb guard trips cheaply
+        # (Resource.py:686-689) and install per-instance counters for the HMU
+        # handshake (Resource.py:483-503). request_next() / hashmap_update_packet
+        # are shadowed on the instance, so RNS's own internal self.request_next()
+        # calls go through the counting wrappers.
+        rec = {
+            "resource": resource,
+            "hmu_requests_sent": 0,
+            "hashmap_updates_received": 0,
+            "data": None,
+            "metadata": None,
+        }
+        try:
+            resource.max_decompressed_size = _WIRE_RX_MAX_DECOMPRESSED
+        except Exception:
+            pass
+        try:
+            orig_hmu_packet = resource.hashmap_update_packet
+
+            def counted_hmu_packet(plaintext, _orig=orig_hmu_packet, _rec=rec):
+                _rec["hashmap_updates_received"] += 1
+                return _orig(plaintext)
+
+            resource.hashmap_update_packet = counted_hmu_packet
+
+            orig_request_next = resource.request_next
+
+            def counted_request_next(_orig=orig_request_next, _res=resource, _rec=rec):
+                before = bool(getattr(_res, "waiting_for_hmu", False))
+                result = _orig()
+                if bool(getattr(_res, "waiting_for_hmu", False)) and not before:
+                    _rec["hmu_requests_sent"] += 1
+                return result
+
+            resource.request_next = counted_request_next
+        except Exception:
+            pass
+        with recv_lock:
+            incoming_resources.append(rec)
+
     def on_link_established(link):
+        # Keep a reference to the inbound (receiver-side) Link so lifecycle
+        # tests can observe its status / teardown_reason after the initiator
+        # tears it down (DESTINATION/INITIATOR_CLOSED is only observable on
+        # the *peer* of whoever called teardown). See wire_listener_link_status.
+        with recv_lock:
+            inbound_links.append(link)
+
         def on_packet(message, packet):
             with recv_lock:
                 recv_buffer.append(bytes(message))
-        def on_resource_concluded(resource):
-            # resource.data is a BytesIO-like object on complete resources.
-            if getattr(resource, "status", None) == RNS.Resource.COMPLETE:
-                data_blob = resource.data
-                if hasattr(data_blob, "read"):
-                    try:
-                        data_blob.seek(0)
-                    except Exception:
-                        pass
-                    payload = data_blob.read()
-                else:
-                    payload = bytes(data_blob)
-                with recv_lock:
-                    resource_buffer.append(payload)
+
         link.set_packet_callback(on_packet)
-        # Accept any incoming Resource; buffer its data on completion.
-        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        link.set_resource_strategy(strategy_const)
         link.set_resource_concluded_callback(on_resource_concluded)
+        link.set_resource_started_callback(on_resource_started)
+        if resource_strategy == "app":
+            def app_accept(advertisement):
+                try:
+                    return advertisement.get_data_size() <= _RESOURCE_APP_ACCEPT_MAX_SIZE
+                except Exception:
+                    return False
+            link.set_resource_callback(app_accept)
+
+        # Channel: opening it (get_channel) makes the receiver PROVE inbound
+        # CHANNEL packets (Link.py:1166-1169) — without this the sender's
+        # receipts never deliver. Register the recording message type + handler
+        # so wire_channel_received can observe delivered messages.
+        try:
+            channel = link.get_channel()
+            msgclass = _get_channel_message_class()
+            try:
+                channel.register_message_type(msgclass)
+            except Exception:
+                pass
+
+            def on_channel_message(message, _msgclass=msgclass):
+                # Only consume the wire channel message type; let other types
+                # (notably Buffer's StreamDataMessage) fall through to the
+                # RawChannelReader handler added below (run_callbacks stops at
+                # the first handler returning True).
+                if isinstance(message, _msgclass):
+                    with recv_lock:
+                        channel_received.append(bytes(getattr(message, "data", b"")))
+                    return True
+                return False
+
+            channel.add_message_handler(on_channel_message)
+
+            # Buffer (RawChannelReader): reassemble a StreamDataMessage stream
+            # and detect the MAX_CHUNK_LEN decompression-bomb abort.
+            _ensure_buffer_reader(channel, buffer_state, recv_lock)
+        except Exception:
+            pass
 
     destination.set_link_established_callback(on_link_established)
 
@@ -726,15 +1220,75 @@ def cmd_wire_listen(params):
         "identity": identity,
         "recv_buffer": recv_buffer,
         "resource_buffer": resource_buffer,
+        "inbound_links": inbound_links,
+        "incoming_resources": incoming_resources,
+        "channel_received": channel_received,
+        "buffer_state": buffer_state,
         "recv_lock": recv_lock,
+        "resource_strategy": resource_strategy,
     }
     # Keep strong reference so it isn't garbage collected.
     inst["destinations"].append((identity, destination))
 
-    return {
+    response = {
         "destination_hash": destination.hash.hex(),
         "identity_hash": identity.hash.hex(),
+        # public_key surfaces the listening identity's raw key so recall
+        # tests can assert byte-identity (recalled.public_key == this), not
+        # just length (N-M3). The hash above is a truncated SHA-256 of this
+        # key, so asserting both pins the full key material end-to-end.
+        "public_key": identity.get_public_key().hex(),
+        "resource_strategy": resource_strategy,
     }
+    if enable_ratchets:
+        response["ratchets_enabled"] = ratchets_enabled
+        response["current_ratchet_id"] = _current_ratchet_id(destination)
+        response["ratchet_count"] = (
+            len(destination.ratchets) if destination.ratchets is not None else 0
+        )
+    return response
+
+
+def _make_detecting_stream_message_class(buffer_state):
+    """A StreamDataMessage subclass whose unpack records the bz2 decompression-
+    bomb abort (Buffer.py:95-97 raises IOError when a compressed chunk would
+    exceed RawChannelWriter.MAX_CHUNK_LEN) onto buffer_state before re-raising,
+    so the receiver can observe `aborted` even though Channel._receive swallows
+    the exception.
+    """
+    from RNS.Buffer import StreamDataMessage
+
+    class _DetectingStreamDataMessage(StreamDataMessage):
+        def unpack(self, raw):
+            try:
+                return super().unpack(raw)
+            except Exception as e:
+                buffer_state["aborted"] = True
+                buffer_state["error"] = str(e)
+                raise
+
+    return _DetectingStreamDataMessage
+
+
+def _ensure_buffer_reader(channel, buffer_state, recv_lock):
+    """Create a RawChannelReader on `channel` (idempotent) and swap in the
+    bomb-detecting StreamDataMessage factory. Stores the reader on buffer_state.
+    """
+    if buffer_state.get("reader") is not None:
+        return buffer_state["reader"]
+    from RNS.Buffer import RawChannelReader, StreamDataMessage
+
+    reader = RawChannelReader(_WIRE_BUFFER_STREAM_ID, channel)
+    # RawChannelReader.__init__ registered the plain StreamDataMessage; replace
+    # the factory with the detecting subclass so over-bound chunks are recorded.
+    try:
+        channel._message_factories[StreamDataMessage.MSGTYPE] = (
+            _make_detecting_stream_message_class(buffer_state)
+        )
+    except Exception:
+        pass
+    buffer_state["reader"] = reader
+    return reader
 
 
 def cmd_wire_link_open(params):
@@ -812,7 +1366,37 @@ def cmd_wire_link_open(params):
         raise
 
     inst.setdefault("out_links", {})[link.link_id] = link
+    _track_keepalive_emissions(inst, link)
     return {"link_id": link.link_id.hex()}
+
+
+def _track_keepalive_emissions(inst, link):
+    """Record the last keepalive byte a link emits via send_keepalive (the
+    initiator's 0xFF, Link.py:848-849). The non-initiator's 0xFE answer is
+    inline in Link.receive, so it's captured by wire_send_keepalive_probe
+    instead. Idempotent per link. Stored under inst['keepalive_payloads'].
+    """
+    store = inst.setdefault("keepalive_payloads", {})
+    try:
+        link_id = link.link_id
+    except Exception:
+        return
+    if getattr(link, "_wire_keepalive_wrapped", False):
+        return
+    orig_send_keepalive = link.send_keepalive
+
+    def wrapped_send_keepalive(_orig=orig_send_keepalive, _lid=link_id):
+        try:
+            store[_lid] = b"\xff"
+        except Exception:
+            pass
+        return _orig()
+
+    try:
+        link.send_keepalive = wrapped_send_keepalive
+        link._wire_keepalive_wrapped = True
+    except Exception:
+        pass
 
 
 def cmd_wire_link_send(params):
@@ -842,9 +1426,39 @@ def cmd_wire_link_send(params):
     return {"sent": True}
 
 
+def _resource_info(resource):
+    """Read the construction-time observables off an outbound RNS.Resource
+    (set synchronously in __init__, so valid even mid-transfer)."""
+    info = {}
+    try:
+        info["original_hash"] = resource.original_hash.hex()
+    except Exception:
+        info["original_hash"] = None
+    try:
+        info["hash"] = resource.hash.hex()
+    except Exception:
+        info["hash"] = None
+    try:
+        info["total_segments"] = int(resource.total_segments)
+    except Exception:
+        info["total_segments"] = None
+    try:
+        info["segment_index"] = int(resource.segment_index)
+    except Exception:
+        info["segment_index"] = None
+    try:
+        info["parts"] = int(resource.total_parts)
+    except Exception:
+        info["parts"] = None
+    info["compressed"] = bool(getattr(resource, "compressed", False))
+    info["has_metadata"] = bool(getattr(resource, "has_metadata", False))
+    info["split"] = bool(getattr(resource, "split", False))
+    return info
+
+
 def cmd_wire_resource_send(params):
     """Send arbitrary-size bytes over an established outbound Link via the
-    Resource API, blocking until the transfer completes or times out.
+    Resource API.
 
     This exercises the same code path LXMF uses for image/file/media
     attachments in apps like Columba and Sideband. Data > link.mdu gets
@@ -852,14 +1466,30 @@ def cmd_wire_resource_send(params):
     receiver. The receiver must have accepted resources on the link
     (wire_listen wires this up automatically).
 
-    Returns {success, status, size}. `status` is the RNS Resource status
-    code (COMPLETE=6, FAILED=7) at completion / timeout.
+    Params:
+      metadata (hex, optional): packed into the Resource 'x' metadata field
+        (Resource.py:260-268) as a bytes object, so it round-trips byte-exact.
+        Sets has_metadata=True.
+      wait (bool, default True): when True, block until the transfer concludes
+        or times out and return {success, status, ...}. When False, start the
+        transfer on RNS's background threads and return immediately with
+        {resource_id, started, ...} so the caller can abort it mid-flight via
+        wire_resource_cancel (the only way to drive RESOURCE_ICL).
+
+    Returns (wait=True): {success, status, size, timed_out, resource_id,
+      original_hash, total_segments, parts, compressed, has_metadata}.
+    Returns (wait=False): {started, resource_id, size, original_hash,
+      total_segments, parts, compressed, has_metadata}.
+    `status` is the RNS Resource status code (COMPLETE=6, FAILED=7, REJECTED=0).
     """
     RNS = _get_rns()
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
     payload = bytes.fromhex(params.get("data", ""))
     timeout_ms = int(params.get("timeout_ms", 30000))
+    wait = bool(params.get("wait", True))
+    metadata_hex = params.get("metadata")
+    metadata = bytes.fromhex(metadata_hex) if metadata_hex else None
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -870,6 +1500,11 @@ def cmd_wire_resource_send(params):
     if link is None:
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
 
+    # NOTE: to chunk a transfer into >74 parts (HMU) or slow it for a mid-flight
+    # cancel, establish the link with a small fixed MTU (wire_start_tcp_*
+    # fixed_mtu=...) so BOTH peers share the same small per-part SDU. Shrinking
+    # only the sender's link.mtu here would desync the receiver's part count and
+    # break reassembly — so it is deliberately not offered.
     done = threading.Event()
     final_status = [None]
 
@@ -877,14 +1512,28 @@ def cmd_wire_resource_send(params):
         final_status[0] = getattr(resource, "status", None)
         done.set()
 
-    resource = RNS.Resource(payload, link, callback=on_done)
+    resource = RNS.Resource(payload, link, metadata=metadata, callback=on_done)
+
+    resource_id = secrets.token_hex(8)
+    with _instances_lock:
+        inst.setdefault("out_resources", {})[resource_id] = {
+            "resource": resource,
+            "link": link,
+        }
+    info = _resource_info(resource)
+
+    if not wait:
+        # Non-blocking: leave the transfer running so wire_resource_cancel can
+        # abort it mid-flight (RESOURCE_ICL). The link MTU was already restored
+        # right after construction. Returns immediately with the handle.
+        return {
+            "started": True,
+            "resource_id": resource_id,
+            "size": len(payload),
+            **info,
+        }
 
     if not done.wait(timeout=timeout_ms / 1000.0):
-        # Cancel the outbound resource so its worker threads / callbacks
-        # don't continue touching `final_status` / `done` after we
-        # return. Harmless under the current fresh-bridge-per-test
-        # fixture, but prevents interference if a future fixture reuses
-        # a bridge process across tests on the same link.
         try:
             resource.cancel()
         except Exception:
@@ -892,12 +1541,13 @@ def cmd_wire_resource_send(params):
         raw_status = getattr(resource, "status", None)
         return {
             "success": False,
-            # Use explicit None check rather than `... or -1` — a genuine
-            # status of 0 (Resource.NONE) is falsy and would coerce to
-            # -1 under the truthiness fallback.
+            # Explicit None check — a genuine status of 0 (NONE/REJECTED) is
+            # falsy and would coerce to -1 under a truthiness fallback.
             "status": int(raw_status) if raw_status is not None else -1,
             "size": len(payload),
             "timed_out": True,
+            "resource_id": resource_id,
+            **info,
         }
 
     status_value = final_status[0]
@@ -907,6 +1557,173 @@ def cmd_wire_resource_send(params):
         "status": int(status_value) if status_value is not None else -1,
         "size": len(payload),
         "timed_out": False,
+        "resource_id": resource_id,
+        **info,
+    }
+
+
+def cmd_wire_resource_cancel(params):
+    """Abort an in-flight outbound Resource started by wire_resource_send(wait
+    =False). Calls RNS.Resource.cancel (Resource.py:1075): the initiator sends a
+    RESOURCE_ICL to the receiver (Link.py:1131), whose inbound Resource then
+    cancels (status FAILED). Returns {cancelled, resource_id, status}.
+    """
+    handle = params["handle"]
+    resource_id = params["resource_id"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    record = inst.get("out_resources", {}).get(resource_id)
+    if record is None:
+        raise ValueError(f"Unknown resource_id: {resource_id}")
+    resource = record["resource"]
+    cancelled = False
+    try:
+        resource.cancel()
+        cancelled = True
+    except Exception:
+        cancelled = False
+    status = getattr(resource, "status", None)
+    return {
+        "cancelled": cancelled,
+        "resource_id": resource_id,
+        "status": int(status) if status is not None else -1,
+    }
+
+
+def cmd_wire_resource_send_bomb(params):
+    """Send a crafted compressible Resource whose decompressed payload exceeds
+    the receiver's decompression bound, tripping the bz2 decompression-bomb
+    guard (Resource.py:686-689): the receiver's
+    BZ2Decompressor.decompress(max_length=...) stops short of EOF, so RNS marks
+    the inbound Resource CORRUPT and tears the link down (Resource.py:1081-1084).
+
+    The receiver's per-Resource bound is lowered to _WIRE_RX_MAX_DECOMPRESSED by
+    wire_listen, so a few-MiB of zeros (compresses tiny, decompresses past the
+    bound) is enough — we cap the crafted size for cheapness regardless of the
+    requested `decompressed_size`. The sender's own transfer ends FAILED.
+    Returns {success, status, size, resource_id}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    requested = int(params.get("decompressed_size", _WIRE_RX_MAX_DECOMPRESSED + 1024 * 1024))
+    timeout_ms = int(params.get("timeout_ms", 30000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    # Craft a payload that decompresses just past the receiver bound. Zeros
+    # compress to a few bytes (so the WIRE transfer stays tiny) but inflate back
+    # to `crafted` bytes. The crafted size stays BELOW MAX_EFFICIENT_SIZE so the
+    # Resource is a single (non-split) compressed segment whose decompressed size
+    # exceeds the receiver's lowered bound — the cleanest way to trip the guard.
+    floor = _WIRE_RX_MAX_DECOMPRESSED + 1
+    ceil = min(_WIRE_RX_MAX_DECOMPRESSED * 2, RNS.Resource.MAX_EFFICIENT_SIZE - 1)
+    crafted = max(floor, min(requested, ceil))
+    payload = bytes(crafted)  # zeros; bz2-compresses to a tiny advertised payload
+
+    done = threading.Event()
+    final_status = [None]
+
+    def on_done(resource):
+        final_status[0] = getattr(resource, "status", None)
+        done.set()
+
+    # auto_compress default (True) compresses since crafted < AUTO_COMPRESS_MAX_SIZE,
+    # so the receiver receives a compressed Resource and must decompress it.
+    resource = RNS.Resource(payload, link, callback=on_done)
+    resource_id = secrets.token_hex(8)
+    with _instances_lock:
+        inst.setdefault("out_resources", {})[resource_id] = {
+            "resource": resource, "link": link,
+        }
+
+    done.wait(timeout=timeout_ms / 1000.0)
+    status_value = getattr(resource, "status", None)
+    if not done.is_set():
+        try:
+            resource.cancel()
+        except Exception:
+            pass
+        status_value = getattr(resource, "status", None)
+    else:
+        status_value = final_status[0]
+    return {
+        "success": status_value == RNS.Resource.COMPLETE,
+        "status": int(status_value) if status_value is not None else -1,
+        "size": crafted,
+        "resource_id": resource_id,
+    }
+
+
+def cmd_wire_resource_receiver_status(params):
+    """Read the receiver-side state of the most recent inbound Resource on a
+    listening destination — the discriminating observable for the HMU handshake,
+    metadata round-trip, cancel (RESOURCE_ICL) and bz2-bomb (CORRUPT) cases.
+
+    Returns {found, status, status_name, corrupt, hmu_requests_sent,
+    hashmap_updates_received, hashmap_height, has_metadata, metadata, data,
+    resource_count}. `metadata`/`data` are hex (or None). Optionally polls up to
+    timeout_ms for an inbound Resource to appear / reach a terminal status
+    (COMPLETE/FAILED/CORRUPT).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 0))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    terminal = {0x06, 0x07, 0x08}  # COMPLETE / FAILED / CORRUPT
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        with listener["recv_lock"]:
+            recs = list(listener.get("incoming_resources", []))
+        if recs:
+            status = getattr(recs[-1]["resource"], "status", None)
+            if status in terminal or time.time() >= deadline:
+                break
+        elif time.time() >= deadline:
+            break
+        time.sleep(0.05)
+
+    with listener["recv_lock"]:
+        recs = list(listener.get("incoming_resources", []))
+    if not recs:
+        return {"found": False, "resource_count": 0}
+    rec = recs[-1]
+    resource = rec["resource"]
+    status = getattr(resource, "status", None)
+    metadata = rec.get("metadata")
+    data = rec.get("data")
+    return {
+        "found": True,
+        "resource_count": len(recs),
+        "status": int(status) if status is not None else -1,
+        "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        "corrupt": status == 0x08,
+        "hmu_requests_sent": int(rec.get("hmu_requests_sent", 0)),
+        "hashmap_updates_received": int(rec.get("hashmap_updates_received", 0)),
+        "hashmap_height": int(getattr(resource, "hashmap_height", 0) or 0),
+        "max_decompressed_size": int(getattr(resource, "max_decompressed_size", -1) or -1),
+        "compressed": bool(getattr(resource, "compressed", False)),
+        "has_metadata": bool(getattr(resource, "has_metadata", False)),
+        "metadata": metadata.hex() if isinstance(metadata, (bytes, bytearray)) else None,
+        "data": data.hex() if isinstance(data, (bytes, bytearray)) else None,
     }
 
 
@@ -934,11 +1751,40 @@ def cmd_wire_resource_create(params):
     `data` return a different `hash` and different `parts`. The invariant
     tests in tests/wire/test_resource_invariants.py assert exactly that —
     on both the reference and the SUT.
+
+    Optional params for the segmentation / HMU / compression coverage cases
+    (CONFORMANCE_REAUDIT.md §5 "Resource"):
+      force_sdu (int): temporarily override the link's transfer SDU so a
+        modest payload produces >74 parts, the threshold above which RNS
+        sends the hashmap across multiple advertisements (HMU,
+        ResourceAdvertisement.HASHMAP_MAX_LEN=74). The override is applied
+        only for the duration of this construction and then restored, so the
+        live link is left untouched. Lets a test assert num_parts>74 without
+        moving a megabyte of data.
+      include_parts (bool, default True): when False, omit the per-part
+        `parts` list from the response. Set False for >1 MiB multi-segment
+        payloads, where the first segment alone is thousands of parts and
+        hex-encoding them all would bloat the JSON pipe.
+      auto_compress (bool, default True): pass-through to RNS.Resource; the
+        compressible-payload case relies on the default to observe
+        compressed=True.
+
+    A payload exceeding RNS.Resource.MAX_EFFICIENT_SIZE (1 MiB - 1) makes RNS
+    split the transfer into total_segments>1; this command reports the first
+    segment's attributes plus total_segments/segment_index, which is the
+    observable a multi-segment test pins.
     """
     RNS = _get_rns()
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
     payload = bytes.fromhex(params.get("data", ""))
+    force_sdu = params.get("force_sdu")
+    include_parts = bool(params.get("include_parts", True))
+    auto_compress = bool(params.get("auto_compress", True))
+    # metadata (hex bytes) -> packed into the Resource 'x' field (Resource.py:
+    # 260-268); passed as a bytes object so umsgpack round-trips it byte-exact.
+    metadata_hex = params.get("metadata")
+    metadata = bytes.fromhex(metadata_hex) if metadata_hex else None
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -949,11 +1795,43 @@ def cmd_wire_resource_create(params):
     if link is None:
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
 
-    # Real RNS.Resource, real established link, full __init__ — just no
-    # advertise/send. Every field below is read straight off the object.
-    resource = RNS.Resource(payload, link, advertise=False)
+    # Forced-small-MDU path: RNS.Resource derives its per-part SDU from the
+    # link as `link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE` (Resource.py
+    # __init__). Temporarily shrinking link.mtu to force_sdu + that overhead
+    # makes the resource chunk at force_sdu bytes/part, so e.g. a 4 KiB
+    # payload at force_sdu=50 exceeds the 74-part HMU threshold. mtu must
+    # stay a valid int (RNS.Packet construction reads it), so we shrink it
+    # rather than null it, and restore it after — the live link's negotiated
+    # MTU is untouched once this returns.
+    saved_mtu = None
+    restore_link = False
+    if force_sdu is not None:
+        force_sdu = int(force_sdu)
+        overhead = RNS.Reticulum.HEADER_MAXSIZE + RNS.Reticulum.IFAC_MIN_SIZE
+        saved_mtu = link.mtu
+        restore_link = True
+        link.mtu = force_sdu + overhead
 
-    return {
+    try:
+        # Real RNS.Resource, real established link, full __init__ — just no
+        # advertise/send. Every field below is read straight off the object.
+        resource = RNS.Resource(
+            payload, link, metadata=metadata, advertise=False, auto_compress=auto_compress
+        )
+    finally:
+        if restore_link:
+            link.mtu = saved_mtu
+
+    # ResourceAdvertisement flags byte (Resource.py:1307) packs has_metadata at
+    # bit 5: `f = ... | x<<5 | ...`. Surfacing it lets a metadata test pin "flag
+    # bit 5 set" without reconstructing the byte.
+    flags = None
+    try:
+        flags = int(RNS.ResourceAdvertisement(resource).f)
+    except Exception:
+        flags = None
+
+    out = {
         "hash": resource.hash.hex(),
         "truncated_hash": resource.truncated_hash.hex(),
         "random_hash": resource.random_hash.hex(),
@@ -963,13 +1841,27 @@ def cmd_wire_resource_create(params):
         "encrypted": bool(resource.encrypted),
         "compressed": bool(resource.compressed),
         "split": bool(resource.split),
+        # total_segments>1 is the observable that a >1 MiB payload triggered
+        # multi-segment transfer (Resource.py: total_segments derived from
+        # total_size // MAX_EFFICIENT_SIZE). segment_index is which segment
+        # this object represents (1-based).
+        "total_segments": int(resource.total_segments),
+        "segment_index": int(resource.segment_index),
+        # original_hash is the pre-segmentation hash RNS chains multi-segment
+        # transfers against (Resource.py:445-448); == hash for segment 1.
+        "original_hash": resource.original_hash.hex(),
+        "has_metadata": bool(resource.has_metadata),
+        "flags": flags,
         "size": resource.size,
         "total_size": resource.total_size,
+        "sdu": int(resource.sdu),
+    }
+    if include_parts:
         # Packed wire bytes of each part — for the "two resources from
         # byte-identical input produce different encrypted output"
         # invariant (the data-stream random prefix + per-token IV).
-        "parts": [p.raw.hex() for p in resource.parts],
-    }
+        out["parts"] = [p.raw.hex() for p in resource.parts]
+    return out
 
 
 def cmd_wire_resource_poll(params):
@@ -1038,11 +1930,13 @@ def cmd_wire_register_request_handler(params):
     machinery — we just plug in a generator that returns the test-supplied
     response and records the invocation for later assertion.
 
-    Optional auth policy: pass `allow` as "all" (default) or "list" plus
-    `allowed_identity_hashes` (list of hex strings). RNS rejects requests
-    from un-listed identities before the generator runs — the invocation
-    log will not record those, which is exactly what the ALLOW_LIST
-    negative-control test asserts.
+    Optional auth policy: pass `allow` as "all" (default), "list" plus
+    `allowed_identity_hashes` (list of hex strings), or "none". RNS rejects
+    requests from un-listed identities (ALLOW_LIST) or every request
+    (ALLOW_NONE) before the generator runs (Link.py:868-873) — the invocation
+    log will not record those, which is exactly what the ALLOW_LIST /
+    ALLOW_NONE negative-control tests assert (the requester's RequestReceipt
+    never reaches READY).
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -1070,8 +1964,11 @@ def cmd_wire_register_request_handler(params):
     elif allow_param == "list":
         allow = RNS.Destination.ALLOW_LIST
         allowed_list = [bytes.fromhex(h) for h in allowed_list_hex]
+    elif allow_param == "none":
+        allow = RNS.Destination.ALLOW_NONE
+        allowed_list = None
     else:
-        raise ValueError(f"unsupported allow: {allow_param!r} (use 'all' or 'list')")
+        raise ValueError(f"unsupported allow: {allow_param!r} (use 'all', 'list' or 'none')")
 
     key = (handle, dest_hash, path)
     _request_handler_responses[key] = response
@@ -1166,6 +2063,22 @@ def cmd_wire_link_request(params):
             return {"status": "failed", "response": None}
         time.sleep(0.05)
     return {"status": "timeout", "response": None}
+
+
+def cmd_wire_link_request_large(params):
+    """Issue a Link request whose response exceeds the link MDU.
+
+    Identical mechanics to wire_link_request, but documents/serves the >MDU
+    case: a handler returning ~50 KB cannot answer in a single RESPONSE packet,
+    so RNS delivers the response as a Resource (Link.handle_request:898-901) and
+    the RequestReceipt only reaches READY once that response Resource fully
+    transfers (Link.py:496-517/:939-952). The default timeout is generous to
+    cover the resource transfer. Returns {status, response, response_time_s}
+    with `status == "ready"` and the full byte-exact response (hex).
+    """
+    params = dict(params)
+    params.setdefault("timeout_ms", 30000)
+    return cmd_wire_link_request(params)
 
 
 def cmd_wire_get_request_log(params):
@@ -1563,10 +2476,2010 @@ def cmd_wire_stop(params):
     return {"stopped": True}
 
 
+# ---------------------------------------------------------------------------
+# Link lifecycle observation (status / STALE / teardown / keepalive)
+#
+# All values are read straight off the real RNS.Link instance — RNS's own
+# watchdog (Link.__watchdog_job) drives the ACTIVE→STALE→CLOSED transitions
+# and sets teardown_reason; these commands only observe.
+# ---------------------------------------------------------------------------
+
+_LINK_STATUS_NAMES = {0: "PENDING", 1: "HANDSHAKE", 2: "ACTIVE", 3: "STALE", 4: "CLOSED"}
+# Link.TIMEOUT=1, Link.INITIATOR_CLOSED=2, Link.DESTINATION_CLOSED=3
+_LINK_TEARDOWN_NAMES = {1: "TIMEOUT", 2: "INITIATOR_CLOSED", 3: "DESTINATION_CLOSED"}
+
+
+def _link_status_dict(link):
+    """Snapshot the observable lifecycle fields of an RNS.Link.
+
+    keepalive observation: when a link is healthy, RNS's watchdog sends a
+    keepalive every `keepalive_s` and the peer's response refreshes
+    last_inbound, so `no_inbound_for_ms` stays small. A link that has lost
+    its peer shows no_inbound_for_ms climbing past keepalive_s, then transits
+    to STALE/CLOSED with teardown_reason=TIMEOUT.
+    """
+    status = getattr(link, "status", None)
+    reason = getattr(link, "teardown_reason", None)
+    last_inbound = getattr(link, "last_inbound", 0) or 0
+    last_keepalive = getattr(link, "last_keepalive", 0) or 0
+    now = time.time()
+    # get_mtu()/get_mdu() return None until the link is ACTIVE (Link.py:609/:618);
+    # get_mode() always returns the negotiated mode constant (Link.py:636). These
+    # are the negotiated-parameter read-backs the §4b "Link MTU/MDU/mode" gap needs.
+    try:
+        mtu = link.get_mtu()
+    except Exception:
+        mtu = None
+    try:
+        mdu = link.get_mdu()
+    except Exception:
+        mdu = None
+    try:
+        mode = link.get_mode()
+    except Exception:
+        mode = None
+    # get_remote_identity() (Link.py:683-687) returns the remote peer's Identity
+    # only once that peer has independently called identify() — observable on the
+    # receiver-side (inbound) link after the initiator wire_link_identify's.
+    remote_identity = None
+    try:
+        remote_identity = link.get_remote_identity()
+    except Exception:
+        remote_identity = None
+    remote_identity_hash = (
+        remote_identity.hash.hex()
+        if remote_identity is not None and getattr(remote_identity, "hash", None) is not None
+        else None
+    )
+    return {
+        "status": int(status) if status is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status),
+        "teardown_reason": int(reason) if reason is not None else None,
+        "teardown_reason_name": _LINK_TEARDOWN_NAMES.get(reason),
+        "no_inbound_for_ms": int(max(0.0, now - last_inbound) * 1000) if last_inbound else None,
+        "last_keepalive_ago_ms": int(max(0.0, now - last_keepalive) * 1000) if last_keepalive else None,
+        "keepalive_s": getattr(link, "keepalive", None),
+        "stale_time_s": getattr(link, "stale_time", None),
+        "rtt": getattr(link, "rtt", None),
+        "mtu": int(mtu) if mtu is not None else None,
+        "mdu": int(mdu) if mdu is not None else None,
+        "mode": int(mode) if mode is not None else None,
+        "remote_identity_hash": remote_identity_hash,
+        "remote_identified": remote_identity is not None,
+    }
+
+
+def cmd_wire_link_status(params):
+    """Return the lifecycle snapshot of an outbound link (initiator side).
+
+    Fields: status / status_name (PENDING/HANDSHAKE/ACTIVE/STALE/CLOSED),
+    teardown_reason / teardown_reason_name (TIMEOUT/INITIATOR_CLOSED/
+    DESTINATION_CLOSED), no_inbound_for_ms, last_keepalive_ago_ms,
+    keepalive_s, stale_time_s, rtt. All read off the real RNS.Link.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    return _link_status_dict(link)
+
+
+def cmd_wire_link_set_watchdog(params):
+    """Compress an established link's keepalive / stale timings so the
+    ACTIVE→STALE→CLOSED watchdog path is observable inside a test timeout.
+
+    RNS's full defaults are keepalive=360s / stale_time=720s; even the
+    loopback-negotiated values (~5s / ~10s) are slow for a tight test.
+    Setting these small lets a test exercise keepalive churn and, if the peer
+    actually stops answering, reach STALE→CLOSED/TIMEOUT quickly.
+
+    Teardown-reason reality (validated reference-vs-reference over loopback):
+      - INITIATOR_CLOSED / DESTINATION_CLOSED come from an explicit
+        teardown or a clean disconnect and fire immediately, *independent*
+        of these timings.
+      - TIMEOUT requires inbound to go *silent* (a stalled, not cleanly
+        closed, peer) for stale_time. A clean TCP disconnect propagates as
+        DESTINATION_CLOSED instead. While the peer keeps answering
+        keepalives, last_inbound is refreshed every watchdog pass and the
+        link never goes STALE — so this knob alone cannot force TIMEOUT;
+        it only shortens the window once inbound genuinely ceases.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    keepalive_s = params.get("keepalive_s")
+    stale_time_s = params.get("stale_time_s")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    if keepalive_s is not None:
+        link.keepalive = float(keepalive_s)
+    if stale_time_s is not None:
+        link.stale_time = float(stale_time_s)
+    return {"keepalive_s": link.keepalive, "stale_time_s": link.stale_time}
+
+
+def cmd_wire_link_await_status(params):
+    """Block until an outbound link reaches at least `target_status`, or
+    timeout. Returns the final lifecycle snapshot plus `reached`.
+
+    `target_status` accepts an int or a name ("STALE"/"CLOSED"/...). The
+    comparison is `link.status >= target` on the PENDING(0) < HANDSHAKE(1) <
+    ACTIVE(2) < STALE(3) < CLOSED(4) ordering, so awaiting STALE also returns
+    if the link has already raced through STALE to CLOSED (STALE is a
+    short-lived transitional state in RNS's watchdog).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    target = params["target_status"]
+    timeout_ms = int(params.get("timeout_ms", 15000))
+    if isinstance(target, str):
+        name_to_int = {v: k for k, v in _LINK_STATUS_NAMES.items()}
+        if target.upper() not in name_to_int:
+            raise ValueError(f"Unknown target_status name: {target!r}")
+        target_int = name_to_int[target.upper()]
+    else:
+        target_int = int(target)
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    deadline = time.time() + timeout_ms / 1000.0
+    reached = False
+    while time.time() < deadline:
+        status = getattr(link, "status", None)
+        if status is not None and int(status) >= target_int:
+            reached = True
+            break
+        time.sleep(0.05)
+    out = _link_status_dict(link)
+    out["reached"] = reached
+    return out
+
+
+def cmd_wire_link_teardown(params):
+    """Gracefully tear down an outbound link from the initiator side
+    (real RNS.Link.teardown). The *peer* observes this as a CLOSED link
+    with teardown_reason=INITIATOR_CLOSED (observe via
+    wire_listener_link_status on the receiver).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    link.teardown()
+    return {"torn_down": True}
+
+
+def cmd_wire_listener_link_status(params):
+    """Observe the *receiver-side* (inbound) link a wire_listen destination
+    accepted, by destination_hash. Optionally polls up to timeout_ms for the
+    inbound link to appear (link establishment is asynchronous).
+
+    Returns the lifecycle snapshot of the most recently accepted inbound
+    link plus `link_count`. This is how a test sees teardown_reason on the
+    side that did NOT initiate the close (e.g. INITIATOR_CLOSED after the
+    initiator calls wire_link_teardown).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 0))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        with listener["recv_lock"]:
+            links = list(listener.get("inbound_links", []))
+        if links or time.time() >= deadline:
+            break
+        time.sleep(0.05)
+    if not links:
+        return {"found": False, "link_count": 0}
+    out = _link_status_dict(links[-1])
+    out["found"] = True
+    out["link_count"] = len(links)
+    return out
+
+
+_PROOF_STRATEGY_MAP = {
+    "all": "PROVE_ALL",
+    "app": "PROVE_APP",
+    "none": "PROVE_NONE",
+}
+
+
+def cmd_wire_set_proof_strategy(params):
+    """Set a listening destination's packet-proof strategy
+    (real RNS.Destination.set_proof_strategy). Replaces the dead
+    rns_set_proof_strategy bridge command (CONFORMANCE_REAUDIT.md §5,
+    "Dead-but-counted surface").
+
+    strategy: "all" (PROVE_ALL), "app" (PROVE_APP) or "none" (PROVE_NONE).
+    Returns the resolved constant so a test can assert the strategy took on
+    the real destination object.
+
+    For "app", a deterministic proof_requested callback is installed
+    (Destination.set_proof_requested_callback, consulted at Link.py:1002-1006):
+    it PROVES iff the inbound packet's decrypted payload begins with byte 0x01,
+    and declines otherwise. So a link-DATA test can drive PROVE_APP both ways by
+    sending a payload starting with 0x01 (proof -> receipt DELIVERED) versus one
+    starting with any other byte (no proof -> receipt never DELIVERS). The
+    callback decrypts via the destination's links, so it works on the encrypted
+    packet RNS hands it.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    strategy = str(params["strategy"]).lower()
+    if strategy not in _PROOF_STRATEGY_MAP:
+        raise ValueError(f"strategy must be one of {sorted(_PROOF_STRATEGY_MAP)} (got {strategy!r})")
+    const = getattr(RNS.Destination, _PROOF_STRATEGY_MAP[strategy])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, destination_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {destination_hash.hex()} on "
+            f"handle {handle}; call wire_listen first."
+        )
+    destination.set_proof_strategy(const)
+    if strategy == "app":
+        def proof_requested(packet, _dest=destination):
+            # Decide on the decrypted payload: prove iff it starts with 0x01.
+            for link in list(getattr(_dest, "links", [])):
+                try:
+                    plaintext = link.decrypt(packet.data)
+                except Exception:
+                    plaintext = None
+                if plaintext is not None and len(plaintext) >= 1:
+                    return plaintext[0:1] == b"\x01"
+            return False
+        destination.set_proof_requested_callback(proof_requested)
+    return {
+        "strategy": strategy,
+        "proof_strategy": int(destination.proof_strategy),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Transport posture, link MTU, and single-packet PacketReceipt observation
+#
+# These three unblock CONFORMANCE_GAPS.md §3 (R3 transport-off bypass,
+# proof_for_local_client receipt return) and §2c (in-transit link-MTU strip).
+# All read straight off the real RNS objects — nothing is recomputed.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_transport_enabled(params):
+    """Return the GROUND-TRUTH RNS.Reticulum.transport_enabled() for this peer.
+
+    This is the discriminating observable for R3: a shared master started with
+    enable_transport=False must report transport_enabled() == False here, yet
+    an attached local client's announces/links must still reach a TCP peer
+    (local-client forwarding bypasses the transport gate). Asserting the config
+    value alone would be vacuous — this reads the live process-wide flag RNS
+    set at Reticulum.__init__ time, so a test can pin "transport really is off"
+    independently of whether forwarding happened.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    return {
+        "transport_enabled": bool(RNS.Reticulum.transport_enabled()),
+        # is_connected_to_shared_instance / is_shared_instance let a test
+        # disambiguate the peer's role without inferring it from the handle.
+        "is_shared_instance": bool(getattr(inst["rns"], "is_shared_instance", False)),
+        "is_connected_to_shared_instance": bool(
+            getattr(inst["rns"], "is_connected_to_shared_instance", False)
+        ),
+    }
+
+
+def _find_link_by_id(inst, link_id):
+    """Locate a real RNS.Link by its 16-byte link_id on this peer.
+
+    Checks both outbound links opened via wire_link_open (the initiator side)
+    AND inbound links accepted by any wire_listen destination (the receiver
+    side). The in-transit link-MTU strip (Transport.py:1593-1600) is observed
+    on the DESTINATION side — the receiver's inbound link carries the reduced
+    mtu — so wire_link_mtu must be able to read a listener's inbound link too,
+    not just an initiator's outbound one.
+    """
+    link = inst.get("out_links", {}).get(link_id)
+    if link is not None:
+        return link
+    for listener in inst.get("listeners", {}).values():
+        with listener["recv_lock"]:
+            inbound = list(listener.get("inbound_links", []))
+        for lk in inbound:
+            if getattr(lk, "link_id", None) == link_id:
+                return lk
+    return None
+
+
+def cmd_wire_link_mtu(params):
+    """Read the negotiated MTU (and MDU / mode) of an established link.
+
+    Returns {mtu, mdu, mode, status, status_name}. mtu is link.mtu read
+    straight off the real RNS.Link — the value the link-MTU-discovery
+    signalling settled on. On a direct loopback TCP link this is the large
+    autoconfigured value (TCP HW_MTU); when an in-transit relay forwarded the
+    LINKREQUEST out a next-hop interface that does NOT support MTU
+    autoconfiguration, RNS strips the 3-byte LINK_MTU_SIZE signalling field
+    (Transport.py:1593-1600) and the destination's link falls back to
+    Reticulum.MTU (500). So a test that establishes a link across a mixed
+    interface-type relay can assert link.mtu == 500 here to prove the strip
+    happened.
+
+    link_id may be either an outbound link (initiator side) or an inbound
+    link accepted by a wire_listen destination (receiver side). get_mtu()/
+    get_mdu() return None until the link is ACTIVE, so we read the raw .mtu/
+    .mdu fields (always populated post-establishment) and also surface status
+    so a test can gate on ACTIVE.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    status = getattr(link, "status", None)
+    return {
+        "mtu": int(link.mtu) if getattr(link, "mtu", None) is not None else None,
+        "mdu": int(link.mdu) if getattr(link, "mdu", None) is not None else None,
+        "mode": int(link.mode) if getattr(link, "mode", None) is not None else None,
+        "status": int(status) if status is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status),
+    }
+
+
+def cmd_wire_send_packet(params):
+    """Send a single SINGLE-destination DATA Packet with a tracked PacketReceipt.
+
+    Distinct from wire_link_send (which sends over an established Link): this is
+    the raw single-packet path. The receiver's destination, if it has
+    proof_strategy == PROVE_ALL, returns a PROOF; RNS validates it against the
+    originating PacketReceipt, which then transitions SENT -> DELIVERED. The
+    return path is the discriminating observable for proof_for_local_client
+    (CONFORMANCE_GAPS.md §3): when the originator sits behind a shared master,
+    the PROOF is routed back to it via the master's reverse_table
+    (Transport.py:2254-2261) because the reverse entry's received-iface is a
+    local-client iface — a path NOT exercised by any LRPROOF/link_table test.
+
+    Requires the destination identity to be known (via a received announce), as
+    with wire_link_open. Builds an OUT SINGLE Destination from the recalled
+    identity + the supplied app_name/aspects, constructs a Packet with
+    create_receipt=True (the default), sends it, and stashes the returned
+    PacketReceipt under a fresh receipt_id for wire_packet_receipt_status to
+    poll. Returns {receipt_id, sent, hops}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data", ""))
+    create_receipt = bool(params.get("create_receipt", True))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity,
+        RNS.Destination.OUT,
+        RNS.Destination.SINGLE,
+        app_name,
+        *aspects,
+    )
+
+    packet = RNS.Packet(out_destination, payload, create_receipt=create_receipt)
+    receipt = packet.send()
+    # packet.send() returns the PacketReceipt when create_receipt=True, None
+    # when create_receipt=False, or False when the send itself failed (no
+    # path / outbound rejected). Distinguish those for a clear test signal.
+    if receipt is False:
+        return {"sent": False, "receipt_id": None, "hops": None}
+
+    hops = int(RNS.Transport.hops_to(destination_hash))
+    receipt_id = None
+    if receipt is not None:
+        receipt_id = secrets.token_hex(8)
+        inst.setdefault("receipts", {})[receipt_id] = receipt
+    # Keep the OUT destination referenced so it isn't GC'd before the proof
+    # round-trips and the receipt callback fires.
+    inst["destinations"].append((identity, out_destination))
+    return {"sent": True, "receipt_id": receipt_id, "hops": hops}
+
+
+_PACKET_RECEIPT_STATUS_NAMES = {0x00: "FAILED", 0x01: "SENT", 0x02: "DELIVERED", 0xFF: "CULLED"}
+
+
+def cmd_wire_packet_receipt_status(params):
+    """Poll a tracked PacketReceipt until it concludes, or timeout.
+
+    Returns {status, status_name, delivered, proved}. status is the real
+    RNS.PacketReceipt.status int (SENT=0x01, DELIVERED=0x02, FAILED=0x00,
+    CULLED=0xFF). `delivered` is True iff status == DELIVERED, the observable
+    a proof_for_local_client test asserts: the single packet's PROOF made it
+    all the way back to the originator. Polls up to timeout_ms (blocking the
+    bridge thread, same pattern as wire_poll_path) so the test doesn't have to
+    sleep on raw timing; returns the current status immediately when
+    timeout_ms == 0.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    receipt_id = params["receipt_id"]
+    timeout_ms = int(params.get("timeout_ms", 0))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    receipt = inst.get("receipts", {}).get(receipt_id)
+    if receipt is None:
+        raise ValueError(f"Unknown receipt_id: {receipt_id}")
+
+    DELIVERED = RNS.PacketReceipt.DELIVERED
+    FAILED = RNS.PacketReceipt.FAILED
+    CULLED = RNS.PacketReceipt.CULLED
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while True:
+        status = receipt.get_status()
+        if status in (DELIVERED, FAILED, CULLED):
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.05)
+
+    status = receipt.get_status()
+    return {
+        "status": int(status),
+        "status_name": _PACKET_RECEIPT_STATUS_NAMES.get(status),
+        "delivered": status == DELIVERED,
+        "proved": bool(getattr(receipt, "proved", False)),
+    }
+
+
+def cmd_wire_send_link_data(params):
+    """Send a DATA packet OVER an established Link with a tracked PacketReceipt.
+
+    Distinct from wire_link_send (fire-and-forget over a Link) and
+    wire_send_packet (single SINGLE-destination packet): this drives the
+    link-DATA proof path (Link.py:999-1008). The receiver proves the packet per
+    its destination's proof strategy (set via wire_set_proof_strategy); the
+    returning PROOF validates the receipt, making PROVE_ALL/NONE/APP observable:
+      'all'  -> receipt reaches DELIVERED,
+      'none' -> no proof, receipt never DELIVERS (eventually FAILED),
+      'app'  -> DELIVERED only when the callback returns True (payload[0]==0x01).
+    Returns {sent, receipt_id}; poll via wire_packet_receipt_status (stashed in
+    the same receipts table as wire_send_packet).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    payload = bytes.fromhex(params.get("data", ""))
+    create_receipt = bool(params.get("create_receipt", True))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    packet = RNS.Packet(link, payload, create_receipt=create_receipt)
+    receipt = packet.send()
+    if receipt is False:
+        return {"sent": False, "receipt_id": None}
+    receipt_id = None
+    if receipt is not None:
+        receipt_id = secrets.token_hex(8)
+        with _instances_lock:
+            inst.setdefault("receipts", {})[receipt_id] = receipt
+    return {"sent": True, "receipt_id": receipt_id}
+
+
+def cmd_wire_send_keepalive_probe(params):
+    """Inject a decrypted 0xFF keepalive into a link's receive path and report
+    the link's response — making the keepalive byte protocol observable
+    (Link.py:848-849/:974/:1149-1153).
+
+    On a NON-initiator (a listener's inbound link) RNS answers a 0xFF with
+    bytes([0xFE]) (Link.py:1151) and updates last_keepalive/last_inbound but NOT
+    last_data; the captured response is "fe". On an INITIATOR link the receive
+    guard (Link.py:974) drops the link's own 0xFF echo entirely — no answer,
+    last_inbound/last_data unchanged. Returns {response, answered, initiator,
+    last_inbound_advanced, last_data_advanced, status_before, status_after}.
+    Pass `value` (hex, default "ff") to inject a different keepalive byte.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    value = bytes.fromhex(params.get("value", "ff"))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    store = inst.setdefault("keepalive_payloads", {})
+
+    # Build a properly-framed inbound keepalive packet (unencrypted — KEEPALIVE
+    # ciphertext == data, Packet.py:206-209), then feed it through link.receive
+    # as if it arrived on the link's attached interface.
+    out_packet = RNS.Packet(link, value, context=RNS.Packet.KEEPALIVE)
+    out_packet.pack()
+    rx = RNS.Packet(None, out_packet.raw)
+    if not rx.unpack():
+        raise RuntimeError("could not unpack crafted keepalive packet")
+    rx.receiving_interface = link.attached_interface
+
+    # Capture the link's own keepalive emission (the 0xFE answer) during receive.
+    captured = []
+    orig_send = RNS.Packet.send
+
+    def capturing_send(pkt_self, _orig=orig_send):
+        try:
+            if (getattr(pkt_self, "context", None) == RNS.Packet.KEEPALIVE
+                    and getattr(pkt_self, "destination", None) is link):
+                captured.append(bytes(pkt_self.data))
+        except Exception:
+            pass
+        return _orig(pkt_self)
+
+    last_inbound_before = getattr(link, "last_inbound", 0) or 0
+    last_data_before = getattr(link, "last_data", 0) or 0
+    status_before = getattr(link, "status", None)
+
+    RNS.Packet.send = capturing_send
+    try:
+        link.receive(rx)
+    finally:
+        RNS.Packet.send = orig_send
+
+    response = captured[-1] if captured else None
+    if response is not None:
+        store[link_id] = response
+
+    return {
+        "response": response.hex() if response is not None else None,
+        "answered": bool(captured),
+        "initiator": bool(getattr(link, "initiator", False)),
+        "last_inbound_advanced": (getattr(link, "last_inbound", 0) or 0) > last_inbound_before,
+        "last_data_advanced": (getattr(link, "last_data", 0) or 0) > last_data_before,
+        "status_before": int(status_before) if status_before is not None else None,
+        "status_after": int(getattr(link, "status", -1)),
+    }
+
+
+def cmd_wire_last_keepalive(params):
+    """Return the last keepalive byte this link emitted/answered (hex), or
+    payload=None. "ff" for an initiator's own keepalive (captured by wrapping
+    send_keepalive in wire_link_open), "fe" for a non-initiator's answer
+    (captured by wire_send_keepalive_probe). Lets a test assert the exact
+    keepalive byte values rather than only the timing (Link.py:848-849/:1151).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    payload = inst.get("keepalive_payloads", {}).get(link_id)
+    return {"payload": payload.hex() if isinstance(payload, (bytes, bytearray)) else None}
+
+
+# ---------------------------------------------------------------------------
+# Channel out-of-order / duplicate injection + window observation
+#
+# RNS.Channel reorders and de-duplicates received envelopes by sequence
+# (Channel._receive / _emplace_envelope). These commands feed crafted
+# envelopes straight into the real channel's receive path and observe the
+# order in which the channel delivers them to its message handler — testing
+# RNS's reassembly logic without needing the wire to deliver out of order.
+# ---------------------------------------------------------------------------
+
+_WIRE_CHANNEL_MSGTYPE = 0x0101
+_channel_message_class = None
+
+
+def _get_channel_message_class():
+    """A minimal MessageBase whose payload is opaque bytes, registered on
+    the channel so RNS's Envelope.unpack can reconstruct injected messages.
+    """
+    global _channel_message_class
+    if _channel_message_class is None:
+        from RNS.Channel import MessageBase
+
+        class _WireChannelMessage(MessageBase):
+            MSGTYPE = _WIRE_CHANNEL_MSGTYPE
+
+            def __init__(self, data=b""):
+                self.data = bytes(data)
+
+            def pack(self):
+                return self.data
+
+            def unpack(self, raw):
+                self.data = bytes(raw)
+
+        _channel_message_class = _WireChannelMessage
+    return _channel_message_class
+
+
+def _ensure_channel_state(inst, link_id):
+    """Lazily wire a recording message handler onto a link's real Channel."""
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+    channels = inst.setdefault("channels", {})
+    state = channels.get(link_id)
+    if state is not None:
+        return state
+
+    channel = link.get_channel()
+    msgclass = _get_channel_message_class()
+    received = []
+    rlock = threading.Lock()
+    try:
+        channel.register_message_type(msgclass)
+    except Exception:
+        # Already registered on this channel — fine.
+        pass
+
+    def _on_message(message):
+        with rlock:
+            received.append(bytes(getattr(message, "data", b"")))
+        return True  # consume
+
+    channel.add_message_handler(_on_message)
+    state = {"channel": channel, "received": received, "lock": rlock}
+    channels[link_id] = state
+    return state
+
+
+def cmd_wire_channel_inject(params):
+    """Feed crafted envelopes into a link's real RNS.Channel receive path.
+
+    envelopes: list of {sequence: int, data: hex}. Each is packed into a real
+    RNS.Channel.Envelope (struct ">HHH" MSGTYPE/sequence/len + payload) and
+    handed to Channel._receive — exactly the bytes the channel would see off
+    the wire. RNS then reorders by sequence and drops duplicates; delivered
+    payloads (in delivery order) are observable via wire_channel_received.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    envelopes = params.get("envelopes", []) or []
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+    msgclass = _get_channel_message_class()
+    from RNS.Channel import Envelope
+
+    injected = []
+    for env in envelopes:
+        seq = int(env["sequence"])
+        data = bytes.fromhex(env.get("data", ""))
+        message = msgclass(data)
+        envelope = Envelope(outlet=channel._outlet, message=message, sequence=seq)
+        raw = envelope.pack()
+        channel._receive(raw)
+        injected.append(seq)
+    return {"injected": injected}
+
+
+def cmd_wire_channel_received(params):
+    """Drain the in-order payloads the channel has delivered to its handler.
+
+    Returns {messages: [hex, ...]} in the exact order RNS delivered them —
+    which for out-of-order injection is the reassembled sequence order, and
+    for duplicates excludes the dropped copy.
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    # Initiator side: messages recorded by _ensure_channel_state on an out_link.
+    state = inst.get("channels", {}).get(link_id)
+    if state is not None:
+        with state["lock"]:
+            out = [d.hex() for d in state["received"]]
+            state["received"].clear()
+        return {"messages": out}
+    # Receiver side: messages recorded by the wire_listen channel handler on the
+    # inbound link whose link_id matches (the same value on both peers).
+    for listener in inst.get("listeners", {}).values():
+        with listener["recv_lock"]:
+            inbound = list(listener.get("inbound_links", []))
+        if any(getattr(lk, "link_id", None) == link_id for lk in inbound):
+            with listener["recv_lock"]:
+                out = [d.hex() for d in listener.get("channel_received", [])]
+                listener["channel_received"].clear()
+            return {"messages": out}
+    return {"messages": []}
+
+
+def cmd_wire_channel_window(params):
+    """Report a link channel's real window + sequence state.
+
+    Fields read straight off RNS.Channel: window / window_min / window_max /
+    window_flexibility, next_rx_sequence (the low edge of the receive
+    window — advances as contiguous envelopes are delivered), next_sequence
+    (tx), and the current rx/tx ring depths. `tx_tries` is the max retransmit
+    count across in-flight tx envelopes and `tx_envelopes` lists each
+    in-flight envelope's {sequence, tries} — the observable for the Channel
+    retransmission-backoff / 5-try-teardown gap (Channel.py:555-584).
+    """
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    state = _ensure_channel_state(inst, link_id)
+    ch = state["channel"]
+    tx_envelopes = []
+    max_tries = 0
+    try:
+        for env in list(ch._tx_ring):
+            tries = int(getattr(env, "tries", 0) or 0)
+            tx_envelopes.append({"sequence": int(getattr(env, "sequence", -1)), "tries": tries})
+            if tries > max_tries:
+                max_tries = tries
+    except Exception:
+        pass
+    return {
+        "window": int(ch.window),
+        "window_min": int(ch.window_min),
+        "window_max": int(ch.window_max),
+        "window_flexibility": int(ch.window_flexibility),
+        "next_rx_sequence": int(ch._next_rx_sequence),
+        "next_sequence": int(ch._next_sequence),
+        "rx_ring": len(ch._rx_ring),
+        "tx_ring": len(ch._tx_ring),
+        "tx_tries": max_tries,
+        "tx_envelopes": tx_envelopes,
+    }
+
+
+def cmd_wire_channel_send(params):
+    """Perform a REAL RNS.Channel.send over an established link — the honest
+    replacement for the dead cmd_rns_channel_send (zero callers).
+
+    The Channel is keyed by its Link, so `channel_id` (or `link_id`) carries the
+    link id. Sends a _WireChannelMessage; by default waits for the send receipt
+    to DELIVER (the peer proves the CHANNEL packet, Link.py:1165-1173) or the
+    link to be torn down.
+
+    drop_acks (default False): neuter THIS message's receipt so the peer's PROOF
+    can't validate it. RNS then retransmits with an increasing timeout window
+    and, after _max_tries (5) unanswered tries, tears the link down and shrinks
+    the window (Channel.py:555-584). The neutering is applied inside the outlet
+    send — before any proof can round-trip — so it is race-free; resends reuse
+    the same (neutered) receipt.
+
+    msgtype (optional): request a specific Channel MSGTYPE. A value >= 0xf000 is
+    system-reserved (Channel.py:328-345) and must be rejected — returns
+    {rejected: True, error} without sending.
+
+    Returns {sent, delivered, tries, sequence, window, window_max, link_status}
+    (or {rejected, error} for a reserved msgtype). timeout_ms bounds the wait.
+    """
+    RNS = _get_rns()
+    from RNS.Channel import MessageState
+
+    handle = params["handle"]
+    link_id_hex = params.get("link_id") or params.get("channel_id")
+    if not link_id_hex:
+        raise ValueError("wire_channel_send requires link_id (or channel_id)")
+    link_id = bytes.fromhex(link_id_hex)
+    payload = bytes.fromhex(params.get("data", ""))
+    drop_acks = bool(params.get("drop_acks", False))
+    msgtype = params.get("msgtype")
+    timeout_ms = int(params.get("timeout_ms", 20000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    # Reserved-MSGTYPE rejection (construction-time guard, Channel.py:336-338).
+    if msgtype is not None and int(msgtype) >= 0xF000:
+        state = _ensure_channel_state(inst, link_id)
+        channel = state["channel"]
+        from RNS.Channel import MessageBase, ChannelException
+
+        class _ReservedMessage(MessageBase):
+            MSGTYPE = int(msgtype)
+
+            def pack(self):
+                return b""
+
+            def unpack(self, raw):
+                pass
+
+        try:
+            channel.register_message_type(_ReservedMessage)
+            return {"rejected": False, "error": None, "sent": False}
+        except ChannelException as e:
+            return {"rejected": True, "error": str(e), "sent": False}
+
+    state = _ensure_channel_state(inst, link_id)
+    channel = state["channel"]
+    link = inst.get("out_links", {}).get(link_id)
+    msgclass = _get_channel_message_class()
+    message = msgclass(payload)
+
+    # Wait until the channel can accept a send (window not saturated).
+    deadline = time.time() + timeout_ms / 1000.0
+    while not channel.is_ready_to_send() and time.time() < deadline:
+        time.sleep(0.02)
+    if not channel.is_ready_to_send():
+        return {
+            "sent": False, "delivered": False, "tries": 0, "sequence": None,
+            "window": int(channel.window), "window_max": int(channel.window_max),
+            "ready": False,
+        }
+
+    if drop_acks:
+        # Persistently neuter the receipt of EVERY (re)send on this outlet so the
+        # returning proof can never validate it. Transport.outbound creates a
+        # FRESH receipt on each resend (Transport.py:1112), so neutering only the
+        # first would let a retransmit's receipt deliver — we must wrap both send
+        # and resend. The neutering is applied synchronously inside the outlet
+        # call (before any proof can round-trip), so it is race-free. No restore:
+        # the link is torn down after _max_tries, ending this outlet's life.
+        outlet = channel._outlet
+        if not getattr(outlet, "_wire_drop_acks", False):
+            orig_send = outlet.send
+            orig_resend = outlet.resend
+
+            def _neuter(packet):
+                try:
+                    if packet is not None and getattr(packet, "receipt", None) is not None:
+                        packet.receipt.validate_proof = lambda *a, **k: False
+                        packet.receipt.validate_proof_packet = lambda *a, **k: False
+                except Exception:
+                    pass
+                return packet
+
+            def dropping_send(raw, _orig=orig_send):
+                return _neuter(_orig(raw))
+
+            def dropping_resend(packet, _orig=orig_resend):
+                return _neuter(_orig(packet))
+
+            outlet.send = dropping_send
+            outlet.resend = dropping_resend
+            outlet._wire_drop_acks = True
+
+    envelope = channel.send(message)
+
+    # Observe the outcome: delivery (non-drop) or retransmit/teardown (drop).
+    def _delivered():
+        pkt = getattr(envelope, "packet", None)
+        if pkt is None:
+            return False
+        try:
+            return channel._outlet.get_packet_state(pkt) == MessageState.MSGSTATE_DELIVERED
+        except Exception:
+            return False
+
+    link_closed = lambda: (link is not None and getattr(link, "status", None) == RNS.Link.CLOSED)
+    while time.time() < deadline:
+        if _delivered() or link_closed():
+            break
+        time.sleep(0.05)
+
+    return {
+        "sent": True,
+        "delivered": _delivered(),
+        "tries": int(getattr(envelope, "tries", 0) or 0),
+        "sequence": int(getattr(envelope, "sequence", -1)),
+        "window": int(channel.window),
+        "window_max": int(channel.window_max),
+        "link_status": int(getattr(link, "status", -1)) if link is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Buffer (RawChannelReader / RawChannelWriter) streaming
+# ---------------------------------------------------------------------------
+
+def cmd_wire_buffer_stream(params):
+    """Stream bytes over a link via RNS.Buffer (RawChannelWriter).
+
+    Writes `data` through a RawChannelWriter on the out-link's Channel; the
+    payload is chunked into StreamDataMessages (Channel SMT_STREAM_DATA 0xff00,
+    MAX_DATA_LEN per send, MAX_CHUNK_LEN=16 KiB per write) and reassembled by the
+    peer's RawChannelReader (created at link establishment by wire_listen). A
+    payload spanning several chunks + a partial final chunk exercises multi-chunk
+    reassembly + EOF; read it back with wire_buffer_received on the receiver.
+
+    bomb (default False): instead of `data`, send a single crafted chunk whose
+    compressed body decompresses past MAX_CHUNK_LEN (Buffer.py:95-97). The
+    receiver's reader must abort with IOError (observable via
+    wire_buffer_received -> aborted=True), not silently truncate.
+
+    Returns {written, eof}.
+    """
+    RNS = _get_rns()
+    import bz2
+    from RNS.Buffer import StreamDataMessage, RawChannelWriter
+
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    data = bytes.fromhex(params.get("data", ""))
+    bomb = bool(params.get("bomb", False))
+    timeout_ms = int(params.get("timeout_ms", 30000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    channel = link.get_channel()
+    deadline = time.time() + timeout_ms / 1000.0
+
+    def _wait_ready():
+        while not channel.is_ready_to_send() and time.time() < deadline:
+            time.sleep(0.02)
+        return channel.is_ready_to_send()
+
+    if bomb:
+        # Craft a compressed StreamDataMessage whose decompressed payload exceeds
+        # MAX_CHUNK_LEN; the receiver's StreamDataMessage.unpack trips the bound.
+        oversize = RawChannelWriter.MAX_CHUNK_LEN * 4  # 64 KiB > 16 KiB bound
+        compressed = bz2.compress(bytes(oversize))
+        if len(compressed) >= StreamDataMessage.MAX_DATA_LEN:
+            raise RuntimeError("crafted bomb chunk does not fit a single message")
+        message = StreamDataMessage(_WIRE_BUFFER_STREAM_ID, compressed, eof=False, compressed=True)
+        if not _wait_ready():
+            return {"written": 0, "eof": False, "ready": False}
+        channel.send(message)
+        return {"written": 0, "eof": False, "bomb": True}
+
+    writer = RawChannelWriter(_WIRE_BUFFER_STREAM_ID, channel)
+    remaining = data
+    total = 0
+    while remaining and time.time() < deadline:
+        if not channel.is_ready_to_send():
+            time.sleep(0.02)
+            continue
+        n = writer.write(remaining)
+        if n and n > 0:
+            remaining = remaining[n:]
+            total += n
+        else:
+            time.sleep(0.02)
+    # Flush EOF (empty write with eof flag) once the ring drains.
+    _wait_ready()
+    writer._eof = True
+    try:
+        writer.write(b"")
+    except Exception:
+        pass
+    return {"written": total, "eof": True}
+
+
+def cmd_wire_buffer_received(params):
+    """Drain what a listener's RawChannelReader reassembled from a stream.
+
+    Pairs with wire_buffer_stream on the sender. Blocks up to timeout_ms for the
+    stream to conclude (EOF) or abort (bz2-bomb). Returns {data, eof, aborted,
+    error}: `data` is the byte-exact reassembly across all chunks (hex), `eof`
+    True once the writer's EOF marker was seen, `aborted` True iff the reader hit
+    the MAX_CHUNK_LEN decompression bound (Buffer.py:95-97), `error` the abort
+    reason when aborted.
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    timeout_ms = int(params.get("timeout_ms", 30000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    listener = inst.get("listeners", {}).get(destination_hash)
+    if listener is None:
+        raise ValueError(
+            f"No listener registered for destination_hash={destination_hash.hex()}"
+        )
+
+    buffer_state = listener.get("buffer_state") or {}
+    recv_lock = listener["recv_lock"]
+    # Accumulate the reassembled stream as a hex string (the RawChannelReader
+    # already holds the protocol-decoded bytes; we only concatenate the drained
+    # chunks, never reconstruct any wire structure here). MAX_READ caps a single
+    # _read() at 1 MiB (== 1 << 20).
+    MAX_READ = 1048576
+    data_hex = ""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        reader = buffer_state.get("reader")
+        chunk = None
+        if reader is not None:
+            try:
+                chunk = reader._read(MAX_READ)
+            except Exception:
+                chunk = None
+        if chunk:
+            data_hex += chunk.hex()
+            continue
+        eof = bool(reader is not None and getattr(reader, "_eof", False))
+        aborted = bool(buffer_state.get("aborted"))
+        if eof or aborted:
+            break
+        time.sleep(0.05)
+
+    reader = buffer_state.get("reader")
+    # Final drain.
+    if reader is not None:
+        try:
+            tail = reader._read(MAX_READ)
+            while tail:
+                data_hex += tail.hex()
+                tail = reader._read(MAX_READ)
+        except Exception:
+            pass
+    return {
+        "data": data_hex,
+        "eof": bool(reader is not None and getattr(reader, "_eof", False)),
+        "aborted": bool(buffer_state.get("aborted")),
+        "error": buffer_state.get("error"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GROUP destination symmetric encrypt / decrypt
+# ---------------------------------------------------------------------------
+
+def cmd_wire_group_create(params):
+    """Create a real RNS.Destination of type GROUP and either generate or
+    load its symmetric key (RNS.Destination.create_keys / load_private_key).
+
+    Returns the destination_hash (a handle for subsequent encrypt/decrypt on
+    this peer) and the symmetric `key` (hex). GROUP encryption is symmetric
+    and identity-independent, so a second peer that loads the same key can
+    decrypt; a peer with a different key cannot.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", []) or []
+    key_hex = params.get("key")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    destination = RNS.Destination(
+        None, RNS.Destination.IN, RNS.Destination.GROUP, app_name, *aspects
+    )
+    if key_hex:
+        destination.load_private_key(bytes.fromhex(key_hex))
+    else:
+        destination.create_keys()
+
+    inst.setdefault("group_dests", {})[destination.hash] = destination
+    # Strong ref so it isn't GC'd (identity slot is None for GROUP).
+    inst["destinations"].append((None, destination))
+    return {
+        "destination_hash": destination.hash.hex(),
+        "key": destination.get_private_key().hex(),
+    }
+
+
+def cmd_wire_group_encrypt(params):
+    """Encrypt plaintext for a GROUP destination (real Destination.encrypt → Token)."""
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = inst.get("group_dests", {}).get(destination_hash)
+    if destination is None:
+        raise ValueError(f"No GROUP destination {destination_hash.hex()} on handle {handle}")
+    ciphertext = destination.encrypt(plaintext)
+    return {"ciphertext": ciphertext.hex()}
+
+
+def cmd_wire_group_decrypt(params):
+    """Decrypt ciphertext for a GROUP destination (real Destination.decrypt).
+
+    Returns {plaintext: hex|None, decrypted: bool}. A wrong key yields
+    decrypted=False (RNS returns None on Token auth failure).
+    """
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    ciphertext = bytes.fromhex(params.get("ciphertext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = inst.get("group_dests", {}).get(destination_hash)
+    if destination is None:
+        raise ValueError(f"No GROUP destination {destination_hash.hex()} on handle {handle}")
+    plaintext = destination.decrypt(ciphertext)
+    return {
+        "plaintext": plaintext.hex() if plaintext is not None else None,
+        "decrypted": plaintext is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Identity ratchet encrypt / decrypt (enforce_ratchets rejection support)
+#
+# Pure RNS crypto — no started wire instance required.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_identity_keypair(params):
+    """Generate a fresh RNS.Identity; return its private/public key + hash."""
+    RNS = _get_rns()
+    identity = RNS.Identity()
+    return {
+        "private_key": identity.get_private_key().hex(),
+        "public_key": identity.get_public_key().hex(),
+        "hash": identity.hash.hex(),
+    }
+
+
+def cmd_wire_ratchet_keypair(params):
+    """Generate a fresh X25519 ratchet keypair (RNS.Cryptography.X25519).
+
+    The public bytes are passed to wire_identity_encrypt(ratchet_pub=...);
+    the private bytes go into wire_identity_decrypt(ratchets=[...]).
+    """
+    _get_rns()
+    from RNS.Cryptography import X25519PrivateKey
+    k = X25519PrivateKey.generate()
+    return {
+        "private_key": k.private_bytes().hex(),
+        "public_key": k.public_key().public_bytes().hex(),
+    }
+
+
+def cmd_wire_identity_encrypt(params):
+    """Encrypt for an identity's public key (real RNS.Identity.encrypt).
+
+    When `ratchet_pub` is supplied the message is encrypted to that ratchet
+    public key (forward secrecy); otherwise to the identity's base key.
+    """
+    RNS = _get_rns()
+    public_key = bytes.fromhex(params["public_key"])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    ratchet_pub = params.get("ratchet_pub")
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    if ratchet_pub:
+        ciphertext = identity.encrypt(plaintext, ratchet=bytes.fromhex(ratchet_pub))
+    else:
+        ciphertext = identity.encrypt(plaintext)
+    return {"ciphertext": ciphertext.hex()}
+
+
+def cmd_wire_identity_decrypt(params):
+    """Decrypt for an identity's private key (real RNS.Identity.decrypt),
+    with full ratchet-enforcement support.
+
+    ratchets: list of ratchet PRIVATE keys (hex) to try. enforce_ratchets:
+    when True, RNS REJECTS (returns None) any ciphertext that none of the
+    supplied ratchets can decrypt — even though the identity's base key
+    could — which is the forward-secrecy guarantee. Returns {plaintext:
+    hex|None, decrypted: bool}.
+    """
+    RNS = _get_rns()
+    private_key = bytes.fromhex(params["private_key"])
+    ciphertext = bytes.fromhex(params["ciphertext"])
+    ratchets_hex = params.get("ratchets", []) or []
+    enforce = bool(params.get("enforce_ratchets", False))
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    ratchets = [bytes.fromhex(r) for r in ratchets_hex] or None
+    plaintext = identity.decrypt(ciphertext, ratchets=ratchets, enforce_ratchets=enforce)
+    return {
+        "plaintext": plaintext.hex() if plaintext is not None else None,
+        "decrypted": plaintext is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# IFAC (issue-29 golden vector) — computed from the ifac_key RNS itself
+# derived for this peer's configured interface; nothing is re-derived here.
+# ---------------------------------------------------------------------------
+
+def cmd_wire_ifac_compute(params):
+    """Compute the IFAC access code RNS.Transport.transmit (Transport.py:1054)
+    would prepend, using the live interface's RNS-derived ifac_identity /
+    ifac_key.
+
+    The peer must have been started with network_name + passphrase so RNS
+    derived an IFAC key during config parse (Reticulum._add_interface). This
+    command reads `interface.ifac_identity` / `interface.ifac_key` straight
+    off the live interface and signs `packet_data` with it — i.e. the exact
+    Ed25519 sign + trailing-bytes slice RNS uses — so the reticulum-kt#29
+    golden vector (network=testnet, pass=testpass, packet=bytes(range(64)))
+    is reproduced via genuine RNS, not a hand-rolled HKDF/Ed25519.
+
+    Returns ifac_key (hex), the full 64-byte Ed25519 signature, the ifac_size
+    used, and the `ifac` tag (signature[-ifac_size:]).
+    """
+    handle = params["handle"]
+    packet_data = bytes.fromhex(params["packet_data"])
+    ifac_size_override = params.get("ifac_size")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    ifac_iface = None
+    for iface in _interfaces_matching_handle(inst["rns"], inst["role"]):
+        if getattr(iface, "ifac_identity", None) is not None:
+            ifac_iface = iface
+            break
+    if ifac_iface is None:
+        raise RuntimeError(
+            "No IFAC-configured interface on this handle. Start the peer with "
+            "network_name + passphrase so RNS derives an ifac_key."
+        )
+
+    size = int(ifac_size_override) if ifac_size_override is not None else int(ifac_iface.ifac_size)
+    signature = ifac_iface.ifac_identity.sign(packet_data)
+    return {
+        "ifac_key": ifac_iface.ifac_key.hex(),
+        "ifac_size": size,
+        "signature": signature.hex(),
+        "ifac": signature[-size:].hex(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Destination-level ratchets (latest_ratchet_id / rotation-interval gating /
+# retained-cap / file persistence / Identity ratchet expiry)
+#
+# All drive the REAL RNS.Destination / RNS.Identity ratchet machinery on a
+# ratchet-enabled SINGLE destination (created via wire_announce
+# enable_ratchets=True). Timestamps are manipulated deterministically — no
+# real sleeps — to make rotation-interval and expiry gating observable.
+# ---------------------------------------------------------------------------
+
+def _ratchet_id_hex(RNS, private_bytes):
+    """ratchet_id (Identity.py:410-411) of a ratchet PRIVATE key, as hex."""
+    pub = RNS.Identity._ratchet_public_bytes(private_bytes)
+    return RNS.Identity._get_ratchet_id(pub).hex()
+
+
+def _current_ratchet_id(destination):
+    """Hex ratchet_id of the newest (index 0) ratchet, or None."""
+    from bridge_server import _get_full_rns
+    RNS = _get_full_rns()
+    if not getattr(destination, "ratchets", None):
+        return None
+    return _ratchet_id_hex(RNS, destination.ratchets[0])
+
+
+def _previous_ratchet_id(destination):
+    """Hex ratchet_id of the second-newest (index 1) ratchet, or None."""
+    from bridge_server import _get_full_rns
+    RNS = _get_full_rns()
+    rs = getattr(destination, "ratchets", None)
+    if not rs or len(rs) < 2:
+        return None
+    return _ratchet_id_hex(RNS, rs[1])
+
+
+def _ratchet_dest_or_raise(inst, dest_hash, handle):
+    """Locate a ratchet-ENABLED SINGLE destination by hash, or raise.
+
+    The destination must have been created with wire_announce
+    enable_ratchets=True (so destination.ratchets is a list, not None).
+    """
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on "
+            f"handle {handle}; call wire_announce(enable_ratchets=True) first."
+        )
+    if getattr(destination, "ratchets", None) is None:
+        raise ValueError(
+            f"Destination {dest_hash.hex()} does not have ratchets enabled; "
+            f"call wire_announce(enable_ratchets=True)."
+        )
+    return destination
+
+
+def _ratchet_snapshot(destination):
+    """Read-only snapshot of a ratchet-enabled destination's ratchet state."""
+    rs = getattr(destination, "ratchets", None)
+    latest = getattr(destination, "latest_ratchet_id", None)
+    return {
+        "ratchet_count": len(rs) if rs is not None else 0,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "previous_ratchet_id": _previous_ratchet_id(destination),
+        "ratchet_interval": int(destination.ratchet_interval),
+        "retained_ratchets": int(destination.retained_ratchets),
+        "latest_ratchet_id": latest.hex() if isinstance(latest, (bytes, bytearray)) else None,
+        "latest_ratchet_time": destination.latest_ratchet_time,
+    }
+
+
+def cmd_wire_read_ratchets(params):
+    """Read the current ratchet state of a ratchet-enabled destination.
+
+    Returns {ratchet_count, current_ratchet_id, previous_ratchet_id,
+    ratchet_interval, retained_ratchets, latest_ratchet_id,
+    latest_ratchet_time}. The current/previous ids + count are the
+    observables for the rotation-interval gating test (Destination.py:227-241).
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    return _ratchet_snapshot(destination)
+
+
+def cmd_wire_set_ratchet_interval(params):
+    """Set a destination's minimum ratchet-rotation interval in seconds
+    (real RNS.Destination.set_ratchet_interval, Destination.py:519-531).
+
+    Returns {ok, ratchet_interval}. `ok` is False for a non-positive / non-int
+    value (RNS rejects it and leaves the interval unchanged).
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    seconds = params["seconds"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    # Pass int (RNS requires isinstance int); a float arg is coerced so the
+    # command is forgiving, but a non-positive value is forwarded as-is so the
+    # rejection (returns False) stays observable.
+    arg = seconds if not isinstance(seconds, bool) and isinstance(seconds, int) else int(seconds)
+    ok = bool(destination.set_ratchet_interval(arg))
+    return {"ok": ok, "ratchet_interval": int(destination.ratchet_interval)}
+
+
+def cmd_wire_rotate_ratchet(params):
+    """Trigger a ratchet rotation and observe the rotation-INTERVAL gate
+    (Destination.py:227-241) WITHOUT a real wait.
+
+    rotate_ratchets() only inserts a new ratchet when
+    now > latest_ratchet_time + ratchet_interval. Pass
+    last_rotation_ago_s to deterministically backdate latest_ratchet_time
+    (so the gate either opens or stays shut): a value < ratchet_interval
+    leaves the count unchanged (gated); a value > ratchet_interval inserts a
+    new newest ratchet (the prior current becomes previous).
+
+    Returns {rotated, before_count, after_count, before_current_id,
+    current_ratchet_id, previous_ratchet_id, ratchet_interval,
+    latest_ratchet_time}. `rotated` is after_count > before_count.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    last_rotation_ago_s = params.get("last_rotation_ago_s")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    if last_rotation_ago_s is not None:
+        destination.latest_ratchet_time = time.time() - float(last_rotation_ago_s)
+
+    before_count = len(destination.ratchets)
+    before_current = _current_ratchet_id(destination)
+    destination.rotate_ratchets()
+    after_count = len(destination.ratchets)
+    return {
+        "rotated": after_count > before_count,
+        "before_count": before_count,
+        "after_count": after_count,
+        "before_current_id": before_current,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "previous_ratchet_id": _previous_ratchet_id(destination),
+        "ratchet_interval": int(destination.ratchet_interval),
+        "latest_ratchet_time": destination.latest_ratchet_time,
+    }
+
+
+def cmd_wire_set_retained_ratchets(params):
+    """Set the retained-ratchets cap and observe RATCHET_COUNT truncation
+    (real RNS.Destination.set_retained_ratchets, Destination.py:504-517).
+
+    set_retained_ratchets(n) sets retained_ratchets and runs _clean_ratchets
+    (Destination.py:205-208), which truncates the list to Destination.
+    RATCHET_COUNT (512) when len exceeds the retained cap. To make the cap
+    observable cheaply, pass pad_to=N to first inflate the ratchets list with
+    N real freshly-generated ratchets (RNS.Identity._generate_ratchet) before
+    applying the cap.
+
+    Returns {ok, retained_ratchets, ratchet_count, ratchet_count_cap}.
+    `ok` is False for a non-positive / non-int n (RNS rejects it).
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    n = params["n"]
+    pad_to = params.get("pad_to")
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    if pad_to is not None:
+        pad_to = int(pad_to)
+        while len(destination.ratchets) < pad_to:
+            destination.ratchets.append(RNS.Identity._generate_ratchet())
+
+    arg = n if not isinstance(n, bool) and isinstance(n, int) else int(n)
+    ok = bool(destination.set_retained_ratchets(arg))
+    return {
+        "ok": ok,
+        "retained_ratchets": int(destination.retained_ratchets),
+        "ratchet_count": len(destination.ratchets),
+        "ratchet_count_cap": int(RNS.Destination.RATCHET_COUNT),
+    }
+
+
+def cmd_wire_ratchet_file_roundtrip(params):
+    """Persist + reload a destination's ratchet store and confirm the signed
+    on-disk store round-trips (Destination.py:210-225 _persist_ratchets /
+    :426-464 _reload_ratchets).
+
+    Drives a fresh Destination._persist_ratchets (which writes the signed
+    on-disk blob), clears the in-memory ratchet list, then reloads via
+    Destination._reload_ratchets. _reload_ratchets validates the embedded
+    signature against the destination identity and only repopulates
+    destination.ratchets when it verifies (raising otherwise, :432-437/:450-458).
+    A successful reload that reproduces the ratchet list byte-exact therefore
+    proves the persisted store carried a valid signature over the well-formed
+    format -- the bridge does NOT re-implement or hand-parse the on-disk format;
+    the validation is RNS's own.
+
+    Returns {ratchets_path_set, reload_ok, ratchet_count_before,
+    ratchet_count_after, roundtrip_match, ratchet_ids}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+    if not destination.ratchets_path:
+        raise ValueError(
+            f"Destination {dest_hash.hex()} has no ratchets_path; ratchets must "
+            f"be enabled with a file path (wire_announce enable_ratchets=True)."
+        )
+
+    def _ratchet_ids(ratchets):
+        return [_ratchet_id_hex(RNS, r) for r in ratchets]
+
+    before_ratchets = list(destination.ratchets)
+    ratchet_count_before = len(before_ratchets)
+    ids_before = _ratchet_ids(before_ratchets)
+    ratchets_path = destination.ratchets_path
+
+    # Force a fresh signed write to disk.
+    destination._persist_ratchets()
+
+    # Reload from disk into a clean in-memory list. _reload_ratchets validates
+    # the embedded signature against the destination identity and only sets
+    # destination.ratchets when it verifies; reload_ok therefore reflects that
+    # the persisted signature was valid and the format well-formed (an invalid
+    # signature or malformed blob makes RNS raise here).
+    destination.ratchets = None
+    reload_ok = True
+    try:
+        destination._reload_ratchets(ratchets_path)
+    except Exception:
+        reload_ok = False
+    after_ratchets = list(destination.ratchets) if destination.ratchets is not None else []
+    ratchet_count_after = len(after_ratchets)
+    ids_after = _ratchet_ids(after_ratchets)
+
+    return {
+        "ratchets_path_set": True,
+        "reload_ok": reload_ok,
+        "ratchet_count_before": ratchet_count_before,
+        "ratchet_count_after": ratchet_count_after,
+        "roundtrip_match": ids_before == ids_after and ratchet_count_before == ratchet_count_after,
+        "ratchet_ids": ids_after,
+    }
+
+
+def cmd_wire_destination_latest_ratchet_id(params):
+    """Drive a real Destination.encrypt + Destination.decrypt round-trip on a
+    ratchet-enabled SINGLE destination and expose latest_ratchet_id
+    (Destination.py:595-643).
+
+    encrypt() selects the current ratchet via RNS.Identity.get_ratchet and
+    sets destination.latest_ratchet_id to that ratchet's id (Destination.py:
+    596-599). decrypt() re-derives it via ratchet_id_receiver=self
+    (Identity.py:889-890). Both should equal the current ratchet id — the
+    discriminating observable that the SINGLE auto-ratchet path actually
+    tracked a ratchet (not None) for an app-level message.
+
+    Returns {decrypted, plaintext, latest_ratchet_id, encrypt_ratchet_id,
+    current_ratchet_id, match, ratchet_count}.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    probe = bytes.fromhex(params.get("data", "")) or b"ratchet-probe"
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _ratchet_dest_or_raise(inst, dest_hash, handle)
+
+    ciphertext = destination.encrypt(probe)
+    enc_id = getattr(destination, "latest_ratchet_id", None)
+    plaintext = destination.decrypt(ciphertext)
+    dec_id = getattr(destination, "latest_ratchet_id", None)
+    decrypted = plaintext == probe
+    return {
+        "decrypted": bool(decrypted),
+        "plaintext": plaintext.hex() if isinstance(plaintext, (bytes, bytearray)) else None,
+        "latest_ratchet_id": dec_id.hex() if isinstance(dec_id, (bytes, bytearray)) else None,
+        "encrypt_ratchet_id": enc_id.hex() if isinstance(enc_id, (bytes, bytearray)) else None,
+        "current_ratchet_id": _current_ratchet_id(destination),
+        "match": bool(
+            isinstance(enc_id, (bytes, bytearray))
+            and isinstance(dec_id, (bytes, bytearray))
+            and enc_id == dec_id
+        ),
+        "ratchet_count": len(destination.ratchets) if destination.ratchets is not None else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single-packet PROOF emission (implicit vs explicit), PLAIN no-op crypto,
+# request-handler deregister, known-public-key-mismatch rejection, and the
+# two deferred Link edges (forged LINKCLOSE, identify on a PENDING link).
+# ---------------------------------------------------------------------------
+
+def cmd_wire_send_packet_with_proof_request(params):
+    """Send a single SINGLE-destination DATA packet (tracked PacketReceipt)
+    and capture the PROOF the receiver returns (Destination.py:359-368,
+    Identity.py:959-970, Transport.py:2155-2165).
+
+    When the receiver's destination has proof_strategy PROVE_ALL/PROVE_APP it
+    emits a PROOF; RNS validates it against the originating receipt using the
+    receiver's public key (Packet.py:498-537), setting receipt.proved and
+    stashing receipt.proof_packet. This command waits for that, then surfaces
+    the proof bytes and whether RNS used an IMPLICIT (signature only,
+    IMPL_LENGTH) or EXPLICIT (packet_hash+signature, EXPL_LENGTH) proof per
+    RNS.Reticulum.should_use_implicit_proof().
+
+    Returns {sent, receipt_id, hops, delivered, proved, implicit_proof_config,
+    proof_data, proof_len, proof_is_implicit, proof_is_explicit,
+    impl_length, expl_length}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    payload = bytes.fromhex(params.get("data", ""))
+    timeout_ms = int(params.get("timeout_ms", 10000))
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    packet = RNS.Packet(out_destination, payload, create_receipt=True)
+    receipt = packet.send()
+    if receipt is False:
+        return {"sent": False, "receipt_id": None, "hops": None, "delivered": False}
+
+    hops = int(RNS.Transport.hops_to(destination_hash))
+    inst["destinations"].append((identity, out_destination))
+
+    DELIVERED = RNS.PacketReceipt.DELIVERED
+    FAILED = RNS.PacketReceipt.FAILED
+    CULLED = RNS.PacketReceipt.CULLED
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        st = receipt.get_status()
+        if st in (DELIVERED, FAILED, CULLED):
+            break
+        time.sleep(0.05)
+
+    receipt_id = secrets.token_hex(8)
+    inst.setdefault("receipts", {})[receipt_id] = receipt
+
+    proof_packet = getattr(receipt, "proof_packet", None)
+    proof_data = getattr(proof_packet, "data", None) if proof_packet is not None else None
+    proof_len = len(proof_data) if isinstance(proof_data, (bytes, bytearray)) else None
+    impl_len = int(RNS.PacketReceipt.IMPL_LENGTH)
+    expl_len = int(RNS.PacketReceipt.EXPL_LENGTH)
+    return {
+        "sent": True,
+        "receipt_id": receipt_id,
+        "hops": hops,
+        "delivered": receipt.get_status() == DELIVERED,
+        "proved": bool(getattr(receipt, "proved", False)),
+        "implicit_proof_config": bool(RNS.Reticulum.should_use_implicit_proof()),
+        "proof_data": proof_data.hex() if isinstance(proof_data, (bytes, bytearray)) else None,
+        "proof_len": proof_len,
+        "proof_is_implicit": proof_len == impl_len if proof_len is not None else None,
+        "proof_is_explicit": proof_len == expl_len if proof_len is not None else None,
+        "impl_length": impl_len,
+        "expl_length": expl_len,
+    }
+
+
+def cmd_wire_deregister_request_handler(params):
+    """Deregister a request handler by path (real RNS.Destination.
+    deregister_request_handler, Destination.py:389-401).
+
+    Returns {deregistered} — True if a handler for the path existed and was
+    removed, False otherwise. After this, a request to the same path is no
+    longer answered (the requester's RequestReceipt never reaches READY),
+    which is the discriminating control versus a still-registered handler.
+    """
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    path = params["path"]
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    destination = _find_destination_by_hash(inst, dest_hash)
+    if destination is None:
+        raise ValueError(
+            f"No registered destination with hash {dest_hash.hex()} on handle {handle}."
+        )
+    deregistered = bool(destination.deregister_request_handler(path))
+    # Drop the local response mapping so a later re-register starts clean; the
+    # invocation log is left intact so prior-call assertions still work.
+    _request_handler_responses.pop((handle, dest_hash, path), None)
+    return {"deregistered": deregistered}
+
+
+def _plain_destination(RNS, inst, app_name, aspects):
+    """Get-or-create a cached PLAIN IN destination on this instance.
+
+    A PLAIN destination holds no keys; encrypt/decrypt are identity no-ops
+    (Destination.py:592-593/:618-619). Cached per (app_name, aspects) so
+    repeated calls don't churn Transport.destinations.
+    """
+    key = (app_name, tuple(aspects))
+    cache = inst.setdefault("plain_dests", {})
+    dest = cache.get(key)
+    if dest is None:
+        dest = RNS.Destination(
+            None, RNS.Destination.IN, RNS.Destination.PLAIN, app_name, *aspects,
+        )
+        cache[key] = dest
+        inst["destinations"].append((None, dest))
+    return dest
+
+
+def cmd_wire_plain_encrypt(params):
+    """Encrypt via a PLAIN destination — a no-op passthrough that returns the
+    plaintext unchanged (Destination.py:592-593). Returns {ciphertext,
+    passthrough} where passthrough is ciphertext == plaintext.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    plaintext = bytes.fromhex(params.get("plaintext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    dest = _plain_destination(RNS, inst, app_name, aspects)
+    ciphertext = dest.encrypt(plaintext)
+    return {
+        "ciphertext": ciphertext.hex(),
+        "passthrough": ciphertext == plaintext,
+    }
+
+
+def cmd_wire_plain_decrypt(params):
+    """Decrypt via a PLAIN destination — a no-op passthrough that returns the
+    ciphertext unchanged (Destination.py:618-619). Returns {plaintext,
+    passthrough} where passthrough is plaintext == ciphertext.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    ciphertext = bytes.fromhex(params.get("ciphertext", ""))
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    dest = _plain_destination(RNS, inst, app_name, aspects)
+    plaintext = dest.decrypt(ciphertext)
+    return {
+        "plaintext": plaintext.hex(),
+        "passthrough": plaintext == ciphertext,
+    }
+
+
+def cmd_wire_known_key_validate(params):
+    """Validate a real signed announce against a planted known public key for
+    the same destination hash, exercising the known-key-mismatch rejection
+    (Identity.py:583-589).
+
+    Builds a genuine SINGLE destination + signed announce, then seeds
+    Identity.known_destinations[dest_hash] with a chosen public key before
+    calling RNS.Identity.validate_announce:
+      plant='mismatch' -> a DIFFERENT key is stored: the announce's valid key
+        != stored key, so validate_announce REJECTS (returns False).
+      plant='match'    -> the announce's own key is stored: accepted (True).
+      plant='none'     -> no prior entry: accepted (True).
+    The same announce flips accept/reject solely on the stored key — that
+    divergence is the property.
+
+    Returns {validated, destination_hash, public_key, planted_public_key, plant}.
+    """
+    RNS = _get_rns()
+    from RNS.vendor import umsgpack  # noqa: F401  (parity with RNS internals)
+    handle = params["handle"]
+    app_name = params["app_name"]
+    aspects = params.get("aspects", []) or []
+    plant = str(params.get("plant", "mismatch")).lower()
+    if plant not in ("mismatch", "match", "none"):
+        raise ValueError(f"plant must be 'mismatch', 'match' or 'none' (got {plant!r})")
+    app_data_hex = params.get("app_data") or ""
+    app_data = bytes.fromhex(app_data_hex) if app_data_hex else None
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    real_pub = identity.get_public_key()
+    dest_hash = destination.hash
+
+    # Build a genuine signed announce and re-parse it as a received packet.
+    announce_packet = destination.announce(app_data=app_data, send=False)
+    announce_packet.pack()
+    rx = RNS.Packet(None, announce_packet.raw)
+    if not rx.unpack():
+        raise RuntimeError("could not unpack crafted announce packet")
+
+    planted = None
+    if plant == "match":
+        planted = real_pub
+    elif plant == "mismatch":
+        planted = RNS.Identity().get_public_key()  # a different, valid key
+
+    Identity = RNS.Identity
+    with Identity.known_destinations_lock:
+        Identity.known_destinations.pop(dest_hash, None)
+        if planted is not None:
+            # known_destinations entry layout: [packet_hash, received, public_key, app_data]
+            Identity.known_destinations[dest_hash] = [rx.get_hash(), time.time(), planted, app_data]
+
+    validated = bool(Identity.validate_announce(rx))
+    # Keep refs alive until validation finished.
+    inst["destinations"].append((identity, destination))
+    return {
+        "validated": validated,
+        "destination_hash": dest_hash.hex(),
+        "public_key": real_pub.hex(),
+        "planted_public_key": planted.hex() if planted is not None else None,
+        "plant": plant,
+    }
+
+
+def cmd_wire_send_forged_link_close(params):
+    """Inject a LINKCLOSE carrying a forged (wrong) link_id over an established
+    link and report whether it tore the link down (Link.py:710-722).
+
+    teardown_packet only closes the link when the decrypted payload equals the
+    link's own link_id. A forged id (forged_id != link_id) must be ignored —
+    the link stays ACTIVE. Passing the real link_id as forged_id is the
+    positive control (the link DOES close). The crafted packet is built and
+    encrypted to the real link, then fed through link.receive on the link's
+    own attached interface (so the unexpected-interface guard, Link.py:975,
+    does not pre-empt the teardown check).
+
+    Returns {torn_down, status_before, status_after, status_name_after,
+    forged_id, real_link_id}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    forged_id = bytes.fromhex(params["forged_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = _find_link_by_id(inst, link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    status_before = getattr(link, "status", None)
+    # LINKCLOSE payloads ARE encrypted to the link (Packet.py:215-216), unlike
+    # KEEPALIVE; build + pack so link.decrypt(packet.data) yields forged_id.
+    out_packet = RNS.Packet(link, forged_id, context=RNS.Packet.LINKCLOSE)
+    out_packet.pack()
+    rx = RNS.Packet(None, out_packet.raw)
+    if not rx.unpack():
+        raise RuntimeError("could not unpack crafted LINKCLOSE packet")
+    rx.receiving_interface = link.attached_interface
+    link.receive(rx)
+
+    status_after = getattr(link, "status", None)
+    return {
+        "torn_down": status_after == RNS.Link.CLOSED,
+        "status_before": int(status_before) if status_before is not None else None,
+        "status_after": int(status_after) if status_after is not None else None,
+        "status_name_after": _LINK_STATUS_NAMES.get(status_after),
+        "forged_id": forged_id.hex(),
+        "real_link_id": link.link_id.hex(),
+    }
+
+
+def cmd_wire_link_identify_pending(params):
+    """Call RNS.Link.identify on a PENDING (pre-ACTIVE) link and assert it is a
+    no-op that does not crash (Link.py:459-475/:468).
+
+    identify only acts when self.initiator and self.status == Link.ACTIVE; on
+    a PENDING link it must silently do nothing (no LINKIDENTIFY packet emitted,
+    remote_identity unchanged). This builds an initiator Link to the recalled
+    destination, forces it to PENDING deterministically (so timing can't race
+    it to ACTIVE), wraps Packet.send to detect any LINKIDENTIFY emission, and
+    calls identify. The link is torn down afterward.
+
+    Returns {crashed, identify_packet_sent, status, status_name, initiator}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    destination_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+    private_key = bytes.fromhex(params["private_key"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(destination_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {destination_hash.hex()}; "
+            f"ensure an announce for this destination was received first."
+        )
+    out_destination = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+    ident = RNS.Identity.from_bytes(private_key)
+    if ident is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+
+    link = RNS.Link(out_destination)
+    # Force PENDING so identify's ACTIVE-only guard is deterministically hit,
+    # regardless of any concurrent handshake progress.
+    link.status = RNS.Link.PENDING
+
+    captured = []
+    orig_send = RNS.Packet.send
+
+    def capturing_send(pkt_self, _orig=orig_send):
+        try:
+            if (getattr(pkt_self, "context", None) == RNS.Packet.LINKIDENTIFY
+                    and getattr(pkt_self, "destination", None) is link):
+                captured.append(True)
+        except Exception:
+            pass
+        return _orig(pkt_self)
+
+    crashed = False
+    RNS.Packet.send = capturing_send
+    try:
+        link.identify(ident)
+    except Exception:
+        crashed = True
+    finally:
+        RNS.Packet.send = orig_send
+
+    status_after = getattr(link, "status", None)
+    try:
+        link.teardown()
+    except Exception:
+        pass
+
+    return {
+        "crashed": crashed,
+        "identify_packet_sent": bool(captured),
+        "status": int(status_after) if status_after is not None else None,
+        "status_name": _LINK_STATUS_NAMES.get(status_after),
+        "initiator": bool(getattr(link, "initiator", False)),
+    }
+
+
 WIRE_COMMANDS = {
     "wire_start_tcp_server": cmd_wire_start_tcp_server,
     "wire_start_tcp_client": cmd_wire_start_tcp_client,
     "wire_start_local_client": cmd_wire_start_local_client,
+    "wire_start_pipe_peer": cmd_wire_start_pipe_peer,
+    "wire_start_pipe_tcp_relay": cmd_wire_start_pipe_tcp_relay,
     "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
@@ -1579,15 +4492,73 @@ WIRE_COMMANDS = {
     "wire_read_path_random_hash": cmd_wire_read_path_random_hash,
     "wire_identity_recall": cmd_wire_identity_recall,
     "wire_register_request_handler": cmd_wire_register_request_handler,
+    "wire_deregister_request_handler": cmd_wire_deregister_request_handler,
     "wire_link_identify": cmd_wire_link_identify,
+    "wire_link_identify_pending": cmd_wire_link_identify_pending,
     "wire_link_request": cmd_wire_link_request,
+    "wire_link_request_large": cmd_wire_link_request_large,
     "wire_get_request_log": cmd_wire_get_request_log,
     "wire_listen": cmd_wire_listen,
     "wire_link_open": cmd_wire_link_open,
     "wire_link_send": cmd_wire_link_send,
     "wire_link_poll": cmd_wire_link_poll,
     "wire_resource_send": cmd_wire_resource_send,
+    "wire_resource_send_bomb": cmd_wire_resource_send_bomb,
+    "wire_resource_cancel": cmd_wire_resource_cancel,
     "wire_resource_create": cmd_wire_resource_create,
     "wire_resource_poll": cmd_wire_resource_poll,
+    "wire_resource_receiver_status": cmd_wire_resource_receiver_status,
+    # Link lifecycle observation
+    "wire_link_status": cmd_wire_link_status,
+    "wire_link_set_watchdog": cmd_wire_link_set_watchdog,
+    "wire_link_await_status": cmd_wire_link_await_status,
+    "wire_link_teardown": cmd_wire_link_teardown,
+    "wire_listener_link_status": cmd_wire_listener_link_status,
+    "wire_set_proof_strategy": cmd_wire_set_proof_strategy,
+    # Link DATA proof strategy / keepalive byte values
+    "wire_send_link_data": cmd_wire_send_link_data,
+    "wire_send_keepalive_probe": cmd_wire_send_keepalive_probe,
+    "wire_last_keepalive": cmd_wire_last_keepalive,
+    # Transport posture / link MTU / single-packet PacketReceipt observation
+    "wire_transport_enabled": cmd_wire_transport_enabled,
+    "wire_link_mtu": cmd_wire_link_mtu,
+    "wire_send_packet": cmd_wire_send_packet,
+    "wire_packet_receipt_status": cmd_wire_packet_receipt_status,
+    # Channel out-of-order / duplicate injection + window observation
+    "wire_channel_inject": cmd_wire_channel_inject,
+    "wire_channel_received": cmd_wire_channel_received,
+    "wire_channel_window": cmd_wire_channel_window,
+    "wire_channel_send": cmd_wire_channel_send,
+    # Buffer (RawChannelReader/Writer) streaming
+    "wire_buffer_stream": cmd_wire_buffer_stream,
+    "wire_buffer_received": cmd_wire_buffer_received,
+    # GROUP destination symmetric crypto
+    "wire_group_create": cmd_wire_group_create,
+    "wire_group_encrypt": cmd_wire_group_encrypt,
+    "wire_group_decrypt": cmd_wire_group_decrypt,
+    # Identity ratchet crypto (enforce_ratchets rejection)
+    "wire_identity_keypair": cmd_wire_identity_keypair,
+    "wire_ratchet_keypair": cmd_wire_ratchet_keypair,
+    "wire_identity_encrypt": cmd_wire_identity_encrypt,
+    "wire_identity_decrypt": cmd_wire_identity_decrypt,
+    # Destination-level ratchets (latest_ratchet_id / rotation-interval /
+    # retained-cap / file persistence)
+    "wire_read_ratchets": cmd_wire_read_ratchets,
+    "wire_set_ratchet_interval": cmd_wire_set_ratchet_interval,
+    "wire_rotate_ratchet": cmd_wire_rotate_ratchet,
+    "wire_set_retained_ratchets": cmd_wire_set_retained_ratchets,
+    "wire_ratchet_file_roundtrip": cmd_wire_ratchet_file_roundtrip,
+    "wire_destination_latest_ratchet_id": cmd_wire_destination_latest_ratchet_id,
+    # Single-packet PROOF emission (implicit vs explicit)
+    "wire_send_packet_with_proof_request": cmd_wire_send_packet_with_proof_request,
+    # PLAIN destination no-op encrypt/decrypt
+    "wire_plain_encrypt": cmd_wire_plain_encrypt,
+    "wire_plain_decrypt": cmd_wire_plain_decrypt,
+    # Known-public-key-mismatch rejection
+    "wire_known_key_validate": cmd_wire_known_key_validate,
+    # Deferred Link edges (forged LINKCLOSE / identify on PENDING link)
+    "wire_send_forged_link_close": cmd_wire_send_forged_link_close,
+    # IFAC issue-29 golden vector
+    "wire_ifac_compute": cmd_wire_ifac_compute,
     "wire_stop": cmd_wire_stop,
 }

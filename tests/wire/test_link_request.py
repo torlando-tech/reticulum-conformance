@@ -14,12 +14,15 @@ Honest test: peer A registers a fixed-response handler on a destination,
 peer B opens a link and calls link.request(path, data). Real RNS routes
 the request to A's handler, runs it, sends the response back over the
 link, fires B's response_callback. We assert:
-  - the response RNS delivered matches what A's handler returned,
+  - the response RNS delivered matches what A's handler returned, and
   - the handler was invoked exactly once with the exact request bytes B
     sent (this catches an impl that loses/duplicates request data on the
-    wire), and
-  - the handler observed B's identity (impls that drop remote_identity
-    break authentication-gated request handlers).
+    wire).
+
+The identity-gated path — where the handler observes the requester's
+Identity after Link.identify — is NOT exercised here: this test leaves the
+requester un-identified, so remote_identity is None by RNS default. That
+path is covered separately in test_link_identify.py.
 """
 
 import secrets
@@ -38,13 +41,24 @@ _LINK_TIMEOUT_MS = 15000
 _PATH_POLL_TIMEOUT_MS = 10000
 _REQUEST_TIMEOUT_MS = 15000
 
+# A fixed small link MTU (>= Reticulum.MTU floor of 500) keeps the negotiated
+# link MDU small (~431 B) so a modest request/response crosses it and RNS must
+# deliver it as a Resource rather than a single RESPONSE packet — the only way
+# to drive the >MDU resource-backed request/response path on a loopback link
+# (a direct TCP link negotiates a ~256 KiB MDU that no realistic payload beats).
+_FIXED_MTU = 500
+_LARGE_RESPONSE_LEN = 50000   # ~50 KB handler response (>> MDU -> response Resource)
+_LARGE_REQUEST_LEN = 2000     # ~2 KB request data (> MDU -> request Resource)
+_LARGE_TIMEOUT_MS = 45000
+
 
 @conformance_case(
     commands=[
-        "start_tcp_server", "start_tcp_client", "listen", "link_open",
-        "register_request_handler", "link_request", "get_request_log",
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "link_request",
+        "get_request_log",
     ],
-    verifies="RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data + the requester's Identity",
+    verifies="RNS Link request/response RPC: a Destination.register_request_handler-registered generator fires when the linked client calls Link.request(path, data); the handler's return bytes are delivered back via response_callback, and the handler observes the exact request data the client sent",
 )
 def test_link_request_round_trip(wire_peers):
     server, client = wire_peers
@@ -98,3 +112,52 @@ def test_link_request_round_trip(wire_peers):
     # identified path here; ALLOW_LIST request handlers (LXMF lxmd's
     # SYNC_REQUEST_PATH, etc.) require an additional link.identify call
     # which belongs in a dedicated test that adds the identify bridge cmd.
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "register_request_handler", "link_request_large",
+        "get_request_log",
+    ],
+    verifies="RequestReceipt over the >MDU resource path (Link.py:496-517/:898-901/:939-952): on a link pinned to a fixed 500-byte MTU (small MDU), a ~2 KB request and a ~50 KB handler response both exceed the link MDU, so RNS carries each as a Resource. The request data the handler observes is byte-exact, the handler-returned response round-trips byte-exact back to the requester, and the RequestReceipt reaches READY only once the response Resource fully transfers.",
+)
+def test_link_request_large_response_round_trips_as_resource(wire_link_setup):
+    server, client, dest_hash, link_id = wire_link_setup(
+        _APP, _ASPECTS, fixed_mtu=_FIXED_MTU,
+    )
+
+    # ~50 KB random response: incompressible and far above the ~431 B link MDU,
+    # so handle_request delivers it as a response Resource (Link.py:901), not a
+    # single RESPONSE packet.
+    response_payload = secrets.token_bytes(_LARGE_RESPONSE_LEN)
+    server.register_request_handler(dest_hash, _PATH, response_payload)
+
+    # ~2 KB request data also exceeds the MDU, so the request itself is sent as
+    # a Resource (Link.py:514-527) — exercising both >MDU directions.
+    request_data = secrets.token_bytes(_LARGE_REQUEST_LEN)
+    result = client.link_request_large(
+        link_id, _PATH, data=request_data, timeout_ms=_LARGE_TIMEOUT_MS,
+    )
+    assert result["status"] == "ready", (
+        f"a >MDU request/response did not reach RequestReceipt READY: "
+        f"status={result['status']!r}. The RequestReceipt only goes READY once "
+        f"the response Resource fully transfers (Link.py:939-952)."
+    )
+    assert bytes.fromhex(result["response"]) == response_payload, (
+        f"the ~50 KB resource-backed response did not round-trip byte-exact: "
+        f"got {len(bytes.fromhex(result['response']))} bytes, expected "
+        f"{len(response_payload)}."
+    )
+
+    # The handler must have observed the exact >MDU request bytes (proves the
+    # request Resource reassembled correctly on the receiver, not just that a
+    # response came back).
+    entries = server.get_request_log(dest_hash, _PATH)
+    assert len(entries) == 1, (
+        f"handler invoked {len(entries)} times, expected exactly 1: {entries!r}"
+    )
+    assert entries[0]["data"] == request_data.hex(), (
+        f"the >MDU request data the handler observed did not match what the "
+        f"client sent — the request Resource did not reassemble byte-exact."
+    )

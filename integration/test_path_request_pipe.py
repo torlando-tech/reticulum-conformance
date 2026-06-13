@@ -80,21 +80,26 @@ class TestPathRequestResponder:
         # A announces, C sends path request.
         # C's interface on B is full — B has the path cached from A's announce
         # and should respond from cache (no DISCOVER_PATHS_FOR needed).
-        s.start(
-            b_mode_a="full", b_mode_c="full",
-            a_action="announce",
-            a_cmd=local_peer_cmd,
-            a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
-            c_action="path_request",
-            c_cmd=local_peer_cmd,
-            c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
-        )
-        yield s
-        s.stop()
         try:
-            os.unlink(hash_file_path)
-        except OSError:
-            pass
+            s.start(
+                b_mode_a="full", b_mode_c="full",
+                a_action="announce",
+                a_cmd=local_peer_cmd,
+                a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
+                c_action="path_request",
+                c_cmd=local_peer_cmd,
+                c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
+            )
+            yield s
+        finally:
+            # build/yield in try/finally so a failed start (or a failing test)
+            # always tears down Node B; otherwise the leaked RNS singleton would
+            # break the next test with "Attempt to reinitialise Reticulum" (N-H5).
+            s.stop()
+            try:
+                os.unlink(hash_file_path)
+            except OSError:
+                pass
 
     def test_sut_responds_to_path_request_from_cache(self, session):
         """SUT (B) responds to path request with cached path."""
@@ -158,21 +163,26 @@ class TestPathRequestRequester:
             # Python-only mode: C is also Python
             c_cmd = local_peer_cmd
 
-        s.start(
-            b_mode_a="full", b_mode_c="full",
-            a_action="announce",
-            a_cmd=local_peer_cmd,
-            a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
-            c_action="path_request",
-            c_cmd=c_cmd,
-            c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
-        )
-        yield s
-        s.stop()
         try:
-            os.unlink(hash_file_path)
-        except OSError:
-            pass
+            s.start(
+                b_mode_a="full", b_mode_c="full",
+                a_action="announce",
+                a_cmd=local_peer_cmd,
+                a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
+                c_action="path_request",
+                c_cmd=c_cmd,
+                c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
+            )
+            yield s
+        finally:
+            # build/yield in try/finally so a failed start (or a failing test)
+            # always tears down Node B; otherwise the leaked RNS singleton would
+            # break the next test with "Attempt to reinitialise Reticulum" (N-H5).
+            s.stop()
+            try:
+                os.unlink(hash_file_path)
+            except OSError:
+                pass
 
     def test_sut_discovers_path_via_request(self, session):
         """SUT (C) requests path and discovers it through relay B."""
@@ -225,21 +235,26 @@ class TestPathRequestBothSUT:
         # C is target when available, else Python
         c_cmd = target_cmd if target_cmd is not None else local_peer_cmd
 
-        s.start(
-            b_mode_a="full", b_mode_c="full",
-            a_action="announce",
-            a_cmd=local_peer_cmd,
-            a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
-            c_action="path_request",
-            c_cmd=c_cmd,
-            c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
-        )
-        yield s
-        s.stop()
         try:
-            os.unlink(hash_file_path)
-        except OSError:
-            pass
+            s.start(
+                b_mode_a="full", b_mode_c="full",
+                a_action="announce",
+                a_cmd=local_peer_cmd,
+                a_env={"PIPE_PEER_HASH_OUTPUT_FILE": hash_file_path},
+                c_action="path_request",
+                c_cmd=c_cmd,
+                c_env={"PIPE_PEER_PATH_REQUEST_DEST_FILE": hash_file_path},
+            )
+            yield s
+        finally:
+            # build/yield in try/finally so a failed start (or a failing test)
+            # always tears down Node B; otherwise the leaked RNS singleton would
+            # break the next test with "Attempt to reinitialise Reticulum" (N-H5).
+            s.stop()
+            try:
+                os.unlink(hash_file_path)
+            except OSError:
+                pass
 
     def test_both_sut_path_request_roundtrip(self, session):
         """B responds, C discovers — full path request roundtrip."""

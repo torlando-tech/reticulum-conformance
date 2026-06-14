@@ -358,6 +358,12 @@ REGISTER_COMMAND(crypto_provider_op, {
         auto pub_bytes = bridge::hex_param(p, "public_key");
         auto message = bridge::hex_param(p, "message");
         auto signature = bridge::hex_param(p, "signature");
+        // Mirror the standalone ed25519_verify command: RNS.Identity.validate is
+        // a total boolean predicate — a malformed signature (Ed25519 = 64 bytes)
+        // or wrong-length public key (32 bytes) verifies False, never raises.
+        if (signature.size() != 64 || pub_bytes.size() != 32) {
+            return bridge::json{{"valid", false}};
+        }
         auto pub = RNS::Cryptography::Ed25519PublicKey::from_public_bytes(to_rns(pub_bytes));
         bool ok = pub->verify(to_rns(signature), to_rns(message));
         return bridge::json{{"valid", ok}};

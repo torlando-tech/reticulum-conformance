@@ -272,6 +272,28 @@ def test_clean_peer_disconnect_closes_destination_closed(wire_peers, wire_pair):
     server, client = wire_peers
     _server_dest, link_id = _bring_up_link(server, client)
 
+    # A peer that broadcasts a graceful link teardown on shutdown (the
+    # reference's Reticulum exit handler) closes the initiator IMMEDIATELY with
+    # DESTINATION_CLOSED, independent of the watchdog. A peer that does NOT
+    # (reticulum-kt clears interfaces without tearing links down — see the
+    # xfail below) leaves the initiator to discover the close only via the
+    # watchdog ACTIVE→STALE→CLOSED/TIMEOUT path. At RNS's default loopback
+    # timings that path takes stale_time (keepalive * STALE_FACTOR == 10s) +
+    # one watchdog poll (~12.9s measured here), right against this test's
+    # budget — and the clock (last_inbound) RESTARTS every time the still-
+    # shutting-down peer answers one more keepalive during the close handshake.
+    # Under xdist CPU contention the watchdog sleeps overshoot / a late
+    # keepalive resets the clock and CLOSED slips past the deadline, leaving the
+    # link ACTIVE (observed as a flaky failure under load on slower runners).
+    # Compress the window on the timeout-only leg so TIMEOUT lands well inside
+    # the budget. The reference leg closes via the teardown packet and never
+    # reaches the watchdog, so it is deliberately left at default timings:
+    # compressing it would risk a STALE/TIMEOUT racing ahead of a load-delayed
+    # teardown and masking the DESTINATION_CLOSED this positive control asserts.
+    peer_closes_via_watchdog = server_impl == "kotlin"
+    if peer_closes_via_watchdog:
+        client.link_set_watchdog(link_id, keepalive_s=1.0, stale_time_s=3.0)
+
     # Graceful peer shutdown: closing the bridge subprocess's stdin runs its
     # Reticulum exit handler, which sends a link teardown packet before the
     # TCP socket drops — so the initiator learns the destination closed
@@ -281,7 +303,10 @@ def test_clean_peer_disconnect_closes_destination_closed(wire_peers, wire_pair):
     server.bridge.close()
     server.handle = None  # keep the fixture finalizer from poking a dead proc
 
-    result = client.link_await_status(link_id, "CLOSED", timeout_ms=15000)
+    # 30s budget (vs the compressed ~3s STALE window / ~13s default path) gives
+    # generous slack on a contended runner. link_await_status returns as soon as
+    # CLOSED is reached, so the wider budget never slows the passing case.
+    result = client.link_await_status(link_id, "CLOSED", timeout_ms=30000)
     assert result["reached"] and result["status_name"] == "CLOSED", (
         f"initiator link did not close after the peer shut down cleanly: "
         f"{result!r}"

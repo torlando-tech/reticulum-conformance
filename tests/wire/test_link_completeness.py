@@ -58,6 +58,13 @@ _KEEPALIVE_MAX = 360     # RNS.Link.KEEPALIVE_MAX
 _KEEPALIVE_MAX_RTT = 1.75  # RNS.Link.KEEPALIVE_MAX_RTT
 _STALE_FACTOR = 2        # RNS.Link.STALE_FACTOR
 
+# keepalive_s / stale_time_s cross the bridge boundary in seconds, but a
+# conformant impl may carry the local watchdog interval at integer-millisecond
+# resolution (reticulum-kt keeps every link timer as a ms long, so its clamp is
+# floor(rtt_ms * scale)/1000 rather than a full-precision seconds float). One
+# millisecond is therefore the comparison quantum for those derived timings.
+_MS = 1e-3
+
 
 def _expected_mdu(mtu):
     """The RNS 1.3.1 link MDU floor, recomputed independently from spec
@@ -174,30 +181,50 @@ def test_keepalive_interval_is_rtt_clamp(wire_link_setup):
     # Independent derivation of the keepalive clamp from the reported RTT.
     raw = rtt * (_KEEPALIVE_MAX / _KEEPALIVE_MAX_RTT)
     expected = max(min(raw, _KEEPALIVE_MAX), _KEEPALIVE_MIN)
-    assert keepalive == expected, (
+    # keepalive_s is a LOCAL watchdog interval, never carried on the wire: RNS
+    # Link.py never serialises self.keepalive — it only gates send_keepalive and
+    # the stale transition against time.time() (Link.py:792-803). The protocol
+    # invariant is the clamp FORMULA (RTT scaling plus the min/max bounds), not
+    # sub-millisecond float fidelity. A conformant impl may carry the interval at
+    # integer-millisecond resolution (reticulum-kt: floor(rtt_ms*scale)/1000),
+    # which differs from the full-precision float by up to one millisecond. Since
+    # the RTT is a non-deterministic measurement, compare at the millisecond
+    # resolution the bridge actually carries rather than asserting exact float
+    # equality — the latter only passed when the measured RTT happened to yield a
+    # whole-millisecond clamp, so it failed intermittently under CPU contention.
+    assert abs(keepalive - expected) <= _MS, (
         f"keepalive_s ({keepalive!r}) must equal the RNS clamp of the measured "
-        f"RTT ({expected!r} from rtt={rtt!r}); RNS 1.3.1 pins keepalive = "
-        f"max(min(rtt*360/1.75, 360), 5): {snap!r}"
+        f"RTT ({expected!r} from rtt={rtt!r}) to within one millisecond; RNS "
+        f"1.3.1 pins keepalive = max(min(rtt*360/1.75, 360), 5): {snap!r}"
     )
-    assert stale == keepalive * _STALE_FACTOR, (
+    assert abs(stale - keepalive * _STALE_FACTOR) <= _MS, (
         f"stale_time_s ({stale!r}) must be keepalive_s ({keepalive!r}) * "
         f"STALE_FACTOR ({_STALE_FACTOR}): {snap!r}"
     )
 
-    # On loopback the raw scaled RTT is below the 5s floor, so the KEEPALIVE_MIN
-    # clamp MUST have fired — an impl omitting the floor would report `raw`.
-    assert raw < _KEEPALIVE_MIN, (
-        f"loopback RTT was implausibly high (raw scaled keepalive {raw!r} >= "
-        f"floor {_KEEPALIVE_MIN}); cannot demonstrate the floor clamp: {snap!r}"
-    )
-    assert keepalive == _KEEPALIVE_MIN, (
-        f"on a loopback link the keepalive must clamp UP to KEEPALIVE_MIN "
-        f"({_KEEPALIVE_MIN}), got {keepalive!r}: {snap!r}"
-    )
-    assert keepalive > raw, (
-        f"the KEEPALIVE_MIN floor must have RAISED the keepalive above the raw "
-        f"scaled value ({raw!r}); got keepalive={keepalive!r}: {snap!r}"
-    )
+    if raw < _KEEPALIVE_MIN:
+        # Quiet/fast loopback: the raw scaled RTT is below the 5s floor, so the
+        # KEEPALIVE_MIN clamp MUST have fired — an impl omitting the floor would
+        # report `raw`. KEEPALIVE_MIN is a whole number of seconds, so the clamp
+        # is exact on both a float and an ms-resolution impl.
+        assert keepalive == _KEEPALIVE_MIN, (
+            f"on a loopback link with sub-floor RTT the keepalive must clamp UP "
+            f"to KEEPALIVE_MIN ({_KEEPALIVE_MIN}), got {keepalive!r}: {snap!r}"
+        )
+        assert keepalive > raw, (
+            f"the KEEPALIVE_MIN floor must have RAISED the keepalive above the "
+            f"raw scaled value ({raw!r}); got keepalive={keepalive!r}: {snap!r}"
+        )
+    else:
+        # Slower/contended runner: the measured RTT scaled above the 5s floor, so
+        # the floor did not need to fire. The clamp equality above already pins
+        # keepalive to the scaled value; assert it tracked the RTT (within the
+        # min/max bounds) rather than returning a hardcoded constant.
+        assert _KEEPALIVE_MIN <= keepalive <= _KEEPALIVE_MAX, (
+            f"keepalive ({keepalive!r}) must be the RTT-scaled clamp within "
+            f"[KEEPALIVE_MIN({_KEEPALIVE_MIN}), KEEPALIVE_MAX({_KEEPALIVE_MAX})] "
+            f"when raw={raw!r} exceeds the floor: {snap!r}"
+        )
 
 
 @conformance_case(

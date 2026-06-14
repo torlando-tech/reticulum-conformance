@@ -1714,12 +1714,22 @@ def _get_full_rns():
             return existing
 
         # Genuine first load (or recovering from a partially-imported RNS):
-        # drop the standalone crypto shims (RNS_HMAC, ...) and any half-built
-        # RNS.* / LXMF.* so `import RNS` runs against a clean slate. Safe here
-        # because no Reticulum thread can exist before the first full import.
+        # drop the standalone crypto shims (RNS_HMAC, ...) and the fake
+        # RNS / RNS.Cryptography stub so `import RNS` runs against a clean
+        # slate. Safe here because no Reticulum thread can exist before the
+        # first full import.
+        #
+        # Deliberately does NOT touch LXMF.*. Wiping a (possibly mid-import)
+        # LXMF out of sys.modules races a concurrent `from LXMF import
+        # LXStamper` on a handler/callback thread -> the exact "partially
+        # initialized module" / "No module named 'LXMF'" import race this
+        # clear was introduced to avoid for RNS. LXMF is instead pre-warmed
+        # once in main() (before READY, before any thread), so every later
+        # import just adopts the resident module. LXMF has no bearing on the
+        # crypto-shim swap above, so leaving it resident is always correct.
         for mod in [
             k for k in list(sys.modules.keys())
-            if k.startswith('RNS') or k.startswith('LXMF')
+            if k.startswith('RNS')
         ]:
             sys.modules.pop(mod, None)
 
@@ -4074,6 +4084,23 @@ def main():
     # before any thread) via the clean-slate path.
     try:
         _get_full_rns()
+    except Exception:
+        pass
+
+    # Pre-warm the FULL real LXMF once, single-threaded, before READY — same
+    # rationale as the RNS pre-warm above. The interface-discovery commands
+    # (cmd_discovery_stamp / cmd_discovery_build_announce_appdata / ...) lazily
+    # do `from LXMF import LXStamper` while RNS background threads run. LXMF's
+    # package __init__ is a HEAVY transitive import (LXMessage, LXMRouter,
+    # LXMF.LXStamper, and a wide slice of RNS). Importing it for the first time
+    # on a handler thread under parallel CPU contention races itself / the RNS
+    # submodule loader -> "partially initialized module 'LXMF'" / "No module
+    # named 'LXMF'" (the LXMF twin of the RNS.Channel import race). Loading it
+    # here — after real RNS is resident, before any thread exists — makes every
+    # later `from LXMF import ...` a pure sys.modules lookup. Best-effort: a
+    # failure must not abort the bridge; the command path imports on demand.
+    try:
+        import LXMF.LXStamper  # noqa: F401
     except Exception:
         pass
 

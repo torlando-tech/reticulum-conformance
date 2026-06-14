@@ -1,0 +1,80 @@
+name: Conformance Honesty
+
+# Enforces the "honesty apparatus" the suite claims as its core guarantee —
+# but which, before this workflow, ran nowhere in CI and so was decorative and
+# defeatable (N-H6). Three gates:
+#
+#   1. Every collected test carries an @conformance_case decorator
+#      (tools/check_conformance_decorated.py) — the drift guard.
+#   2. No bridge command hand-rolls protocol logic, and no test depends on a
+#      HANDROLLED/REVIEW/UNKNOWN command (tools/audit_bridge_delegation.py).
+#   3. TESTS.md (the machine-readable PUBLIC catalog of what each test claims
+#      to verify) is regenerated and must match what is committed — a stale
+#      TESTS.md is a false public claim.
+#
+# Pure-Python: no Kotlin/Swift build, no bridge subprocess. RNS/LXMF are pinned
+# to the audited ground-truth releases (1.3.1 / 0.9.9) from PyPI so collection
+# resolves the same implementation the suite was audited against.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  honesty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (RNS/LXMF pinned to audited ground truth)
+        run: pip install pytest "rns==1.3.1" "lxmf==0.9.9" msgpack u-msgpack-python
+
+      - name: Assert RNS/LXMF versions match audited ground truth
+        # The suite resolves RNS/LXMF via _rns_paths (no env var -> the
+        # pip-installed site-packages, exactly as local ground truth). Verify
+        # those are the audited releases before trusting any honesty verdict.
+        run: |
+          python3 - <<'PY'
+          import sys
+          import RNS, LXMF
+          print(f"RNS {RNS.__version__}, LXMF {LXMF.__version__}")
+          errs = []
+          if RNS.__version__ != "1.3.1":
+              errs.append(f"RNS {RNS.__version__} != 1.3.1")
+          if LXMF.__version__ != "0.9.9":
+              errs.append(f"LXMF {LXMF.__version__} != 0.9.9")
+          if errs:
+              print("::error::not running against audited ground truth: " + "; ".join(errs))
+              sys.exit(1)
+          print("OK: RNS 1.3.1 / LXMF 0.9.9")
+          PY
+
+      - name: Drift guard — every test must carry @conformance_case
+        run: python3 tools/check_conformance_decorated.py
+
+      - name: Bridge delegation audit — no handrolled/dishonest commands
+        # Gate on the audit script's own exit code (bash -eo pipefail is the
+        # GitHub Actions default, so a non-zero exit fails the step). The
+        # classification POLICY — which commands count as a violation, and how
+        # to treat any framing utilities the bridge exposes (e.g.
+        # hdlc_deframe/kiss_deframe) — lives in audit_bridge_delegation.py and
+        # is owned there, not encoded in this workflow. CI simply enforces the
+        # verdict the audit reports.
+        run: python3 tools/audit_bridge_delegation.py
+
+      - name: TESTS.md is up to date with the decorators
+        # Regenerate the public catalog and fail if it differs from what is
+        # committed. A drifted TESTS.md is a false public claim about what the
+        # suite verifies.
+        run: |
+          python3 tools/generate_tests_md.py
+          git diff --exit-code TESTS.md

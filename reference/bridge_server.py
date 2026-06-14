@@ -17,43 +17,51 @@ import sys
 import os
 import json
 import traceback
-import multiprocessing
 
-# Patch multiprocessing.set_start_method to be no-op after first call
-# This is needed because LXMF.LXStamper calls it without force=True,
-# which fails on Python 3.14+ if context is already set
-_original_set_start_method = multiprocessing.set_start_method
-_start_method_set = False
+# Add RNS Cryptography to path directly (bypass RNS __init__.py).
+#
+# Resolve the upstream RNS location through the shared `_rns_paths` helper
+# (repo root) instead of a hardcoded `../../../Reticulum` default. This
+# guarantees the GENUINE crypto primitives loaded standalone below come from
+# the SAME RNS that the LIVE handlers import via `_get_full_rns()` — closing
+# the version-skew trap where, run bare (no PYTHON_RNS_PATH), the two halves of
+# the bridge would load different RNS versions (e.g. an old 1.1.3 sibling vs a
+# pip-installed 1.3.1). `_rns_paths.resolve_rns_path()` still honours
+# PYTHON_RNS_PATH first, then a sibling checkout, then the importable install.
+# (N-M9)
+_BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_BRIDGE_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-def _patched_set_start_method(method, force=False):
-    global _start_method_set
-    if _start_method_set and not force:
-        return  # Silently ignore if already set
-    _original_set_start_method(method, force=True)
-    _start_method_set = True
+from _rns_paths import resolve_rns_path, resolve_package_path
 
-multiprocessing.set_start_method = _patched_set_start_method
-multiprocessing.set_start_method("fork")  # Pre-set to fork
-
-# Add RNS Cryptography to path directly (bypass RNS __init__.py)
-rns_path = os.environ.get('PYTHON_RNS_PATH', '../../../Reticulum')
-# Convert to absolute path
-rns_path = os.path.abspath(rns_path)
+rns_path = resolve_rns_path()
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'Cryptography'))
 sys.path.insert(0, rns_path)
 
-# Add LXMF to path
-lxmf_path = os.path.abspath(os.environ.get('PYTHON_LXMF_PATH', '../../../LXMF'))
-sys.path.insert(0, lxmf_path)
+# Wire the LXMF source path onto sys.path the same way as RNS. The
+# discovery-stamp commands delegate to the REAL LXMF.LXStamper (RNS interface
+# discovery's proof-of-work oracle — Discovery.py:172,235-237), so the bridge
+# needs LXMF importable. In CI LXMF is a checkout reached via PYTHON_LXMF_PATH
+# (NOT pip-installed), and nothing else added it to sys.path — so every
+# discovery-stamp test failed DETERMINISTICALLY with "No module named 'LXMF'"
+# (it only passed locally because LXMF happened to be pip-installed). With the
+# path wired here at module load, the main() pre-warm of LXMF.LXStamper resolves
+# and the lazy `from LXMF import LXStamper` is race-free. resolve_package_path
+# falls back to the importable install when PYTHON_LXMF_PATH is unset.
+try:
+    _lxmf_path = resolve_package_path("LXMF", "PYTHON_LXMF_PATH")
+    if _lxmf_path not in sys.path:
+        sys.path.insert(0, _lxmf_path)
+except Exception:
+    pass  # LXMF is only needed by the discovery-stamp commands — never abort startup
 
 import hashlib
 
 # Import umsgpack from RNS vendor
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'vendor'))
 import umsgpack
-
-# Import LXMF stamper (used for stamp generation/validation)
-import LXMF.LXStamper as LXStamper
 
 # Import cryptography modules directly from the Cryptography directory
 # This bypasses RNS/__init__.py which would load all interfaces
@@ -145,16 +153,32 @@ sys.modules['RNS_Token'] = token_module
 Token = token_module
 
 # Pre-register a fake RNS.Cryptography.Hashes module to satisfy eddsa.py import
-# This prevents triggering the full RNS import chain
-fake_rns = type(sys)('RNS')
-fake_crypto = type(sys)('RNS.Cryptography')
-fake_hashes = type(sys)('RNS.Cryptography.Hashes')
-fake_hashes.sha512 = lambda data: hashlib.sha512(data).digest()
-sys.modules['RNS'] = fake_rns
-sys.modules['RNS.Cryptography'] = fake_crypto
-sys.modules['RNS.Cryptography.Hashes'] = fake_hashes
-fake_rns.Cryptography = fake_crypto
-fake_crypto.Hashes = fake_hashes
+# This prevents triggering the full RNS import chain for the crypto-only path.
+#
+# CONDITIONAL: only install the stub when a real, fully-initialised RNS is NOT
+# already resident. This file is executed under TWO module identities — as
+# `__main__` (run as a script) and as `bridge_server` (`from bridge_server
+# import ...` inside wire_tcp.py). The SECOND execution would otherwise clobber
+# sys.modules['RNS'] — which the first identity's startup pre-warm already
+# populated with the genuine full RNS — back down to this stub. That forces the
+# second identity's `_get_full_rns()` to wipe + reimport the LIVE RNS module
+# tree (RNS.Channel / RNS.Buffer), which races RNS's background callback threads
+# (their lazy `from RNS.Channel import ...`) on CPython's import lock ->
+# `_DeadlockError` / "partially initialized module 'RNS.Channel'". Leaving the
+# real RNS in place lets `_get_full_rns()` adopt it instead of re-importing.
+# (The real RNS exposes the genuine RNS.Cryptography.Hashes.sha512, so the
+# crypto-only path is satisfied either way.)
+_existing_rns = sys.modules.get('RNS')
+if _existing_rns is None or getattr(_existing_rns, 'Channel', None) is None:
+    fake_rns = type(sys)('RNS')
+    fake_crypto = type(sys)('RNS.Cryptography')
+    fake_hashes = type(sys)('RNS.Cryptography.Hashes')
+    fake_hashes.sha512 = lambda data: hashlib.sha512(data).digest()
+    sys.modules['RNS'] = fake_rns
+    sys.modules['RNS.Cryptography'] = fake_crypto
+    sys.modules['RNS.Cryptography.Hashes'] = fake_hashes
+    fake_rns.Cryptography = fake_crypto
+    fake_crypto.Hashes = fake_hashes
 
 
 
@@ -166,6 +190,20 @@ def hex_to_bytes(hex_str):
 def bytes_to_hex(data):
     """Convert bytes to hex string."""
     return data.hex()
+
+
+def _maybe_num(value):
+    """Pass a numeric RNS attribute straight through for JSON, preserving None.
+
+    RNS stores the ingress-control knobs as plain ints/floats; this only
+    normalises the absence case (None) and avoids leaking any non-number type
+    into the JSON response. No value is computed here — the number is read
+    verbatim off the live RNS interface object."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return value if isinstance(value, (int, float)) else float(value)
 
 
 # Command handlers
@@ -347,32 +385,60 @@ def cmd_aes_decrypt(params):
     }
 
 
+def cmd_aes_256_cbc_encrypt(params):
+    """Raw AES-256-CBC block-cipher encryption — NO padding.
+
+    Delegates to real RNS.Cryptography.AES.AES_256_CBC.encrypt, routing
+    through RNS's own provider dispatch (PYCA or the internal pure-Python
+    AES, whichever the install selected). This is the bare block cipher: the
+    plaintext MUST already be a multiple of the 16-byte AES block size, and
+    the ciphertext is exactly the same length as the plaintext (no PKCS7
+    growth). Distinct from `aes_encrypt`, which is the PKCS7+CBC composite
+    that RNS's Token layer uses and which grows the input to the next block
+    boundary. RNS does no padding in AES.py itself (AES.py:77-95); padding
+    lives only in Token.py. (N-M2)
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_256_CBC as _RNS_AES_256_CBC
+    plaintext = hex_to_bytes(params['plaintext'])
+    key = hex_to_bytes(params['key'])
+    iv = hex_to_bytes(params['iv'])
+    return {
+        'ciphertext': bytes_to_hex(_RNS_AES_256_CBC.encrypt(plaintext, key, iv))
+    }
+
+
+def cmd_aes_256_cbc_decrypt(params):
+    """Raw AES-256-CBC block-cipher decryption — NO unpadding.
+
+    Delegates to real RNS.Cryptography.AES.AES_256_CBC.decrypt. Returns the
+    raw decrypted blocks verbatim; it does NOT strip PKCS7 padding (that is
+    `aes_decrypt`'s job). Round-trips `aes_256_cbc_encrypt` byte-for-byte.
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_256_CBC as _RNS_AES_256_CBC
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    key = hex_to_bytes(params['key'])
+    iv = hex_to_bytes(params['iv'])
+    return {
+        'plaintext': bytes_to_hex(_RNS_AES_256_CBC.decrypt(ciphertext, key, iv))
+    }
+
+
 def cmd_token_encrypt(params):
-    """Encrypt using Token (modified Fernet)."""
+    """Encrypt plaintext into an RNS Token (Fernet-like: AES-256-CBC + HMAC).
+
+    Delegates to real RNS Token.encrypt. RNS generates the AES IV internally
+    and fresh per call, so this is non-deterministic by construction — two
+    calls with identical key+plaintext return different tokens. Tests must
+    round-trip through token_decrypt, not byte-compare. (The old IV-injection
+    branch hand-assembled iv+ciphertext+hmac to fake a deterministic token;
+    there is no honest way to inject the IV into real Token.encrypt.)
+    """
     key = hex_to_bytes(params['key'])
     plaintext = hex_to_bytes(params['plaintext'])
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
     token_obj = Token.Token(key)
-
-    if iv:
-        # For reproducibility, we need to manually construct the token
-        # This matches the encrypt() method but with fixed IV
-        mode = token_obj.mode
-        ciphertext = mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    return {
-        'token': bytes_to_hex(token_bytes)
-    }
+    return {'token': bytes_to_hex(token_obj.encrypt(plaintext))}
 
 
 def cmd_token_decrypt(params):
@@ -401,2424 +467,915 @@ def cmd_token_verify_hmac(params):
     }
 
 
+def cmd_token_generate_key(params):
+    """Generate a Token key for a chosen AES mode via real RNS.
+
+    Delegates to RNS.Cryptography.Token.Token.generate_key(mode), mapping the
+    `mode` string to the genuine RNS AES class object that generate_key
+    dispatches on (Token.py:53-56). This pins the documented key lengths —
+    AES_128_CBC -> 32 bytes (a 16-byte signing key + 16-byte encryption key),
+    AES_256_CBC (the default) -> 64 bytes (32+32) — and the TypeError RNS
+    raises for any unrecognised mode. Previously generate_key was reachable
+    only implicitly through GROUP key creation in the default mode, so neither
+    the 128-bit length nor the invalid-mode path was observable. (N-Mcrypto)
+    """
+    RNS = _get_full_rns()
+    from RNS.Cryptography.AES import AES_128_CBC as _AES128, AES_256_CBC as _AES256
+    from RNS.Cryptography.Token import Token as _Token
+
+    mode_name = params.get('mode', 'AES_256_CBC')
+    # Map the request string onto the REAL RNS AES class generate_key compares
+    # against. An unknown string is forwarded verbatim so RNS itself raises the
+    # TypeError (we do not synthesise the error ourselves).
+    mode_map = {'AES_128_CBC': _AES128, 'AES_256_CBC': _AES256}
+    mode_arg = mode_map.get(mode_name, mode_name)
+    key = _Token.generate_key(mode_arg)
+    return {'key': bytes_to_hex(key)}
+
+
+def cmd_crypto_provider_op(params):
+    """Run one primitive through a CHOSEN RNS crypto provider (internal|pyca).
+
+    RNS selects its crypto backend once at import time (Provider.py): the
+    pure-Python primitives (PROVIDER_INTERNAL) or the OpenSSL/PyCA bindings
+    (PROVIDER_PYCA). Every other bridge command exercises only whichever the
+    install happens to pick, so the two providers are never compared. This
+    command drives the SAME input through a NAMED provider's REAL RNS
+    implementation so a test can assert byte-identical output across both
+    backends (the conformance requirement that the two providers are drop-in
+    equivalent on the wire).
+
+    No protocol bytes are assembled here — every value is produced by a genuine
+    RNS class:
+      * X25519/Ed25519 dispatch on distinct classes — internal lives in
+        RNS.Cryptography.X25519/.Ed25519, PyCA in RNS.Cryptography.Proxies — so
+        we import the chosen pair directly.
+      * AES_256_CBC dispatches INSIDE RNS.Cryptography.AES on Provider.PROVIDER;
+        we temporarily set that flag and reload the module so RNS's own dispatch
+        selects the requested backend, then restore it. (N-Mcrypto)
+    """
+    RNS = _get_full_rns()
+    import importlib
+    import RNS.Cryptography.Provider as _cp
+
+    op = params['op']
+    provider = params['provider']
+    if provider not in ('internal', 'pyca'):
+        raise ValueError(f"Unknown provider: {provider}")
+
+    if op == 'x25519_exchange':
+        if provider == 'internal':
+            from RNS.Cryptography.X25519 import X25519PrivateKey as Priv, X25519PublicKey as Pub
+        else:
+            from RNS.Cryptography.Proxies import (
+                X25519PrivateKeyProxy as Priv, X25519PublicKeyProxy as Pub)
+        priv = Priv.from_private_bytes(hex_to_bytes(params['private_key']))
+        peer = Pub.from_public_bytes(hex_to_bytes(params['peer_public_key']))
+        return {'result': bytes_to_hex(priv.exchange(peer))}
+
+    if op == 'ed25519_sign':
+        if provider == 'internal':
+            from RNS.Cryptography.Ed25519 import Ed25519PrivateKey as Priv
+        else:
+            from RNS.Cryptography.Proxies import Ed25519PrivateKeyProxy as Priv
+        priv = Priv.from_private_bytes(hex_to_bytes(params['private_key']))
+        return {'result': bytes_to_hex(priv.sign(hex_to_bytes(params['message'])))}
+
+    if op == 'ed25519_verify':
+        if provider == 'internal':
+            from RNS.Cryptography.Ed25519 import Ed25519PublicKey as Pub
+        else:
+            from RNS.Cryptography.Proxies import Ed25519PublicKeyProxy as Pub
+        pub = Pub.from_public_bytes(hex_to_bytes(params['public_key']))
+        try:
+            pub.verify(hex_to_bytes(params['signature']), hex_to_bytes(params['message']))
+            return {'valid': True}
+        except Exception:
+            return {'valid': False}
+
+    if op == 'aes_256_cbc_encrypt':
+        import RNS.Cryptography.AES as _AESmod
+        target = _cp.PROVIDER_INTERNAL if provider == 'internal' else _cp.PROVIDER_PYCA
+        saved = _cp.PROVIDER
+        try:
+            _cp.PROVIDER = target
+            importlib.reload(_AESmod)
+            ct = _AESmod.AES_256_CBC.encrypt(
+                hex_to_bytes(params['plaintext']),
+                hex_to_bytes(params['key']),
+                hex_to_bytes(params['iv']))
+        finally:
+            _cp.PROVIDER = saved
+            importlib.reload(_AESmod)
+        return {'result': bytes_to_hex(ct)}
+
+    raise ValueError(f"Unknown op: {op}")
+
+
 def cmd_identity_from_private_key(params):
-    """Create identity from 64-byte private key (X25519 + Ed25519)."""
+    """Derive public key + hash from a 64-byte Identity private key.
+
+    Delegates to real RNS.Identity.from_bytes — no hand-rolled key split or
+    hash composition. RNS.Identity splits the 64-byte key into its X25519(32)
+    + Ed25519(32) halves, derives both public keys, and computes
+    hash = truncated_hash(public_key) itself.
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
-
-    # Split private key: X25519 (32) + Ed25519 (32)
-    x25519_prv_bytes = private_key[:32]
-    ed25519_prv_bytes = private_key[32:]
-
-    # Derive public keys
-    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
-    x25519_pub = x25519_prv.public_key()
-    x25519_pub_bytes = x25519_pub.public_bytes()
-
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_sk = SigningKey(ed25519_prv_bytes)
-    ed25519_pub_bytes = ed25519_sk.vk_s
-
-    # Full public key
-    public_key = x25519_pub_bytes + ed25519_pub_bytes
-
-    # Identity hash = truncated_hash(public_key)
-    identity_hash = hashlib.sha256(public_key).digest()[:16]
-
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
     return {
-        'public_key': bytes_to_hex(public_key),
-        'hash': bytes_to_hex(identity_hash),
-        'hexhash': identity_hash.hex()
+        'public_key': bytes_to_hex(identity.get_public_key()),
+        'hash': bytes_to_hex(identity.hash),
+        'hexhash': identity.hexhash,
     }
 
 
 def cmd_identity_encrypt(params):
-    """Encrypt plaintext for an identity using ephemeral ECDH."""
+    """Encrypt plaintext for an Identity's public key.
+
+    Delegates to real RNS.Identity.encrypt. RNS generates the ephemeral
+    X25519 key and the AES IV internally and fresh per call — there is no
+    honest way to inject them, so this command is non-deterministic by
+    construction (two calls with identical input return different
+    ciphertext). Tests must round-trip through identity_decrypt.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
     plaintext = hex_to_bytes(params['plaintext'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Extract X25519 public key (first 32 bytes)
-    x25519_pub_bytes = public_key[:32]
-    x25519_pub = X25519.X25519PublicKey.from_public_bytes(x25519_pub_bytes)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(x25519_pub)
-
-    # Identity hash for salt
-    identity_hash = hashlib.sha256(public_key).digest()[:16]
-
-    # HKDF key derivation
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key),
-        'identity_hash': bytes_to_hex(identity_hash)
-    }
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'ciphertext': bytes_to_hex(identity.encrypt(plaintext))}
 
 
 def cmd_identity_decrypt(params):
-    """Decrypt ciphertext encrypted for an identity."""
+    """Decrypt a ciphertext token with an Identity's 64-byte private key.
+
+    Delegates to real RNS.Identity.decrypt. Returns plaintext=None if the
+    token does not authenticate (RNS.Identity.decrypt returns None).
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
     ciphertext = hex_to_bytes(params['ciphertext'])
-
-    # Split private key: X25519 (32) + Ed25519 (32)
-    x25519_prv_bytes = private_key[:32]
-    x25519_prv = X25519.X25519PrivateKey.from_private_bytes(x25519_prv_bytes)
-
-    # Derive public key for identity hash
-    x25519_pub_bytes = x25519_prv.public_key().public_bytes()
-
-    # Get Ed25519 public key too for full identity hash
-    ed25519_prv_bytes = private_key[32:]
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_sk = SigningKey(ed25519_prv_bytes)
-    ed25519_pub_bytes = ed25519_sk.vk_s
-
-    full_public_key = x25519_pub_bytes + ed25519_pub_bytes
-    identity_hash = hashlib.sha256(full_public_key).digest()[:16]
-
-    # Extract ephemeral public key and token
-    peer_pub_bytes = ciphertext[:32]
-    token_bytes = ciphertext[32:]
-
-    peer_pub = X25519.X25519PublicKey.from_public_bytes(peer_pub_bytes)
-
-    # ECDH exchange
-    shared_key = x25519_prv.exchange(peer_pub)
-
-    # HKDF key derivation
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    token_obj = Token.Token(derived_key)
-    plaintext = token_obj.decrypt(token_bytes)
-
-    return {
-        'plaintext': bytes_to_hex(plaintext),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    plaintext = identity.decrypt(ciphertext)
+    return {'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None}
 
 
 def cmd_identity_sign(params):
-    """Sign a message with an identity's Ed25519 key."""
+    """Sign a message with an Identity's 64-byte private key.
+
+    Delegates to real RNS.Identity.sign (Ed25519, deterministic).
+    """
+    RNS = _get_full_rns()
     private_key = hex_to_bytes(params['private_key'])
     message = hex_to_bytes(params['message'])
-
-    # Ed25519 private key is second 32 bytes
-    ed25519_prv_bytes = private_key[32:]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv_bytes)
-    signature = sk.sign(message)
-
-    return {
-        'signature': bytes_to_hex(signature)
-    }
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    return {'signature': bytes_to_hex(identity.sign(message))}
 
 
 def cmd_identity_verify(params):
-    """Verify a signature with an identity's public key."""
+    """Verify an Ed25519 signature against an Identity's public key.
+
+    Delegates to real RNS.Identity.validate.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
     message = hex_to_bytes(params['message'])
     signature = hex_to_bytes(params['signature'])
-
-    # Ed25519 public key is second 32 bytes
-    ed25519_pub_bytes = public_key[32:]
-
-    from pure25519.ed25519_oop import VerifyingKey
-    try:
-        vk = VerifyingKey(ed25519_pub_bytes)
-        vk.verify(signature, message)
-        return {'valid': True}
-    except Exception:
-        return {'valid': False}
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'valid': bool(identity.validate(signature, message))}
 
 
 def cmd_identity_hash(params):
-    """Compute identity hash from public key."""
+    """Compute the Identity hash of a 64-byte public key.
+
+    Delegates to real RNS.Identity — the hash is truncated_hash(public_key),
+    computed by RNS.Identity.update_hashes when the public key is loaded.
+    """
+    RNS = _get_full_rns()
     public_key = hex_to_bytes(params['public_key'])
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {'hash': bytes_to_hex(identity.hash)}
 
-    # Identity hash is truncated_hash(public_key) = SHA256[0:16]
-    full_hash = hashlib.sha256(public_key).digest()
-    truncated = full_hash[:16]
 
+def cmd_identity_to_file(params):
+    """Persist an Identity (from 64-byte private key) to a temp file on
+    disk via real RNS.Identity.to_file, and return the path.
+
+    Delegates straight to RNS.Identity.from_bytes(...).to_file(...) —
+    no hand-rolled file format. The path is in a per-bridge tempdir so
+    repeated calls don't collide. Tests pair this with identity_from_file
+    to round-trip the on-disk identity format Sideband + other apps use.
+    """
+    import tempfile
+    RNS = _get_full_rns()
+    private_key = hex_to_bytes(params['private_key'])
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    path = tempfile.NamedTemporaryFile(
+        prefix='conformance_identity_', suffix='.bin', delete=False
+    ).name
+    if not identity.to_file(path):
+        raise IOError(f"RNS.Identity.to_file returned False for path {path}")
+    return {'path': path}
+
+
+def cmd_identity_from_file(params):
+    """Load an Identity from a file on disk via real RNS.Identity.from_file.
+
+    Returns the recovered identity's public_key + hash + hexhash on
+    success, or {found: False} when from_file returns None (corrupt /
+    invalid file).
+    """
+    RNS = _get_full_rns()
+    path = params['path']
+    identity = RNS.Identity.from_file(path)
+    if identity is None:
+        return {'found': False}
     return {
-        'hash': bytes_to_hex(truncated),
-        'full_hash': bytes_to_hex(full_hash)
+        'found': True,
+        'public_key': bytes_to_hex(identity.get_public_key()),
+        'hash': bytes_to_hex(identity.hash),
+        'hexhash': identity.hexhash,
     }
 
 
 def cmd_destination_hash(params):
-    """Compute destination hash."""
+    """Compute the 16-byte destination address for an identity + app_name +
+    aspects.
+
+    Delegates to real RNS.Destination.hash, which accepts the 16-byte
+    identity hash directly. No hand-rolled name expansion or hash
+    composition — RNS.Destination.hash does the expand_name -> name_hash ->
+    truncated_hash(name_hash + identity_hash) chain itself.
+    """
+    RNS = _get_full_rns()
     identity_hash = hex_to_bytes(params['identity_hash'])
     app_name = params['app_name']
     aspects_param = params.get('aspects', '')
-
-    # Parse aspects - can be comma-separated string or already a list
     if isinstance(aspects_param, list):
         aspects = aspects_param
     elif aspects_param:
         aspects = aspects_param.split(',')
     else:
         aspects = []
-
-    # Build full name
-    name_parts = [app_name] + aspects
-    full_name = ".".join(name_parts)
-
-    # Name hash = SHA256(name.encode())[0:10]
-    name_hash = hashlib.sha256(full_name.encode('utf-8')).digest()[:10]
-
-    # Destination hash = SHA256(name_hash + identity_hash)[0:16]
-    addr_hash_material = name_hash + identity_hash
-    dest_hash = hashlib.sha256(addr_hash_material).digest()[:16]
-
-    return {
-        'name_hash': bytes_to_hex(name_hash),
-        'destination_hash': bytes_to_hex(dest_hash),
-        'full_name': full_name
-    }
+    dest_hash = RNS.Destination.hash(identity_hash, app_name, *aspects)
+    return {'destination_hash': bytes_to_hex(dest_hash)}
 
 
 def cmd_truncated_hash(params):
-    """Compute truncated hash (first 16 bytes of SHA256)."""
-    data = hex_to_bytes(params['data'])
-    full_hash = hashlib.sha256(data).digest()
-    truncated = full_hash[:16]
+    """Compute the RNS truncated hash of arbitrary data.
 
+    Delegates to real RNS.Identity.truncated_hash, which is
+    full_hash(data)[:TRUNCATED_HASHLENGTH//8] (16 bytes in RNS 1.3.1). The
+    previous implementation hardcoded `sha256(data)[:16]`; byte-identical
+    today, but it would silently fail to track an RNS change to the hash
+    algorithm or TRUNCATED_HASHLENGTH constant. full_hash is also reported,
+    sourced from RNS.Identity.full_hash, so nothing about the length or the
+    digest is hardcoded here.
+    """
+    RNS = _get_full_rns()
+    data = hex_to_bytes(params['data'])
     return {
-        'hash': bytes_to_hex(truncated),
-        'full_hash': bytes_to_hex(full_hash)
+        'hash': bytes_to_hex(RNS.Identity.truncated_hash(data)),
+        'full_hash': bytes_to_hex(RNS.Identity.full_hash(data)),
     }
 
 
 def cmd_name_hash(params):
-    """Compute name hash (first 10 bytes of SHA256)."""
+    """Compute the RNS name hash of a (dotted) destination name.
+
+    Delegates to real RNS.Identity.full_hash and the real
+    RNS.Identity.NAME_HASH_LENGTH constant — the name hash is
+    full_hash(name)[:NAME_HASH_LENGTH//8], exactly as RNS.Destination.hash
+    computes it internally. Nothing about the length is hardcoded here.
+    """
+    RNS = _get_full_rns()
     name = params['name']
-    full_hash = hashlib.sha256(name.encode('utf-8')).digest()
-    name_hash = full_hash[:10]
-
-    return {
-        'hash': bytes_to_hex(name_hash)
-    }
+    name_hash = RNS.Identity.full_hash(name.encode('utf-8'))[
+        : RNS.Identity.NAME_HASH_LENGTH // 8
+    ]
+    return {'hash': bytes_to_hex(name_hash)}
 
 
-def cmd_packet_flags(params):
-    """Compute packet flags byte from components."""
-    header_type = int(params['header_type'])
-    context_flag = int(params['context_flag'])
-    transport_type = int(params['transport_type'])
-    destination_type = int(params['destination_type'])
-    packet_type = int(params['packet_type'])
+def cmd_packet_build(params):
+    """Build a real RNS.Packet on a real Destination, pack it, and report
+    the wire bytes plus the fields RNS itself parsed back out.
 
-    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+    Honest replacement for the synthetic packet_pack / packet_flags commands,
+    which hand-assembled the header and bit-packed the flags byte. RNS only
+    produces a packet's wire format through Packet.pack() against a real
+    Destination — there is no "format these arbitrary header fields" entry
+    point. dest_type selects the destination kind ('plain', 'single' or
+    'group'), which sets the destination_type flag bits and decides whether the
+    payload is encrypted: PLAIN carries the payload in the clear so the wire
+    bytes round-trip exactly, SINGLE encrypts non-announce data with the
+    recipient identity so only the header bytes do, and GROUP encrypts
+    non-announce data with a symmetric Token key (same "header-only" round-trip
+    as SINGLE).
 
-    return {
-        'flags': flags,
-        'flags_hex': f'{flags:02x}'
-    }
+    header_type selects the wire header format and accepts either the
+    human-friendly numbers 1 / 2 (default 1 = HEADER_1) or the strings
+    "HEADER_1" / "HEADER_2":
 
-
-def cmd_packet_parse_flags(params):
-    """Parse packet flags byte into components."""
-    flags = int(params['flags'])
-
-    header_type = (flags & 0b01000000) >> 6
-    context_flag = (flags & 0b00100000) >> 5
-    transport_type = (flags & 0b00010000) >> 4
-    destination_type = (flags & 0b00001100) >> 2
-    packet_type = (flags & 0b00000011)
-
-    return {
-        'header_type': header_type,
-        'context_flag': context_flag,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type
-    }
-
-
-def cmd_packet_pack(params):
-    """Pack a packet into raw bytes."""
-    import struct
-
-    header_type = int(params['header_type'])
-    context_flag = int(params['context_flag'])
-    transport_type = int(params['transport_type'])
-    destination_type = int(params['destination_type'])
-    packet_type = int(params['packet_type'])
-    hops = int(params.get('hops', 0))
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    transport_id = hex_to_bytes(params['transport_id']) if params.get('transport_id') else None
+      * HEADER_1 (default) — the normal single-hop header (flags, hops,
+        destination_hash, context, payload).
+      * HEADER_2 — the transport-relayed header that carries a 16-byte
+        transport_id between the hops byte and the destination_hash. RNS
+        only assembles a HEADER_2 packet through Packet.pack() for ANNOUNCE
+        packets (Packet.py:220-229), so HEADER_2 requires packet_type ==
+        ANNOUNCE and a 16-byte `transport_id` param; any other packet_type
+        is rejected with a clear error rather than crashing on RNS's
+        internal "must have a transport ID" / unset-ciphertext path. The
+        returned `hash` excludes the transport_id (Packet.get_hash masks it
+        out, Packet.py:356-360) so a HEADER_2 announce hashes identically to
+        its HEADER_1 equivalent — which the conformance tests assert. (N-M10)
+    """
+    RNS = _get_full_rns()
+    dest_type = params.get('dest_type', 'plain')
+    packet_type = int(params.get('packet_type', RNS.Packet.DATA))
     context = int(params.get('context', 0))
-    data = hex_to_bytes(params['data'])
+    context_flag = int(params.get('context_flag', 0))
+    transport_type = int(params.get('transport_type', RNS.Transport.BROADCAST))
+    hops = int(params.get('hops', 0))
+    data = hex_to_bytes(params.get('data', ''))
 
-    # Compute flags
-    flags = (header_type << 6) | (context_flag << 5) | (transport_type << 4) | (destination_type << 2) | packet_type
+    # Resolve header_type from the human "1"/"2" or "HEADER_1"/"HEADER_2"
+    # convention to the RNS constant. (RNS values are HEADER_1=0, HEADER_2=1,
+    # which would collide with the human "1"; the param is the human form.)
+    header_type_param = params.get('header_type', 1)
+    header_type_map = {
+        1: RNS.Packet.HEADER_1, 2: RNS.Packet.HEADER_2,
+        "1": RNS.Packet.HEADER_1, "2": RNS.Packet.HEADER_2,
+        "HEADER_1": RNS.Packet.HEADER_1, "HEADER_2": RNS.Packet.HEADER_2,
+    }
+    if header_type_param not in header_type_map:
+        raise ValueError(
+            f"unsupported header_type: {header_type_param!r} "
+            "(use 1 / 2 or 'HEADER_1' / 'HEADER_2')"
+        )
+    header_type = header_type_map[header_type_param]
 
-    # Build header
-    header = struct.pack("!B", flags) + struct.pack("!B", hops)
+    transport_id = None
+    if header_type == RNS.Packet.HEADER_2:
+        if packet_type != RNS.Packet.ANNOUNCE:
+            raise ValueError(
+                "HEADER_2 packets are only buildable for ANNOUNCE packet_type "
+                f"({RNS.Packet.ANNOUNCE}); RNS.Packet.pack only assembles a "
+                "HEADER_2 header for announces (Packet.py:220-229)."
+            )
+        if 'transport_id' not in params or params['transport_id'] is None:
+            raise ValueError("HEADER_2 packets require a 16-byte transport_id")
+        transport_id = hex_to_bytes(params['transport_id'])
+        if len(transport_id) != RNS.Identity.TRUNCATED_HASHLENGTH // 8:
+            raise ValueError(
+                f"transport_id must be {RNS.Identity.TRUNCATED_HASHLENGTH // 8} "
+                f"bytes, got {len(transport_id)}"
+            )
 
-    if header_type == 1:  # HEADER_2
-        if transport_id is None:
-            raise ValueError("HEADER_2 requires transport_id")
-        header += transport_id + destination_hash
-    else:  # HEADER_1
-        header += destination_hash
+    if dest_type == 'plain':
+        destination = RNS.Destination(
+            None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+            "conformance", "packet",
+        )
+    elif dest_type == 'single':
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "conformance", "packet",
+        )
+    elif dest_type == 'group':
+        # GROUP destinations are symmetric-key. RNS forbids an outbound
+        # destination of any non-PLAIN type without identity material
+        # (Destination.py:178-179), and the GROUP encrypt path raises unless a
+        # symmetric key exists (Destination.py:601-609), so build with an
+        # Identity and call create_keys() to mint the Token key before pack().
+        # The GROUP destination_type bits (RNS.Destination.GROUP == 0x01) are
+        # set by get_packed_flags from destination.type (Packet.py:173); a DATA
+        # packet's payload is then encrypted by destination.encrypt, exactly as
+        # for SINGLE, so only the header bytes round-trip through unpack().
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP,
+            "conformance", "packet",
+        )
+        destination.create_keys()
+    else:
+        raise ValueError(
+            f"unsupported dest_type: {dest_type!r} "
+            "(use 'plain', 'single' or 'group')"
+        )
 
-    header += bytes([context])
+    packet = RNS.Packet(
+        destination, data,
+        packet_type=packet_type,
+        context=context,
+        transport_type=transport_type,
+        header_type=header_type,
+        transport_id=transport_id,
+        context_flag=context_flag,
+        create_receipt=False,
+    )
+    packet.hops = hops
+    packet.pack()
+    raw = packet.raw
 
-    raw = header + data
-
+    # Read the fields back the way any receiver does — via a real unpack.
+    parsed = RNS.Packet(None, None)
+    parsed.raw = raw
+    parsed.unpack()
     return {
         'raw': bytes_to_hex(raw),
-        'header': bytes_to_hex(header),
-        'size': len(raw)
+        'flags': raw[0],
+        'hops': parsed.hops,
+        'header_type': parsed.header_type,
+        'context_flag': parsed.context_flag,
+        'transport_type': parsed.transport_type,
+        'destination_type': parsed.destination_type,
+        'packet_type': parsed.packet_type,
+        'destination_hash': bytes_to_hex(parsed.destination_hash),
+        'transport_id': (
+            bytes_to_hex(parsed.transport_id)
+            if parsed.transport_id is not None else None
+        ),
+        'context': parsed.context,
+        'data': bytes_to_hex(parsed.data),
+        'hash': bytes_to_hex(parsed.get_hash()),
     }
 
 
 def cmd_packet_unpack(params):
-    """Unpack raw packet bytes into components."""
+    """Unpack raw packet bytes into their wire-format fields.
+
+    Delegates to real RNS.Packet.unpack — exactly the parse a receiver runs.
+    Returns every field RNS populated on the packet, plus the raw flags byte
+    and the packet hash.
+    """
+    RNS = _get_full_rns()
     raw = hex_to_bytes(params['raw'])
-
-    flags = raw[0]
-    hops = raw[1]
-
-    header_type = (flags & 0b01000000) >> 6
-    context_flag = (flags & 0b00100000) >> 5
-    transport_type = (flags & 0b00010000) >> 4
-    destination_type = (flags & 0b00001100) >> 2
-    packet_type = (flags & 0b00000011)
-
-    DST_LEN = 16  # TRUNCATED_HASHLENGTH // 8
-
-    if header_type == 1:  # HEADER_2
-        transport_id = raw[2:2+DST_LEN]
-        destination_hash = raw[2+DST_LEN:2+2*DST_LEN]
-        context = raw[2+2*DST_LEN]
-        data = raw[3+2*DST_LEN:]
-    else:  # HEADER_1
-        transport_id = None
-        destination_hash = raw[2:2+DST_LEN]
-        context = raw[2+DST_LEN]
-        data = raw[3+DST_LEN:]
-
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        return {'unpacked': False}
     return {
-        'flags': flags,
-        'hops': hops,
-        'header_type': header_type,
-        'context_flag': context_flag,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type,
-        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
-        'destination_hash': bytes_to_hex(destination_hash),
-        'context': context,
-        'data': bytes_to_hex(data)
+        'unpacked': True,
+        'flags': raw[0],
+        'hops': packet.hops,
+        'header_type': packet.header_type,
+        'context_flag': packet.context_flag,
+        'transport_type': packet.transport_type,
+        'destination_type': packet.destination_type,
+        'packet_type': packet.packet_type,
+        'destination_hash': bytes_to_hex(packet.destination_hash),
+        'transport_id': (
+            bytes_to_hex(packet.transport_id)
+            if packet.transport_id is not None else None
+        ),
+        'context': packet.context,
+        'data': bytes_to_hex(packet.data),
+        'hash': bytes_to_hex(packet.get_hash()),
     }
 
 
 def cmd_packet_hash(params):
-    """Compute packet hash from raw bytes."""
-    raw = hex_to_bytes(params['raw'])
+    """Compute the hash of a raw packet.
 
-    flags = raw[0]
-    header_type = (flags & 0b01000000) >> 6
-
-    DST_LEN = 16
-
-    # Mask flags to only keep lower 4 bits
-    masked_flags = bytes([flags & 0b00001111])
-
-    if header_type == 1:  # HEADER_2
-        # Skip transport_id (16 bytes after hops)
-        hashable_part = masked_flags + raw[2+DST_LEN:]
-    else:  # HEADER_1
-        hashable_part = masked_flags + raw[2:]
-
-    full_hash = hashlib.sha256(hashable_part).digest()
-    truncated = full_hash[:16]
-
-    return {
-        'hash': bytes_to_hex(full_hash),
-        'truncated_hash': bytes_to_hex(truncated),
-        'hashable_part': bytes_to_hex(hashable_part)
-    }
-
-
-# HDLC framing constants and functions
-HDLC_FLAG = 0x7E
-HDLC_ESC = 0x7D
-HDLC_ESC_MASK = 0x20
-
-
-def cmd_hdlc_escape(params):
-    """Escape data for HDLC framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
-    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
-
-    return {
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-def cmd_hdlc_frame(params):
-    """Frame data with HDLC framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([HDLC_ESC]), bytes([HDLC_ESC, HDLC_ESC ^ HDLC_ESC_MASK]))
-    escaped = escaped.replace(bytes([HDLC_FLAG]), bytes([HDLC_ESC, HDLC_FLAG ^ HDLC_ESC_MASK]))
-
-    framed = bytes([HDLC_FLAG]) + escaped + bytes([HDLC_FLAG])
-
-    return {
-        'framed': bytes_to_hex(framed),
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-# KISS framing constants and functions
-KISS_FEND = 0xC0
-KISS_FESC = 0xDB
-KISS_TFEND = 0xDC
-KISS_TFESC = 0xDD
-KISS_CMD_DATA = 0x00
-
-
-def cmd_kiss_escape(params):
-    """Escape data for KISS framing."""
-    data = hex_to_bytes(params['data'])
-
-    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
-    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
-
-    return {
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-def cmd_kiss_frame(params):
-    """Frame data with KISS framing."""
-    data = hex_to_bytes(params['data'])
-    command = int(params.get('command', KISS_CMD_DATA))
-
-    escaped = data.replace(bytes([KISS_FESC]), bytes([KISS_FESC, KISS_TFESC]))
-    escaped = escaped.replace(bytes([KISS_FEND]), bytes([KISS_FESC, KISS_TFEND]))
-
-    framed = bytes([KISS_FEND, command]) + escaped + bytes([KISS_FEND])
-
-    return {
-        'framed': bytes_to_hex(framed),
-        'escaped': bytes_to_hex(escaped)
-    }
-
-
-# Link operations
-
-def cmd_link_id_from_packet(params):
-    """Compute link ID from link request packet data.
-
-    Link ID = truncated_hash(hashable_part of packet)
-    where hashable_part excludes transport_id and masks flags.
-    For link requests, we also exclude MTU signalling bytes if present.
+    Delegates to real RNS.Packet — unpack the raw bytes, then read get_hash(),
+    which RNS itself uses to populate the dedup hashlist. The hashable part
+    deliberately excludes the hops byte and HEADER_2 transport_id so the
+    hash stays stable as the packet propagates through transports.
     """
+    RNS = _get_full_rns()
     raw = hex_to_bytes(params['raw'])
-
-    flags = raw[0]
-    header_type = (flags & 0b01000000) >> 6
-
-    DST_LEN = 16
-    ECPUBSIZE = 64  # X25519 (32) + Ed25519 (32) public keys
-
-    # Mask flags to only keep lower 4 bits
-    masked_flags = bytes([flags & 0b00001111])
-
-    if header_type == 1:  # HEADER_2
-        hashable_part = masked_flags + raw[2+DST_LEN:]
-    else:  # HEADER_1
-        hashable_part = masked_flags + raw[2:]
-
-    # For link requests, if data is longer than ECPUBSIZE,
-    # exclude the extra bytes (MTU signalling) from hash
-    # Parse to find data portion
-    if header_type == 1:
-        header_len = 2 + DST_LEN + DST_LEN + 1  # flags + hops + transport_id + dest + context
-    else:
-        header_len = 2 + DST_LEN + 1  # flags + hops + dest + context
-
-    data_start = header_len
-    data = raw[data_start:]
-
-    if len(data) > ECPUBSIZE:
-        diff = len(data) - ECPUBSIZE
-        hashable_part = hashable_part[:-diff]
-
-    full_hash = hashlib.sha256(hashable_part).digest()
-    link_id = full_hash[:16]
-
-    return {
-        'link_id': bytes_to_hex(link_id),
-        'hashable_part': bytes_to_hex(hashable_part)
-    }
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        raise ValueError("malformed packet — RNS.Packet.unpack rejected it")
+    return {'hash': bytes_to_hex(packet.get_hash())}
 
 
-def cmd_link_derive_key(params):
-    """Derive link encryption keys using HKDF.
+def cmd_packet_build_raw_header2(params):
+    """Build a HEADER_2 packet and call RNS.Packet.pack() WITHOUT any
+    pre-validation, surfacing RNS's OWN failure.
 
-    For AES-256-CBC mode, derives 64 bytes:
-    - First 32 bytes: encryption key
-    - Last 32 bytes: signing key
+    Unlike packet_build (which guards HEADER_2 in the harness before pack),
+    this constructs the real RNS.Packet exactly as the caller asks — including
+    omitting the transport_id (transport_id=None) or asking for a non-ANNOUNCE
+    HEADER_2 — and lets RNS.Packet.pack() decide. RNS.Packet.pack
+    (Packet.py:220-229) raises IOError("Packet with header type 2 must have a
+    transport ID") when transport_id is None, and for a non-ANNOUNCE HEADER_2 it
+    never assigns self.ciphertext, so .raw assembly raises AttributeError. Either
+    way the failure comes from RNS, not the harness.
 
-    Note: Link.get_context() returns None in Python RNS, so context is None.
+    Params: {packet_type (int, default ANNOUNCE), transport_id (optional hex),
+    data (hex, optional)}. Returns {raw, raw_len} on a successful pack, or
+    {error: <RNS exception message>, error_type: <exception class name>} when
+    RNS refuses.
     """
-    shared_key = hex_to_bytes(params['shared_key'])
-    link_id = hex_to_bytes(params['link_id'])
-    mode = params.get('mode', 'AES_256_CBC')
-
-    # Salt is the link ID (from Link.get_salt())
-    salt = link_id
-
-    # Context is None (from Link.get_context())
-    context = None
-
-    # Derived key length depends on mode
-    if mode == 'AES_256_CBC':
-        length = 64
-    else:
-        length = 32
-
-    derived = HKDF.hkdf(
-        length=length,
-        derive_from=shared_key,
-        salt=salt,
-        context=context
+    RNS = _get_full_rns()
+    packet_type = int(params.get('packet_type', RNS.Packet.ANNOUNCE))
+    data = hex_to_bytes(params.get('data', '')) or b'\x00'
+    transport_id = (
+        hex_to_bytes(params['transport_id'])
+        if params.get('transport_id') is not None else None
     )
-
-    return {
-        'derived_key': bytes_to_hex(derived),
-        'encryption_key': bytes_to_hex(derived[:32]) if length >= 64 else bytes_to_hex(derived[:16]),
-        'signing_key': bytes_to_hex(derived[32:]) if length >= 64 else bytes_to_hex(derived[16:])
-    }
-
-
-def cmd_link_encrypt(params):
-    """Encrypt data for transmission over a link using Token encryption."""
-    derived_key = hex_to_bytes(params['derived_key'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    return {
-        'ciphertext': bytes_to_hex(token_bytes)
-    }
-
-
-def cmd_link_decrypt(params):
-    """Decrypt data received over a link."""
-    derived_key = hex_to_bytes(params['derived_key'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-
-    token_obj = Token.Token(derived_key)
-    plaintext = token_obj.decrypt(ciphertext)
-
-    return {
-        'plaintext': bytes_to_hex(plaintext)
-    }
-
-
-def cmd_link_prove(params):
-    """Generate link proof signature.
-
-    The proof signs: link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-    """
-    identity_private = hex_to_bytes(params['identity_private'])  # 64 bytes: X25519 + Ed25519
-    link_id = hex_to_bytes(params['link_id'])
-    receiver_pub = hex_to_bytes(params['receiver_pub'])  # X25519 public
-    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])  # Ed25519 public
-    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
-
-    # Build signed data
-    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-
-    # Sign with Ed25519 private key (second 32 bytes of identity)
-    ed25519_prv = identity_private[32:64]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv)
-    signature = sk.sign(signed_data)
-
-    return {
-        'signature': bytes_to_hex(signature),
-        'signed_data': bytes_to_hex(signed_data)
-    }
-
-
-def cmd_link_verify_proof(params):
-    """Verify link proof signature."""
-    identity_public = hex_to_bytes(params['identity_public'])  # 64 bytes: X25519 + Ed25519
-    link_id = hex_to_bytes(params['link_id'])
-    receiver_pub = hex_to_bytes(params['receiver_pub'])
-    receiver_sig_pub = hex_to_bytes(params['receiver_sig_pub'])
-    signalling_bytes = hex_to_bytes(params.get('signalling_bytes', ''))
-    signature = hex_to_bytes(params['signature'])
-
-    # Build signed data
-    signed_data = link_id + receiver_pub + receiver_sig_pub + signalling_bytes
-
-    # Verify with Ed25519 public key (second 32 bytes of identity)
-    ed25519_pub = identity_public[32:64]
-
-    from pure25519.ed25519_oop import VerifyingKey
+    # A SINGLE OUT destination supplies destination.hash for the HEADER_2 body.
+    destination = RNS.Destination(
+        RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+        "conformance", "packet",
+    )
+    packet = RNS.Packet(
+        destination, data,
+        packet_type=packet_type,
+        header_type=RNS.Packet.HEADER_2,
+        transport_id=transport_id,
+        create_receipt=False,
+    )
     try:
-        vk = VerifyingKey(ed25519_pub)
-        vk.verify(signature, signed_data)
-        return {'valid': True}
-    except Exception:
-        return {'valid': False}
+        packet.pack()
+    except Exception as e:
+        return {'error': str(e), 'error_type': type(e).__name__}
+    return {'raw': bytes_to_hex(packet.raw), 'raw_len': len(packet.raw)}
 
 
-def cmd_link_signalling_bytes(params):
-    """Encode MTU and mode into signalling bytes.
+def cmd_packet_resend_observe(params):
+    """Pack a packet, then drive real RNS.Packet.resend() and report whether the
+    re-pack produced fresh wire bytes.
 
-    Format: 3 bytes
-    - Bits 21-23: mode (3 bits)
-    - Bits 0-20: MTU (21 bits)
+    RNS.Packet.resend (Packet.py:305-323) re-packs the packet before
+    re-transmitting precisely so an encrypted destination gets fresh ephemeral
+    key material / IV on every attempt. This builds a real RNS.Packet for the
+    requested dest_type, packs it (raw_1/hash_1), marks it sent (resend's
+    precondition), then calls the real resend() — which internally calls
+    self.pack() again — and reads raw_2/hash_2 straight off the packet RNS
+    mutated. No interface is attached, so resend()'s Transport.outbound returns
+    False, but the re-pack (the byte-generation under test) still runs.
+
+    Params: {dest_type: 'single'|'plain'|'group', data (hex)}. Returns
+    {raw_1, hash_1, raw_2, hash_2}.
     """
-    mtu = int(params['mtu'])
-    mode = int(params.get('mode', 1))  # Default: AES_256_CBC = 0x01
-
-    MTU_BYTEMASK = 0x1FFFFF  # 21 bits
-    MODE_BYTEMASK = 0xE0  # Top 3 bits of first byte
-
-    value = (mtu & MTU_BYTEMASK) + (((mode << 5) & MODE_BYTEMASK) << 16)
-
-    signalling = bytes([
-        (value >> 16) & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF
-    ])
-
-    return {
-        'signalling_bytes': bytes_to_hex(signalling),
-        'decoded_mtu': mtu & MTU_BYTEMASK,
-        'decoded_mode': mode
-    }
-
-
-def cmd_link_parse_signalling(params):
-    """Parse signalling bytes into MTU and mode."""
-    signalling = hex_to_bytes(params['signalling_bytes'])
-
-    if len(signalling) != 3:
-        raise ValueError(f"Signalling bytes must be 3 bytes, got {len(signalling)}")
-
-    MTU_BYTEMASK = 0x1FFFFF
-    MODE_BYTEMASK = 0xE0
-
-    value = (signalling[0] << 16) | (signalling[1] << 8) | signalling[2]
-    mtu = value & MTU_BYTEMASK
-    mode = (signalling[0] & MODE_BYTEMASK) >> 5
-
-    return {
-        'mtu': mtu,
-        'mode': mode
-    }
-
-
+    RNS = _get_full_rns()
+    dest_type = params.get('dest_type', 'single')
+    data = hex_to_bytes(params.get('data', '')) or b'conformance-resend'
+    if dest_type == 'plain':
+        destination = RNS.Destination(
+            None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+            "conformance", "packet",
+        )
+    elif dest_type == 'group':
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.GROUP,
+            "conformance", "packet",
+        )
+        destination.create_keys()
+    else:
+        destination = RNS.Destination(
+            RNS.Identity(), RNS.Destination.OUT, RNS.Destination.SINGLE,
+            "conformance", "packet",
+        )
+    packet = RNS.Packet(destination, data, create_receipt=False)
+    packet.pack()
+    raw_1 = bytes_to_hex(packet.raw)
+    hash_1 = bytes_to_hex(packet.get_hash())
+    # resend() requires the packet to have been sent already; RNS sets .sent in
+    # send(). We set it so resend's precondition passes and the real re-pack runs.
+    packet.sent = True
+    packet.resend()
+    raw_2 = bytes_to_hex(packet.raw)
+    hash_2 = bytes_to_hex(packet.get_hash())
+    return {'raw_1': raw_1, 'hash_1': hash_1, 'raw_2': raw_2, 'hash_2': hash_2}
 # Announce operations
 
-def cmd_random_hash(params):
-    """Generate random_hash (5 random bytes + 5 timestamp bytes).
+def cmd_announce_build(params):
+    """Build a real RNS announce packet without putting it on the wire.
 
-    Format matches Python RNS:
-    random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
+    Delegates to real RNS.Destination.announce(send=False), which returns the
+    fully-constructed announce Packet (signed by the destination's Identity,
+    with ratchet embedded if Destination.ratchets is non-empty, with
+    context_flag bookkeeping). Packs it and returns the wire bytes plus the
+    parsed announce_data fields a receiver would extract. Requires a running
+    Reticulum instance to register an IN destination — the bridge spins up a
+    minimal no-interface one lazily.
+
+    The previous synthetic announce_pack / announce_sign / announce_unpack
+    hand-rolled the field concatenation, the signed-data layout, and the
+    Ed25519 signing on top of pure25519. Their output happened to match RNS
+    so the suite stayed green, but any drift in the announce signed-data
+    layout (e.g. RNS reordering fields, changing what app_data scope is
+    signed) would be invisible because the bridge mirrored its own copy.
     """
-    import time
-    timestamp = params.get('timestamp')
-    random_bytes = hex_to_bytes(params['random_bytes']) if params.get('random_bytes') else None
-
-    # Generate random bytes if not provided
-    if random_bytes is None:
-        random_bytes = os.urandom(5)
-    elif len(random_bytes) != 5:
-        raise ValueError(f"random_bytes must be 5 bytes, got {len(random_bytes)}")
-
-    # Use provided timestamp or current time
-    if timestamp is not None:
-        timestamp = int(timestamp)
-    else:
-        timestamp = int(time.time())
-
-    # Combine: 5 random bytes + 5 timestamp bytes (big-endian)
-    random_hash = random_bytes + timestamp.to_bytes(5, "big")
-
-    return {
-        'random_hash': bytes_to_hex(random_hash),
-        'random_bytes': bytes_to_hex(random_bytes),
-        'timestamp': timestamp,
-        'timestamp_bytes': bytes_to_hex(timestamp.to_bytes(5, "big"))
-    }
-
-
-def cmd_announce_pack(params):
-    """Pack announce payload.
-
-    Without ratchet (148 bytes min):
-      public_key (64) + name_hash (10) + random_hash (10) + signature (64) + app_data (var)
-
-    With ratchet (180 bytes min):
-      public_key (64) + name_hash (10) + random_hash (10) + ratchet (32) + signature (64) + app_data (var)
-    """
-    public_key = hex_to_bytes(params['public_key'])
-    name_hash = hex_to_bytes(params['name_hash'])
-    random_hash = hex_to_bytes(params['random_hash'])
-    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
-    signature = hex_to_bytes(params['signature'])
-    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
-
-    # Validate sizes
-    if len(public_key) != 64:
-        raise ValueError(f"public_key must be 64 bytes, got {len(public_key)}")
-    if len(name_hash) != 10:
-        raise ValueError(f"name_hash must be 10 bytes, got {len(name_hash)}")
-    if len(random_hash) != 10:
-        raise ValueError(f"random_hash must be 10 bytes, got {len(random_hash)}")
-    if ratchet and len(ratchet) != 32:
-        raise ValueError(f"ratchet must be 32 bytes, got {len(ratchet)}")
-    if len(signature) != 64:
-        raise ValueError(f"signature must be 64 bytes, got {len(signature)}")
-
-    # Pack announce data
-    announce_data = public_key + name_hash + random_hash + ratchet + signature + app_data
-
-    return {
-        'announce_data': bytes_to_hex(announce_data),
-        'size': len(announce_data),
-        'has_ratchet': len(ratchet) > 0
-    }
-
-
-def cmd_announce_unpack(params):
-    """Unpack announce payload.
-
-    Returns all components of the announce.
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-    has_ratchet = params.get('has_ratchet', False)
-
-    # Constants
-    KEYSIZE = 64
-    NAME_HASH_LEN = 10
-    RANDOM_HASH_LEN = 10
-    RATCHET_SIZE = 32
-    SIG_LEN = 64
-
-    # Unpack based on whether ratchet is present
-    if has_ratchet:
-        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + RATCHET_SIZE + SIG_LEN:
-            raise ValueError(f"announce_data too short for ratchet announce: {len(announce_data)} bytes")
-
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
-    else:
-        if len(announce_data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + SIG_LEN:
-            raise ValueError(f"announce_data too short for non-ratchet announce: {len(announce_data)} bytes")
-
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = b""
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
-
-    return {
-        'public_key': bytes_to_hex(public_key),
-        'name_hash': bytes_to_hex(name_hash),
-        'random_hash': bytes_to_hex(random_hash),
-        'ratchet': bytes_to_hex(ratchet) if ratchet else '',
-        'signature': bytes_to_hex(signature),
-        'app_data': bytes_to_hex(app_data) if app_data else '',
-        'has_ratchet': len(ratchet) > 0
-    }
-
-
-def cmd_announce_sign(params):
-    """Sign announce data.
-
-    Signed data format:
-      destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-    """
+    RNS = _ensure_minimal_rns()
     private_key = hex_to_bytes(params['private_key'])
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    public_key = hex_to_bytes(params['public_key'])
-    name_hash = hex_to_bytes(params['name_hash'])
-    random_hash = hex_to_bytes(params['random_hash'])
-    ratchet = hex_to_bytes(params['ratchet']) if params.get('ratchet') else b""
-    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else b""
-
-    # Build signed data (matches Python RNS Destination.announce())
-    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-
-    # Sign with Ed25519 private key (second 32 bytes)
-    ed25519_prv = private_key[32:64]
-
-    from pure25519.ed25519_oop import SigningKey
-    sk = SigningKey(ed25519_prv)
-    signature = sk.sign(signed_data)
-
-    return {
-        'signature': bytes_to_hex(signature),
-        'signed_data': bytes_to_hex(signed_data)
-    }
-
-
-def cmd_announce_verify(params):
-    """Verify announce signature.
-
-    Validates signature and optionally validates destination hash.
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    has_ratchet = params.get('has_ratchet', False)
-    validate_dest_hash = params.get('validate_dest_hash', True)
-
-    # Constants
-    KEYSIZE = 64
-    NAME_HASH_LEN = 10
-    RANDOM_HASH_LEN = 10
-    RATCHET_SIZE = 32
-    SIG_LEN = 64
-
-    # Unpack announce data
-    if has_ratchet:
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
-        ratchet = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE]
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+RATCHET_SIZE+SIG_LEN:]
+    app_name = params['app_name']
+    aspects_param = params.get('aspects', [])
+    if isinstance(aspects_param, list):
+        aspects = aspects_param
+    elif aspects_param:
+        aspects = aspects_param.split(',')
     else:
-        public_key = announce_data[0:KEYSIZE]
-        name_hash = announce_data[KEYSIZE:KEYSIZE+NAME_HASH_LEN]
-        random_hash = announce_data[KEYSIZE+NAME_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN]
+        aspects = []
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else None
+    enable_ratchets = bool(params.get('enable_ratchets', False))
+    emission_ts = params.get('emission_ts')  # optional: int seconds-since-epoch
+
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+    # Reuse an existing registered destination if the same identity+name has
+    # already been announced through this bridge — RNS raises KeyError
+    # ("Attempt to register an already registered destination") on a second
+    # construction, but real workflows re-announce the same destination
+    # repeatedly. announce_build is called once per test, so the lifetime
+    # match between tests in the same bridge process is identity+name.
+    expected_hash = RNS.Destination.hash(identity, app_name, *aspects)
+    destination = None
+    for existing in RNS.Transport.destinations:
+        if existing.hash == expected_hash:
+            destination = existing
+            break
+    if destination is None:
+        destination = RNS.Destination(
+            identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
+        )
+    if enable_ratchets:
+        # RNS controls the ratchet lifecycle via Destination.enable_ratchets
+        # against a state file; on enable() + the first rotate_ratchets()
+        # inside announce() it generates a fresh ratchet and writes it. We
+        # use a fresh path (no file yet — _reload_ratchets initialises a new
+        # one) to honour that contract; the bridge does not inject a
+        # specific ratchet, tests must read what RNS produced.
+        import tempfile
+        ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
+        destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
+
+    # An optional `emission_ts` lets a caller pin the announce's wall-clock
+    # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
+    # random_hash and stamps `now = time.time()` on the path response. The
+    # behavioral path-replacement tests rely on this to compare fresh and
+    # stale announces. Rather than synthesise the embed by hand we patch
+    # `time.time` for the duration of one announce() call, so RNS still does
+    # all the real work — it just sees the wall-clock value we pin.
+    import time as _time
+    if emission_ts is not None:
+        _orig_time = _time.time
+        _time.time = lambda: float(emission_ts)
+        try:
+            packet = destination.announce(app_data=app_data, send=False)
+        finally:
+            _time.time = _orig_time
+    else:
+        packet = destination.announce(app_data=app_data, send=False)
+    packet.pack()
+    raw = packet.raw
+
+    # Parse what RNS just produced — the field layout RNS itself wrote.
+    keysize = RNS.Identity.KEYSIZE // 8
+    name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+    ratchet_size = RNS.Identity.RATCHETSIZE // 8
+    sig_len = RNS.Identity.SIGLENGTH // 8
+    has_ratchet = packet.context_flag == RNS.Packet.FLAG_SET
+    data = packet.data
+    pubkey = data[:keysize]
+    name_hash = data[keysize:keysize + name_hash_len]
+    # The random_hash slice is 10 bytes — Destination.announce produces it as
+    # 5 bytes of random + 5 bytes big-endian timestamp; the slice length is
+    # the part of the wire format that is not yet a named RNS constant.
+    random_hash_len = 10
+    random_hash_off = keysize + name_hash_len
+    random_hash = data[random_hash_off:random_hash_off + random_hash_len]
+    cursor = random_hash_off + random_hash_len
+    if has_ratchet:
+        ratchet = data[cursor:cursor + ratchet_size]
+        cursor += ratchet_size
+    else:
         ratchet = b""
-        signature = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN:KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN]
-        app_data = announce_data[KEYSIZE+NAME_HASH_LEN+RANDOM_HASH_LEN+SIG_LEN:]
-
-    # Build signed data
-    signed_data = destination_hash + public_key + name_hash + random_hash + ratchet + app_data
-
-    # Verify signature
-    ed25519_pub = public_key[32:64]
-
-    from pure25519.ed25519_oop import VerifyingKey
-    try:
-        vk = VerifyingKey(ed25519_pub)
-        vk.verify(signature, signed_data)
-        signature_valid = True
-    except Exception:
-        signature_valid = False
-
-    # Optionally validate destination hash
-    dest_hash_valid = True
-    expected_dest_hash = b""
-    if validate_dest_hash:
-        # Compute identity hash from public key
-        identity_hash = hashlib.sha256(public_key).digest()[:16]
-
-        # Compute expected destination hash
-        hash_material = name_hash + identity_hash
-        expected_dest_hash = hashlib.sha256(hash_material).digest()[:16]
-
-        dest_hash_valid = (destination_hash == expected_dest_hash)
+    signature = data[cursor:cursor + sig_len]
+    cursor += sig_len
+    app_data_out = data[cursor:]
 
     return {
-        'valid': signature_valid and dest_hash_valid,
-        'signature_valid': signature_valid,
-        'dest_hash_valid': dest_hash_valid,
-        'expected_dest_hash': bytes_to_hex(expected_dest_hash) if validate_dest_hash else ''
-    }
-
-
-# Ratchet operations
-
-def cmd_ratchet_id(params):
-    """Compute ratchet ID from ratchet public key.
-
-    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-
-    # Compute full hash
-    full_hash = hashlib.sha256(ratchet_public).digest()
-
-    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
-    ratchet_id = full_hash[:10]
-
-    return {
-        'ratchet_id': bytes_to_hex(ratchet_id),
-        'full_hash': bytes_to_hex(full_hash)
-    }
-
-
-def cmd_ratchet_public_from_private(params):
-    """Derive public key from ratchet private key."""
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-
-    # Create X25519 key pair from private key
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ratchet_pub = ratchet_prv.public_key()
-    ratchet_pub_bytes = ratchet_pub.public_bytes()
-
-    return {
-        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
-    }
-
-
-def cmd_ratchet_derive_key(params):
-    """Derive encryption key using ratchet.
-
-    This performs ECDH with ephemeral key and ratchet public key,
-    then derives a key using HKDF with identity hash as salt.
-    """
-    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Create keys
-    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    return {
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_encrypt(params):
-    """Encrypt plaintext using ratchet.
-
-    Same as identity_encrypt but uses ratchet public key instead of identity public key.
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Create ratchet public key
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange with ratchet
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_decrypt(params):
-    """Decrypt ciphertext using ratchet.
-
-    Tries to decrypt using provided ratchet private keys.
-    """
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Extract ephemeral public key (first 32 bytes)
-    if len(ciphertext) <= 32:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': 'Ciphertext too short'
-        }
-
-    ephemeral_pub_bytes = ciphertext[:32]
-    token_data = ciphertext[32:]
-
-    # Create keys
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
-
-    # ECDH exchange
-    shared_key = ratchet_prv.exchange(ephemeral_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    try:
-        token_obj = Token.Token(derived_key)
-        plaintext = token_obj.decrypt(token_data)
-
-        if plaintext is None:
-            return {
-                'success': False,
-                'plaintext': None,
-                'shared_key': bytes_to_hex(shared_key),
-                'derived_key': bytes_to_hex(derived_key)
-            }
-
-        return {
-            'success': True,
-            'plaintext': bytes_to_hex(plaintext),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-    except Exception as e:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': str(e),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-
-
-def cmd_ratchet_storage_format(params):
-    """Pack ratchet storage format using msgpack.
-
-    Format: {"ratchet": ratchet_bytes, "received": timestamp}
-    """
-    import time
-
-    ratchet = hex_to_bytes(params['ratchet'])
-    received = float(params.get('received', time.time()))
-
-    # Pack using msgpack
-    ratchet_data = {
-        "ratchet": ratchet,
-        "received": received
-    }
-
-    packed = umsgpack.packb(ratchet_data)
-
-    return {
-        'packed': bytes_to_hex(packed),
-        'ratchet': bytes_to_hex(ratchet),
-        'received': received
-    }
-
-
-def cmd_ratchet_extract_from_announce(params):
-    """Extract ratchet from announce data.
-
-    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-
-    # Parse announce structure
-    # public_key: 64 bytes
-    # name_hash: 10 bytes
-    # random_hash: 10 bytes
-    # ratchet: 32 bytes (or 0 if not present)
-    # signature: 64 bytes
-
-    if len(announce_data) < 64 + 10 + 10 + 64:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Announce too short'
-        }
-
-    offset = 0
-    public_key = announce_data[offset:offset+64]
-    offset += 64
-
-    name_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    random_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    # Check if there's space for ratchet + signature
-    remaining = len(announce_data) - offset
-
-    if remaining >= 32 + 64:
-        # Ratchet is present
-        ratchet = announce_data[offset:offset+32]
-        offset += 32
-        signature = announce_data[offset:offset+64]
-        offset += 64
-
-        # Check if ratchet is all zeros (no ratchet)
-        if ratchet == b'\x00' * 32:
-            has_ratchet = False
-            ratchet = None
-        else:
-            has_ratchet = True
-    elif remaining == 64:
-        # No ratchet, just signature
-        has_ratchet = False
-        ratchet = None
-        signature = announce_data[offset:offset+64]
-        offset += 64
-    else:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Invalid announce structure'
-        }
-
-    # Any remaining data is app_data
-    app_data = announce_data[offset:] if offset < len(announce_data) else b''
-
-    result = {
-        'has_ratchet': has_ratchet,
-        'public_key': bytes_to_hex(public_key),
+        'raw': bytes_to_hex(raw),
+        'destination_hash': bytes_to_hex(destination.hash),
+        'announce_data': bytes_to_hex(data),
+        'public_key': bytes_to_hex(pubkey),
         'name_hash': bytes_to_hex(name_hash),
         'random_hash': bytes_to_hex(random_hash),
-        'signature': bytes_to_hex(signature)
-    }
-
-    if has_ratchet:
-        result['ratchet'] = bytes_to_hex(ratchet)
-        # Compute ratchet ID
-        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
-        result['ratchet_id'] = bytes_to_hex(ratchet_id)
-    else:
-        result['ratchet'] = None
-
-    if app_data:
-        result['app_data'] = bytes_to_hex(app_data)
-
-    return result
-
-# Ratchet operations
-
-def cmd_ratchet_id(params):
-    """Compute ratchet ID from ratchet public key.
-
-    Ratchet ID = SHA256(ratchet_public_bytes)[:10]
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-
-    # Compute full hash
-    full_hash = hashlib.sha256(ratchet_public).digest()
-
-    # Truncate to NAME_HASH_LENGTH (80 bits = 10 bytes)
-    ratchet_id = full_hash[:10]
-
-    return {
-        'ratchet_id': bytes_to_hex(ratchet_id),
-        'full_hash': bytes_to_hex(full_hash)
-    }
-
-
-def cmd_ratchet_public_from_private(params):
-    """Derive public key from ratchet private key."""
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-
-    # Create X25519 key pair from private key
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ratchet_pub = ratchet_prv.public_key()
-    ratchet_pub_bytes = ratchet_pub.public_bytes()
-
-    return {
-        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
-    }
-
-
-def cmd_ratchet_derive_key(params):
-    """Derive encryption key using ratchet.
-
-    This performs ECDH with ephemeral key and ratchet public key,
-    then derives a key using HKDF with identity hash as salt.
-    """
-    ephemeral_private = hex_to_bytes(params['ephemeral_private'])
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Create keys
-    ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # ECDH exchange
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    return {
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_encrypt(params):
-    """Encrypt plaintext using ratchet.
-
-    Same as identity_encrypt but uses ratchet public key instead of identity public key.
-    """
-    ratchet_public = hex_to_bytes(params['ratchet_public'])
-    plaintext = hex_to_bytes(params['plaintext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-    ephemeral_private = hex_to_bytes(params['ephemeral_private']) if params.get('ephemeral_private') else None
-    iv = hex_to_bytes(params['iv']) if params.get('iv') else None
-
-    # Create ratchet public key
-    ratchet_pub = X25519.X25519PublicKey.from_public_bytes(ratchet_public)
-
-    # Generate or use provided ephemeral key
-    if ephemeral_private:
-        ephemeral_prv = X25519.X25519PrivateKey.from_private_bytes(ephemeral_private)
-    else:
-        ephemeral_prv = X25519.X25519PrivateKey.generate()
-
-    ephemeral_pub_bytes = ephemeral_prv.public_key().public_bytes()
-
-    # ECDH exchange with ratchet
-    shared_key = ephemeral_prv.exchange(ratchet_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token encryption
-    token_obj = Token.Token(derived_key)
-
-    if iv:
-        # Use provided IV for reproducibility
-        ciphertext = token_obj.mode.encrypt(
-            plaintext=PKCS7.pad(plaintext),
-            key=token_obj._encryption_key,
-            iv=iv
-        )
-        signed_parts = iv + ciphertext
-        hmac_val = HMAC.new(token_obj._signing_key, signed_parts).digest()
-        token_bytes = signed_parts + hmac_val
-    else:
-        token_bytes = token_obj.encrypt(plaintext)
-
-    # Return ephemeral_pub + token
-    result = ephemeral_pub_bytes + token_bytes
-
-    return {
-        'ciphertext': bytes_to_hex(result),
-        'ephemeral_public': bytes_to_hex(ephemeral_pub_bytes),
-        'shared_key': bytes_to_hex(shared_key),
-        'derived_key': bytes_to_hex(derived_key)
-    }
-
-
-def cmd_ratchet_decrypt(params):
-    """Decrypt ciphertext using ratchet.
-
-    Tries to decrypt using provided ratchet private keys.
-    """
-    ratchet_private = hex_to_bytes(params['ratchet_private'])
-    ciphertext = hex_to_bytes(params['ciphertext'])
-    identity_hash = hex_to_bytes(params['identity_hash'])
-
-    # Extract ephemeral public key (first 32 bytes)
-    if len(ciphertext) <= 32:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': 'Ciphertext too short'
-        }
-
-    ephemeral_pub_bytes = ciphertext[:32]
-    token_data = ciphertext[32:]
-
-    # Create keys
-    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
-    ephemeral_pub = X25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
-
-    # ECDH exchange
-    shared_key = ratchet_prv.exchange(ephemeral_pub)
-
-    # HKDF key derivation with identity hash as salt
-    derived_key = HKDF.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=identity_hash,
-        context=None
-    )
-
-    # Token decryption
-    try:
-        token_obj = Token.Token(derived_key)
-        plaintext = token_obj.decrypt(token_data)
-
-        if plaintext is None:
-            return {
-                'success': False,
-                'plaintext': None,
-                'shared_key': bytes_to_hex(shared_key),
-                'derived_key': bytes_to_hex(derived_key)
-            }
-
-        return {
-            'success': True,
-            'plaintext': bytes_to_hex(plaintext),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-    except Exception as e:
-        return {
-            'success': False,
-            'plaintext': None,
-            'error': str(e),
-            'shared_key': bytes_to_hex(shared_key),
-            'derived_key': bytes_to_hex(derived_key)
-        }
-
-
-def cmd_ratchet_storage_format(params):
-    """Pack ratchet storage format using msgpack.
-
-    Format: {"ratchet": ratchet_bytes, "received": timestamp}
-    """
-    import time
-
-    ratchet = hex_to_bytes(params['ratchet'])
-    received = float(params.get('received', time.time()))
-
-    # Pack using msgpack
-    ratchet_data = {
-        "ratchet": ratchet,
-        "received": received
-    }
-
-    packed = umsgpack.packb(ratchet_data)
-
-    return {
-        'packed': bytes_to_hex(packed),
-        'ratchet': bytes_to_hex(ratchet),
-        'received': received
-    }
-
-
-def cmd_ratchet_extract_from_announce(params):
-    """Extract ratchet from announce data.
-
-    Announce format: public_key(64) + name_hash(10) + random_hash(10) + ratchet(32) + signature(64) [+ app_data]
-    """
-    announce_data = hex_to_bytes(params['announce_data'])
-
-    # Parse announce structure
-    # public_key: 64 bytes
-    # name_hash: 10 bytes
-    # random_hash: 10 bytes
-    # ratchet: 32 bytes (or 0 if not present)
-    # signature: 64 bytes
-
-    if len(announce_data) < 64 + 10 + 10 + 64:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Announce too short'
-        }
-
-    offset = 0
-    public_key = announce_data[offset:offset+64]
-    offset += 64
-
-    name_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    random_hash = announce_data[offset:offset+10]
-    offset += 10
-
-    # Check if there's space for ratchet + signature
-    remaining = len(announce_data) - offset
-
-    if remaining >= 32 + 64:
-        # Ratchet is present
-        ratchet = announce_data[offset:offset+32]
-        offset += 32
-        signature = announce_data[offset:offset+64]
-        offset += 64
-
-        # Check if ratchet is all zeros (no ratchet)
-        if ratchet == b'\x00' * 32:
-            has_ratchet = False
-            ratchet = None
-        else:
-            has_ratchet = True
-    elif remaining == 64:
-        # No ratchet, just signature
-        has_ratchet = False
-        ratchet = None
-        signature = announce_data[offset:offset+64]
-        offset += 64
-    else:
-        return {
-            'has_ratchet': False,
-            'ratchet': None,
-            'error': 'Invalid announce structure'
-        }
-
-    # Any remaining data is app_data
-    app_data = announce_data[offset:] if offset < len(announce_data) else b''
-
-    result = {
+        'ratchet': bytes_to_hex(ratchet) if ratchet else "",
+        'signature': bytes_to_hex(signature),
+        'app_data': bytes_to_hex(app_data_out),
         'has_ratchet': has_ratchet,
-        'public_key': bytes_to_hex(public_key),
-        'name_hash': bytes_to_hex(name_hash),
-        'random_hash': bytes_to_hex(random_hash),
-        'signature': bytes_to_hex(signature)
     }
 
-    if has_ratchet:
-        result['ratchet'] = bytes_to_hex(ratchet)
-        # Compute ratchet ID
-        ratchet_id = hashlib.sha256(ratchet).digest()[:10]
-        result['ratchet_id'] = bytes_to_hex(ratchet_id)
-    else:
-        result['ratchet'] = None
 
-    if app_data:
-        result['app_data'] = bytes_to_hex(app_data)
+def cmd_announce_validate(params):
+    """Validate a real RNS announce packet.
 
-    return result
+    Delegates to real RNS.Identity.validate_announce, which checks the
+    Ed25519 signature over (destination_hash + public_key + name_hash +
+    random_hash + ratchet + app_data) and confirms the destination_hash in
+    the header matches the one derived from the public_key + name_hash. The
+    previous hand-rolled announce_verify reimplemented both checks on top of
+    pure25519 + hashlib; if validate_announce's signed-data layout ever
+    drifted (e.g. app_data scope, ratchet inclusion under context_flag) the
+    bridge wouldn't follow.
 
-
-# Ratchet file format operations (Destination-level ratchet persistence)
-
-def cmd_ratchet_file_write(params):
-    """Write a ratchet file in Python's Destination._persist_ratchets format.
-
-    params:
-        path: str - file path to write
-        ratchet_keys: list of hex strings - ratchet private keys
-        signing_private_key: hex - Ed25519 private key (64 bytes) for signing
-    returns:
-        written: bool
-        path: str
-        ratchet_count: int
+    Returns the validation verdict plus the extracted ratchet (RNS's
+    validate_announce returns only True/False, so the ratchet — when
+    present — is read off packet.data at the offsets RNS itself parses to).
     """
-    path = params['path']
-    ratchet_keys = [hex_to_bytes(k) for k in params['ratchet_keys']]
-    signing_key_bytes = hex_to_bytes(params['signing_private_key'])
-
-    # Ed25519 private key is the second 32 bytes of the 64-byte identity key
-    from pure25519.ed25519_oop import SigningKey
-    ed25519_seed = signing_key_bytes[32:]
-    sk = SigningKey(ed25519_seed)
-
-    # Pack ratchets list (inner packing)
-    packed_ratchets = umsgpack.packb(ratchet_keys)
-
-    # Sign the packed ratchets (matches Destination._persist_ratchets → Identity.sign)
-    signature = sk.sign(packed_ratchets)
-
-    # Wrap in outer msgpack dict
-    persisted_data = {
-        "signature": signature,
-        "ratchets": packed_ratchets
-    }
-
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-
-    # Write atomically via temp file
-    temp_path = path + ".tmp"
-    with open(temp_path, "wb") as f:
-        f.write(umsgpack.packb(persisted_data))
-    if os.path.isfile(path):
-        os.unlink(path)
-    os.rename(temp_path, path)
-
-    return {
-        'written': True,
-        'path': path,
-        'ratchet_count': len(ratchet_keys)
-    }
-
-
-def cmd_ratchet_file_read(params):
-    """Read and validate a ratchet file in Python's Destination._reload_ratchets format.
-
-    params:
-        path: str - file path to read
-        verify_public_key: hex - Ed25519 public key (32 bytes) for signature verification
-    returns:
-        valid: bool
-        ratchet_keys: list of hex strings
-        ratchet_count: int
-        signature_valid: bool
-    """
-    path = params['path']
-    verify_key_bytes = hex_to_bytes(params['verify_public_key'])
-
-    from pure25519.ed25519_oop import VerifyingKey
-
-    with open(path, "rb") as f:
-        file_data = f.read()
-
-    # Unpack outer msgpack dict
-    persisted_data = umsgpack.unpackb(file_data)
-
-    if "signature" not in persisted_data or "ratchets" not in persisted_data:
-        return {
-            'valid': False,
-            'ratchet_keys': [],
-            'ratchet_count': 0,
-            'signature_valid': False,
-            'error': 'Missing signature or ratchets key in file'
-        }
-
-    signature = persisted_data["signature"]
-    packed_ratchets = persisted_data["ratchets"]
-
-    # Verify signature (VerifyingKey.verify raises on invalid)
-    vk = VerifyingKey(verify_key_bytes)
-    try:
-        vk.verify(signature, packed_ratchets)
-        signature_valid = True
-    except Exception:
-        signature_valid = False
-
-    # Unpack inner ratchets list
-    ratchet_keys = umsgpack.unpackb(packed_ratchets)
-
-    return {
-        'valid': signature_valid,
-        'ratchet_keys': [bytes_to_hex(k) for k in ratchet_keys],
-        'ratchet_count': len(ratchet_keys),
-        'signature_valid': signature_valid
-    }
-
-
-# Channel operations
-
-def cmd_envelope_pack(params):
-    """Pack a channel envelope.
-
-    Format: [msgtype:2][sequence:2][length:2][data:N]
-    All fields are big-endian.
-    """
-    import struct
-
-    msgtype = int(params['msgtype'])
-    sequence = int(params['sequence'])
-    data = hex_to_bytes(params['data'])
-    length = len(data)
-
-    # Pack header: msgtype (2), sequence (2), length (2)
-    header = struct.pack(">HHH", msgtype, sequence, length)
-    envelope = header + data
-
-    return {
-        'envelope': bytes_to_hex(envelope),
-        'msgtype': msgtype,
-        'sequence': sequence,
-        'length': length
-    }
-
-
-def cmd_envelope_unpack(params):
-    """Unpack a channel envelope.
-
-    Extracts msgtype, sequence, length, and data from envelope bytes.
-    """
-    import struct
-
-    envelope = hex_to_bytes(params['envelope'])
-
-    if len(envelope) < 6:
-        raise ValueError(f"Envelope too short: {len(envelope)} bytes")
-
-    # Unpack header
-    msgtype, sequence, length = struct.unpack(">HHH", envelope[:6])
-    data = envelope[6:]
-
-    return {
-        'msgtype': msgtype,
-        'sequence': sequence,
-        'length': length,
-        'data': bytes_to_hex(data)
-    }
-
-
-def cmd_stream_msg_pack(params):
-    """Pack a StreamDataMessage.
-
-    Python format: [header:2][data:N]
-    Header bits:
-      Bit 15: EOF flag (0x8000)
-      Bit 14: compressed flag (0x4000)
-      Bits 13-0: stream_id (0-16383)
-    """
-    import struct
-
-    stream_id = int(params['stream_id'])
-    data = hex_to_bytes(params.get('data', ''))
-    eof = bool(params.get('eof', False))
-    compressed = bool(params.get('compressed', False))
-
-    # Validate stream_id
-    if stream_id < 0 or stream_id > 0x3FFF:  # 16383
-        raise ValueError(f"stream_id must be 0-16383, got {stream_id}")
-
-    # Build header value
-    header_val = (stream_id & 0x3FFF)
-    if eof:
-        header_val |= 0x8000
-    if compressed:
-        header_val |= 0x4000
-
-    # Pack as big-endian 2-byte header
-    header = struct.pack(">H", header_val)
-    message = header + data
-
-    return {
-        'message': bytes_to_hex(message),
-        'header_val': header_val,
-        'stream_id': stream_id,
-        'eof': eof,
-        'compressed': compressed
-    }
-
-
-def cmd_stream_msg_unpack(params):
-    """Unpack a StreamDataMessage.
-
-    Extracts stream_id, flags, and data from message bytes.
-    """
-    import struct
-
-    message = hex_to_bytes(params['message'])
-
-    if len(message) < 2:
-        raise ValueError(f"Message too short: {len(message)} bytes")
-
-    # Unpack header
-    header_val = struct.unpack(">H", message[:2])[0]
-
-    # Extract fields
-    stream_id = header_val & 0x3FFF
-    eof = (header_val & 0x8000) != 0
-    compressed = (header_val & 0x4000) != 0
-    data = message[2:]
-
-    return {
-        'stream_id': stream_id,
-        'eof': eof,
-        'compressed': compressed,
-        'data': bytes_to_hex(data),
-        'header_val': header_val
-    }
-
-
-# Link request/response operations
-
-def cmd_link_rtt_pack(params):
-    """Pack RTT value for link using umsgpack.
-
-    Format: umsgpack.packb(rtt_float)
-    """
-    rtt = float(params['rtt'])
-    packed = umsgpack.packb(rtt)
-
-    return {
-        'packed': bytes_to_hex(packed)
-    }
-
-
-def cmd_link_rtt_unpack(params):
-    """Unpack RTT value from msgpack bytes."""
-    packed = hex_to_bytes(params['packed'])
-    rtt = umsgpack.unpackb(packed)
-
-    return {
-        'rtt': rtt
-    }
-
-
-def cmd_link_request_pack(params):
-    """Pack link request data.
-
-    Format: [timestamp, path_hash, data]
-    - timestamp: float (time.time())
-    - path_hash: bytes (16 bytes, truncated hash of path)
-    - data: any (request payload)
-    """
-    timestamp = float(params['timestamp'])
-    path_hash = hex_to_bytes(params['path_hash'])
-
-    # data can be None, bytes, or other types
-    if 'data' in params and params['data'] is not None:
-        if isinstance(params['data'], str):
-            # Assume hex-encoded bytes
-            data = hex_to_bytes(params['data'])
-        else:
-            data = params['data']
-    else:
-        data = None
-
-    unpacked_request = [timestamp, path_hash, data]
-    packed = umsgpack.packb(unpacked_request)
-
-    return {
-        'packed': bytes_to_hex(packed)
-    }
-
-
-def cmd_link_request_unpack(params):
-    """Unpack link request data.
-
-    Returns timestamp, path_hash, and data.
-    """
-    packed = hex_to_bytes(params['packed'])
-    unpacked = umsgpack.unpackb(packed)
-
-    timestamp = unpacked[0]
-    path_hash = unpacked[1]
-    data = unpacked[2]
-
-    return {
-        'timestamp': timestamp,
-        'path_hash': bytes_to_hex(path_hash),
-        'data': bytes_to_hex(data) if data is not None and isinstance(data, bytes) else data
-    }
-
-
-def cmd_link_response_pack(params):
-    """Pack link response data.
-
-    Format: [request_id, response_data]
-    - request_id: bytes (16 bytes, truncated hash of request packet)
-    - response_data: any (response payload)
-    """
-    request_id = hex_to_bytes(params['request_id'])
-
-    # response_data can be None, bytes, or other types
-    if 'response_data' in params and params['response_data'] is not None:
-        if isinstance(params['response_data'], str):
-            # Assume hex-encoded bytes
-            response_data = hex_to_bytes(params['response_data'])
-        else:
-            response_data = params['response_data']
-    else:
-        response_data = None
-
-    packed_response = umsgpack.packb([request_id, response_data])
-
-    return {
-        'packed': bytes_to_hex(packed_response)
-    }
-
-
-def cmd_link_response_unpack(params):
-    """Unpack link response data.
-
-    Returns request_id and response_data.
-    """
-    packed = hex_to_bytes(params['packed'])
-    unpacked = umsgpack.unpackb(packed)
-
-    request_id = unpacked[0]
-    response_data = unpacked[1]
-
-    return {
-        'request_id': bytes_to_hex(request_id),
-        'response_data': bytes_to_hex(response_data) if response_data is not None and isinstance(response_data, bytes) else response_data
-    }
-
-
-
-# Transport operations
-
-def cmd_path_entry_serialize(params):
-    """Serialize a path table entry to msgpack format.
-
-    Format: [destination_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    timestamp = float(params['timestamp'])
-    received_from = hex_to_bytes(params['received_from'])
-    hops = int(params['hops'])
-    expires = float(params['expires'])
-    random_blobs = [hex_to_bytes(blob) for blob in params['random_blobs']]
-    interface_hash = hex_to_bytes(params['interface_hash'])
-    packet_hash = hex_to_bytes(params['packet_hash'])
-
-    entry = [
-        destination_hash,
-        timestamp,
-        received_from,
-        hops,
-        expires,
-        random_blobs,
-        interface_hash,
-        packet_hash
-    ]
-
-    serialized = umsgpack.packb(entry)
-
-    return {
-        'serialized': bytes_to_hex(serialized)
-    }
-
-
-def cmd_path_entry_deserialize(params):
-    """Deserialize a path table entry from msgpack format."""
-    serialized = hex_to_bytes(params['serialized'])
-
-    entry = umsgpack.unpackb(serialized)
-
-    return {
-        'destination_hash': bytes_to_hex(entry[0]),
-        'timestamp': entry[1],
-        'received_from': bytes_to_hex(entry[2]),
-        'hops': entry[3],
-        'expires': entry[4],
-        'random_blobs': [bytes_to_hex(blob) for blob in entry[5]],
-        'interface_hash': bytes_to_hex(entry[6]),
-        'packet_hash': bytes_to_hex(entry[7])
-    }
-
-
-def cmd_path_request_pack(params):
-    """Pack path request data.
-
-    Format: [destination_hash:10-16][transport_instance:10-16?][tag:10?]
-    - If transport_enabled: destination_hash + transport_instance + tag
-    - Otherwise: destination_hash + tag
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    transport_instance = hex_to_bytes(params['transport_instance']) if params.get('transport_instance') else None
-    tag = hex_to_bytes(params['tag']) if params.get('tag') else None
-
-    if transport_instance:
-        # Transport enabled: dest + transport + tag
-        data = destination_hash + transport_instance
-        if tag:
-            data += tag
-    else:
-        # Transport disabled: dest + tag
-        data = destination_hash
-        if tag:
-            data += tag
-
-    return {
-        'data': bytes_to_hex(data),
-        'has_transport_instance': transport_instance is not None,
-        'has_tag': tag is not None
-    }
-
-
-def cmd_path_request_unpack(params):
-    """Unpack path request data.
-
-    Extracts destination_hash, and optionally transport_instance and tag.
-    """
-    data = hex_to_bytes(params['data'])
-
-    # Destination hash is first 10-16 bytes (we'll use 16 for truncated hash)
-    destination_hash = data[:16]
-    remaining = data[16:]
-
-    transport_instance = None
-    tag = None
-
-    if len(remaining) >= 16:
-        # Could be transport instance (16 bytes)
-        transport_instance = remaining[:16]
-        remaining = remaining[16:]
-
-        if len(remaining) >= 10:
-            # Remaining could be tag (10 bytes)
-            tag = remaining[:10]
-    elif len(remaining) >= 10:
-        # No transport instance, but has tag
-        tag = remaining[:10]
-
-    result = {
-        'destination_hash': bytes_to_hex(destination_hash)
-    }
-
-    if transport_instance:
-        result['transport_instance'] = bytes_to_hex(transport_instance)
-    if tag:
-        result['tag'] = bytes_to_hex(tag)
-
-    return result
-
-
-def cmd_packet_hashlist_pack(params):
-    """Pack a list of packet hashes for storage.
-
-    Uses umsgpack to serialize a list of hashes.
-    """
-    hashes = [hex_to_bytes(h) for h in params['hashes']]
-
-    serialized = umsgpack.packb(hashes)
-
-    return {
-        'serialized': bytes_to_hex(serialized),
-        'count': len(hashes)
-    }
-
-
-def cmd_packet_hashlist_unpack(params):
-    """Unpack a list of packet hashes from storage."""
-    serialized = hex_to_bytes(params['serialized'])
-
-    hashes = umsgpack.unpackb(serialized)
-
-    return {
-        'hashes': [bytes_to_hex(h) for h in hashes],
-        'count': len(hashes)
-    }
-
-
-# Resource operations
-
-def cmd_resource_adv_pack(params):
-    """Pack a ResourceAdvertisement to msgpack bytes."""
-    transfer_size = int(params['transfer_size'])
-    data_size = int(params['data_size'])
-    num_parts = int(params['num_parts'])
-    resource_hash = hex_to_bytes(params['resource_hash'])
-    random_hash = hex_to_bytes(params['random_hash'])
-    original_hash = hex_to_bytes(params['original_hash']) if params.get('original_hash') else None
-    segment_index = int(params['segment_index'])
-    total_segments = int(params['total_segments'])
-    request_id = hex_to_bytes(params['request_id']) if params.get('request_id') else None
-    flags = int(params['flags'])
-    hashmap = hex_to_bytes(params.get('hashmap', ''))
-    segment = int(params.get('segment', 0))
-
-    MAPHASH_LEN = 4
-    HASHMAP_MAX_LEN = 56
-
-    hashmap_start = segment * HASHMAP_MAX_LEN
-    hashmap_end = min((segment + 1) * HASHMAP_MAX_LEN, num_parts)
-
-    hashmap_slice = b""
-    for i in range(hashmap_start, hashmap_end):
-        start_byte = i * MAPHASH_LEN
-        end_byte = (i + 1) * MAPHASH_LEN
-        if end_byte <= len(hashmap):
-            hashmap_slice += hashmap[start_byte:end_byte]
-
-    dictionary = {
-        "t": transfer_size,
-        "d": data_size,
-        "n": num_parts,
-        "h": resource_hash,
-        "r": random_hash,
-        "o": original_hash,
-        "i": segment_index,
-        "l": total_segments,
-        "q": request_id,
-        "f": flags,
-        "m": hashmap_slice
-    }
-
-    packed = umsgpack.packb(dictionary)
-
-    return {
-        'packed': bytes_to_hex(packed),
-        'size': len(packed)
-    }
-
-
-def cmd_resource_adv_unpack(params):
-    """Unpack a ResourceAdvertisement from msgpack bytes."""
-    packed = hex_to_bytes(params['packed'])
-    dictionary = umsgpack.unpackb(packed)
-
-    flags = dictionary["f"]
-    encrypted = (flags & 0x01) == 0x01
-    compressed = ((flags >> 1) & 0x01) == 0x01
-    split = ((flags >> 2) & 0x01) == 0x01
-    is_request = ((flags >> 3) & 0x01) == 0x01
-    is_response = ((flags >> 4) & 0x01) == 0x01
-    has_metadata = ((flags >> 5) & 0x01) == 0x01
-
-    return {
-        'transfer_size': dictionary["t"],
-        'data_size': dictionary["d"],
-        'num_parts': dictionary["n"],
-        'resource_hash': bytes_to_hex(dictionary["h"]),
-        'random_hash': bytes_to_hex(dictionary["r"]),
-        'original_hash': bytes_to_hex(dictionary["o"]) if dictionary["o"] is not None else None,
-        'segment_index': dictionary["i"],
-        'total_segments': dictionary["l"],
-        'request_id': bytes_to_hex(dictionary["q"]) if dictionary["q"] is not None else None,
-        'flags': flags,
-        'hashmap': bytes_to_hex(dictionary["m"]),
-        'encrypted': encrypted,
-        'compressed': compressed,
-        'split': split,
-        'is_request': is_request,
-        'is_response': is_response,
-        'has_metadata': has_metadata
-    }
-
-
-def cmd_resource_hash(params):
-    """Compute resource hash from data."""
-    data = hex_to_bytes(params['data'])
-    random_hash = hex_to_bytes(params['random_hash'])
-
-    hash_material = random_hash + data
-    full_hash = hashlib.sha256(hash_material).digest()
-    truncated = full_hash[:16]
-
-    return {
-        'hash': bytes_to_hex(truncated),
-        'full_hash': bytes_to_hex(full_hash)
-    }
-
-
-def cmd_resource_flags(params):
-    """Encode or decode resource flags byte."""
-    mode = params.get('mode', 'encode')
-
-    if mode == 'encode':
-        encrypted = bool(params.get('encrypted', False))
-        compressed = bool(params.get('compressed', False))
-        split = bool(params.get('split', False))
-        is_request = bool(params.get('is_request', False))
-        is_response = bool(params.get('is_response', False))
-        has_metadata = bool(params.get('has_metadata', False))
-
-        flags = 0x00
-        if encrypted: flags |= 0x01
-        if compressed: flags |= 0x02
-        if split: flags |= 0x04
-        if is_request: flags |= 0x08
-        if is_response: flags |= 0x10
-        if has_metadata: flags |= 0x20
-
-        return {
-            'flags': flags
-        }
-    else:
-        flags = int(params['flags'])
-        return {
-            'encrypted': (flags & 0x01) == 0x01,
-            'compressed': ((flags >> 1) & 0x01) == 0x01,
-            'split': ((flags >> 2) & 0x01) == 0x01,
-            'is_request': ((flags >> 3) & 0x01) == 0x01,
-            'is_response': ((flags >> 4) & 0x01) == 0x01,
-            'has_metadata': ((flags >> 5) & 0x01) == 0x01
-        }
-
-
-def cmd_hashmap_pack(params):
-    """Pack a hashmap segment from part hashes."""
-    parts = params.get('parts', [])
-    start_index = int(params.get('start_index', 0))
-    count = int(params.get('count', len(parts)))
-
-    part_data_list = []
-    if isinstance(parts, list):
-        part_data_list = [hex_to_bytes(p) for p in parts]
-    else:
-        part_data_list = [hex_to_bytes(parts)]
-
-    hashmap = b""
-    for i in range(start_index, min(start_index + count, len(part_data_list))):
-        part_data = part_data_list[i]
-        part_hash = hashlib.sha256(part_data).digest()[:4]
-        hashmap += part_hash
-
-    return {
-        'hashmap': bytes_to_hex(hashmap),
-        'num_hashes': (len(hashmap) // 4)
-    }
-
-
-def cmd_resource_map_hash(params):
-    """Compute map hash for a single resource part.
-
-    Map hash = SHA256(part_data + random_hash)[:4]
-    This matches Resource.get_map_hash() in Python RNS.
-    """
-    part_data = hex_to_bytes(params['part_data'])
-    random_hash = hex_to_bytes(params['random_hash'])
-
-    hash_material = part_data + random_hash
-    map_hash = hashlib.sha256(hash_material).digest()[:4]
-
-    return {
-        'map_hash': bytes_to_hex(map_hash)
-    }
-
-
-def cmd_resource_build_hashmap(params):
-    """Build complete hashmap from list of parts.
-
-    Each part hash = SHA256(part_data + random_hash)[:4]
-    Hashmap = concatenation of all part hashes.
-    """
-    parts = params.get('parts', [])
-    random_hash = hex_to_bytes(params['random_hash'])
-
-    part_data_list = [hex_to_bytes(p) for p in parts]
-
-    hashmap = b""
-    for part_data in part_data_list:
-        hash_material = part_data + random_hash
-        map_hash = hashlib.sha256(hash_material).digest()[:4]
-        hashmap += map_hash
-
-    return {
-        'hashmap': bytes_to_hex(hashmap),
-        'num_parts': len(part_data_list)
-    }
-
-
-def cmd_resource_proof(params):
-    """Compute expected proof for resource completion.
-
-    Expected proof = SHA256(uncompressed_data + resource_hash)[:16]
-    This is what the receiver sends to prove successful receipt.
-    """
-    data = hex_to_bytes(params['data'])
-    resource_hash = hex_to_bytes(params['resource_hash'])
-
-    hash_material = data + resource_hash
-    proof = hashlib.sha256(hash_material).digest()[:16]
-
-    return {
-        'proof': bytes_to_hex(proof)
-    }
-
-
-def cmd_resource_find_part(params):
-    """Find part index in hashmap by its map hash.
-
-    Searches hashmap for matching 4-byte hash and returns index.
-    Returns index=-1 and found=False if not found.
-    """
-    hashmap = hex_to_bytes(params['hashmap'])
-    map_hash = hex_to_bytes(params['map_hash'])
-
-    if len(map_hash) != 4:
-        return {'index': -1, 'found': False, 'error': 'map_hash must be 4 bytes'}
-
-    for i in range(0, len(hashmap), 4):
-        if hashmap[i:i+4] == map_hash:
-            return {'index': i // 4, 'found': True}
-
-    return {'index': -1, 'found': False}
-
-
-# IFAC (Interface Access Code) operations
-IFAC_SALT = bytes.fromhex("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
-
-
-def cmd_ifac_derive_key(params):
-    """Derive IFAC key from network name/passphrase.
-
-    Uses HKDF with IFAC_SALT to derive a 64-byte key.
-    """
-    ifac_origin = hex_to_bytes(params['ifac_origin'])
-
-    # Derive 64-byte key using HKDF (matches RNS interface authentication)
-    ifac_key = HKDF.hkdf(length=64, derive_from=ifac_origin, salt=IFAC_SALT, context=None)
-
-    return {
-        'ifac_key': bytes_to_hex(ifac_key),
-        'ifac_salt': bytes_to_hex(IFAC_SALT)
-    }
-
-
-def cmd_ifac_compute(params):
-    """Compute IFAC tag for a packet.
-
-    IFAC = last N bytes of Ed25519 signature of packet data.
-    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    packet_data = hex_to_bytes(params['packet_data'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # Ed25519 signing key is the second half (bytes 32-63)
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-
-    # Sign the packet data
-    signature = sk.sign(packet_data)
-
-    # IFAC is the last ifac_size bytes of the signature
-    ifac = signature[-ifac_size:]
-
-    return {
-        'ifac': bytes_to_hex(ifac),
-        'signature': bytes_to_hex(signature)
-    }
-
-
-def cmd_ifac_verify(params):
-    """Verify IFAC tag matches expected.
-
-    Recomputes IFAC and compares.
-    The 64-byte ifac_key contains: bytes 0-31 = X25519 key, bytes 32-63 = Ed25519 signing key
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    packet_data = hex_to_bytes(params['packet_data'])
-    expected_ifac = hex_to_bytes(params['expected_ifac'])
-    ifac_size = len(expected_ifac)
-
-    # Ed25519 signing key is the second half (bytes 32-63)
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-
-    # Sign the packet data
-    signature = sk.sign(packet_data)
-
-    # IFAC is the last ifac_size bytes of the signature
-    computed_ifac = signature[-ifac_size:]
-
-    return {
-        'valid': computed_ifac == expected_ifac,
-        'computed_ifac': bytes_to_hex(computed_ifac)
-    }
-
-
-def cmd_ifac_mask_packet(params):
-    """Apply IFAC masking to a raw packet.
-
-    Performs the full IFAC transmit transform:
-    1. Compute IFAC tag (Ed25519 sign, take last ifac_size bytes)
-    2. Set IFAC flag (0x80) on header byte 0
-    3. Insert IFAC after 2-byte header
-    4. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
-    5. Apply mask: header bytes and payload masked, IFAC bytes NOT masked
-
-    Returns the masked wire-format packet.
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    raw = hex_to_bytes(params['packet_data'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # 1. Compute IFAC
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-    signature = sk.sign(raw)
-    ifac = signature[-ifac_size:]
-
-    # 2-3. Set flag and insert IFAC
-    new_header = bytes([raw[0] | 0x80, raw[1]])
-    new_raw = new_header + ifac + raw[2:]
-
-    # 4. Generate mask
-    mask = HKDF.hkdf(
-        length=len(new_raw),
-        derive_from=ifac,
-        salt=ifac_key,
-        context=None,
-    )
-
-    # 5. Apply mask
-    masked_raw = b""
-    for i, byte in enumerate(new_raw):
-        if i == 0:
-            masked_raw += bytes([byte ^ mask[i] | 0x80])
-        elif i == 1 or i > ifac_size + 1:
-            masked_raw += bytes([byte ^ mask[i]])
-        else:
-            masked_raw += bytes([byte])
-
-    return {
-        'masked_packet': bytes_to_hex(masked_raw),
-        'ifac': bytes_to_hex(ifac),
-    }
-
-
-def cmd_ifac_unmask_packet(params):
-    """Unmask and validate an IFAC-protected packet.
-
-    Performs the full IFAC receive transform:
-    1. Check IFAC flag (0x80) is set
-    2. Extract IFAC from bytes [2:2+ifac_size]
-    3. Generate XOR mask via HKDF(derive_from=ifac, salt=ifac_key)
-    4. Unmask header bytes and payload (not IFAC itself)
-    5. Clear IFAC flag, remove IFAC bytes
-    6. Recompute expected IFAC and validate
-
-    Returns the original unmasked packet (or invalid=true).
-    """
-    from pure25519.ed25519_oop import SigningKey
-
-    ifac_key = hex_to_bytes(params['ifac_key'])
-    masked = hex_to_bytes(params['masked_packet'])
-    ifac_size = int(params.get('ifac_size', 16))
-
-    # 1. Check flag
-    if masked[0] & 0x80 != 0x80:
-        return {'valid': False, 'error': 'ifac_flag_not_set'}
-
-    if len(masked) <= 2 + ifac_size:
-        return {'valid': False, 'error': 'packet_too_short'}
-
-    # 2. Extract IFAC (not masked)
-    ifac = masked[2:2 + ifac_size]
-
-    # 3. Generate mask
-    mask = HKDF.hkdf(
-        length=len(masked),
-        derive_from=ifac,
-        salt=ifac_key,
-        context=None,
-    )
-
-    # 4. Unmask
-    unmasked = b""
-    for i, byte in enumerate(masked):
-        if i <= 1 or i > ifac_size + 1:
-            unmasked += bytes([byte ^ mask[i]])
-        else:
-            unmasked += bytes([byte])
-
-    # 5. Clear flag and remove IFAC
-    new_raw = bytes([unmasked[0] & 0x7f, unmasked[1]]) + unmasked[2 + ifac_size:]
-
-    # 6. Validate
-    ed25519_key = ifac_key[32:]
-    sk = SigningKey(ed25519_key)
-    expected_ifac = sk.sign(new_raw)[-ifac_size:]
-
-    valid = ifac == expected_ifac
-
+    RNS = _ensure_minimal_rns()
+    raw = hex_to_bytes(params['raw'])
+    packet = RNS.Packet(None, None)
+    packet.raw = raw
+    if not packet.unpack():
+        return {'valid': False, 'error': 'unpack_failed'}
+    if packet.packet_type != RNS.Packet.ANNOUNCE:
+        return {'valid': False, 'error': 'not_an_announce'}
+
+    valid = bool(RNS.Identity.validate_announce(packet))
     result = {
         'valid': valid,
-        'ifac': bytes_to_hex(ifac),
+        'destination_hash': bytes_to_hex(packet.destination_hash),
+        'has_ratchet': packet.context_flag == RNS.Packet.FLAG_SET,
     }
-    if valid:
-        result['packet_data'] = bytes_to_hex(new_raw)
+    if result['has_ratchet']:
+        keysize = RNS.Identity.KEYSIZE // 8
+        name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+        ratchet_size = RNS.Identity.RATCHETSIZE // 8
+        ratchet_off = keysize + name_hash_len + 10
+        result['ratchet'] = bytes_to_hex(packet.data[ratchet_off:ratchet_off + ratchet_size])
     return result
+
+
+# Ratchet operations
+
+def cmd_ratchet_id(params):
+    """Compute the 10-byte ratchet ID for a ratchet public key.
+
+    Delegates to real RNS — the ratchet ID is
+    RNS.Identity.full_hash(public)[:NAME_HASH_LENGTH//8], exactly what
+    Identity._get_ratchet_id computes internally. Nothing here hardcodes
+    the truncation length; it is read off the RNS constant.
+    """
+    RNS = _get_full_rns()
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    rid = RNS.Identity.full_hash(ratchet_public)[: RNS.Identity.NAME_HASH_LENGTH // 8]
+    return {'ratchet_id': bytes_to_hex(rid)}
+
+
+def cmd_ratchet_public_from_private(params):
+    """Derive public key from ratchet private key."""
+    ratchet_private = hex_to_bytes(params['ratchet_private'])
+
+    # Create X25519 key pair from private key
+    ratchet_prv = X25519.X25519PrivateKey.from_private_bytes(ratchet_private)
+    ratchet_pub = ratchet_prv.public_key()
+    ratchet_pub_bytes = ratchet_pub.public_bytes()
+
+    return {
+        'ratchet_public': bytes_to_hex(ratchet_pub_bytes)
+    }
+
+
+def cmd_ratchet_encrypt(params):
+    """Encrypt plaintext for an Identity, using a ratchet public key.
+
+    Delegates to real RNS.Identity.encrypt(plaintext, ratchet=ratchet_public).
+    RNS performs the ECDH-with-ratchet, HKDF (salt = identity's own hash),
+    and Token encryption itself; the previous hand-rolled path took an
+    injected identity_hash as the salt and reassembled iv+ciphertext+hmac
+    by hand. Non-deterministic (fresh ephemeral key + IV per call) — tests
+    must round-trip through ratchet_decrypt.
+    """
+    RNS = _get_full_rns()
+    public_key = hex_to_bytes(params['public_key'])
+    ratchet_public = hex_to_bytes(params['ratchet_public'])
+    plaintext = hex_to_bytes(params['plaintext'])
+    identity = RNS.Identity(create_keys=False)
+    identity.load_public_key(public_key)
+    return {
+        'ciphertext': bytes_to_hex(identity.encrypt(plaintext, ratchet=ratchet_public))
+    }
+
+
+def cmd_ratchet_decrypt(params):
+    """Decrypt a ratchet-encrypted ciphertext with the Identity's private key,
+    trialling one OR MORE candidate ratchet private keys.
+
+    Delegates to real RNS.Identity.decrypt. The multi-ratchet trial loop
+    (Identity.py:882-895) iterates the supplied ratchet list IN ORDER, first
+    success wins, swallowing per-ratchet failures; and on success it writes the
+    winning ratchet id onto the caller-supplied `ratchet_id_receiver`. We expose
+    that by passing a tiny receiver object straight through and surfacing its
+    `latest_ratchet_id` field — RNS computes the id (via Identity._get_ratchet_id),
+    we only read it back.
+
+    Params:
+      private_key (hex)             — 64-byte Identity private key.
+      ciphertext (hex)              — the ratchet-encrypted token.
+      ratchet_privates (list[hex])  — ordered trial list (preferred).
+      ratchet_private (hex)         — single-key back-compat shorthand.
+      enforce_ratchets (bool)       — if true, fall-back to the static X25519
+                                      key is forbidden (Identity returns None
+                                      when no ratchet matches).
+    """
+    RNS = _get_full_rns()
+    private_key = hex_to_bytes(params['private_key'])
+    ciphertext = hex_to_bytes(params['ciphertext'])
+    enforce = bool(params.get('enforce_ratchets', False))
+
+    if params.get('ratchet_privates') is not None:
+        ratchets = [hex_to_bytes(r) for r in params['ratchet_privates']]
+    elif params.get('ratchet_private') is not None:
+        ratchets = [hex_to_bytes(params['ratchet_private'])]
+    else:
+        ratchets = None
+
+    identity = RNS.Identity.from_bytes(private_key)
+    if identity is None:
+        raise ValueError("RNS.Identity.from_bytes rejected the private key")
+
+    class _RatchetIdReceiver:
+        latest_ratchet_id = None
+
+    receiver = _RatchetIdReceiver()
+    plaintext = identity.decrypt(
+        ciphertext,
+        ratchets=ratchets,
+        enforce_ratchets=enforce,
+        ratchet_id_receiver=receiver,
+    )
+    return {
+        'plaintext': bytes_to_hex(plaintext) if plaintext is not None else None,
+        'latest_ratchet_id': bytes_to_hex(receiver.latest_ratchet_id)
+                             if receiver.latest_ratchet_id is not None else None,
+    }
+
+
+def cmd_identity_remember(params):
+    """Plant a known destination via real RNS.Identity.remember, surfacing the
+    KEYSIZE//8 (64-byte) public-key length gate (Identity.py:101-102).
+
+    Delegates entirely to RNS.Identity.remember — RNS itself raises TypeError
+    when len(public_key) != Identity.KEYSIZE//8. We do not pre-check the length;
+    we let RNS enforce it and report whether it accepted the key.
+
+    Params: packet_hash(hex), destination_hash(hex), public_key(hex),
+            app_data(hex|null).
+    """
+    RNS = _get_full_rns()
+    packet_hash = hex_to_bytes(params['packet_hash'])
+    destination_hash = hex_to_bytes(params['destination_hash'])
+    public_key = hex_to_bytes(params['public_key'])
+    app_data = hex_to_bytes(params['app_data']) if params.get('app_data') else None
+    try:
+        RNS.Identity.remember(packet_hash, destination_hash, public_key, app_data)
+    except TypeError as e:
+        return {'ok': False, 'error': 'TypeError', 'public_key_len': len(public_key)}
+    # Confirm the plant took by recalling through real RNS (_no_use avoids
+    # touching a running Reticulum instance's usage bookkeeping).
+    recalled = RNS.Identity.recall(destination_hash, _no_use=True)
+    return {
+        'ok': True,
+        'public_key_len': len(public_key),
+        'recalled': recalled is not None,
+    }
+
+
+def cmd_identity_keyless_op(params):
+    """Drive a crypto op on an Identity that holds NO key, pinning the KeyError
+    path (Identity.decrypt:921 / sign:939 / encrypt:852).
+
+    Delegates to real RNS: builds RNS.Identity(create_keys=False) and loads no
+    key, then invokes the requested op so RNS itself decides to raise. We report
+    the raised exception type rather than fabricating a result.
+
+    Params: op ('decrypt'|'sign'|'encrypt'), data(hex).
+    """
+    RNS = _get_full_rns()
+    op = params['op']
+    data = hex_to_bytes(params['data'])
+    identity = RNS.Identity(create_keys=False)
+    try:
+        if op == 'decrypt':
+            result = identity.decrypt(data)
+        elif op == 'sign':
+            result = identity.sign(data)
+        elif op == 'encrypt':
+            result = identity.encrypt(data)
+        else:
+            raise ValueError(f"unknown op {op!r}")
+    except KeyError as e:
+        return {'raised': 'KeyError', 'message': str(e)}
+    return {'raised': None, 'result': bytes_to_hex(result) if result is not None else None}
+
 
 
 # Compression operations
@@ -2858,269 +1415,407 @@ def cmd_bz2_decompress(params):
     }
 
 
-# LXMF operations
+# ============================================================================
+# Interface framing (HDLC / KISS deframing)
+# ============================================================================
+# These commands reverse the on-the-wire framing RNS applies in its serial /
+# TCP interfaces, so a conformance test can frame a payload with RNS's own
+# escaping and confirm an implementation recovers the exact original bytes.
+# Both use the real RNS framing classes for their constants and the documented
+# inverse of RNS's own send-side escape — there is no separate "deframe" entry
+# point in RNS (the receive logic is inlined in each interface's read loop), so
+# the un-stuffing here mirrors the exact byte-replacements those loops perform
+# (e.g. TCPInterface.py:389-391).
 
-def cmd_lxmf_pack(params):
-    """Pack LXMF message from components.
 
-    Follows LXMessage.pack() logic but works with raw hashes instead of Destination objects.
-    Hash is computed WITHOUT stamp, then stamp can be added to payload separately.
+def cmd_hdlc_deframe(params):
+    """Strip HDLC framing and reverse byte-stuffing from a framed payload.
+
+    Reverses RNS's HDLC framing (the framing TCPInterface uses:
+    FLAG + HDLC.escape(data) + FLAG). Extracts the bytes between the first two
+    FLAG (0x7E) delimiters, then undoes the byte-stuffing with the exact two
+    replacements RNS's TCP read loop performs (TCPInterface.py:389-391):
+    ESC+(FLAG^0x20) -> FLAG, then ESC+(ESC^0x20) -> ESC. Constants are read
+    off the real RNS.Interfaces.TCPInterface.HDLC class, so a change to FLAG /
+    ESC / ESC_MASK upstream is tracked rather than hardcoded.
     """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    source_hash = hex_to_bytes(params['source_hash'])
-    timestamp = float(params['timestamp'])
-    title = params.get('title', '')
-    content = params.get('content', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int (JSON only supports string keys)
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Encode title and content as bytes
-    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
-    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
-
-    # Build payload: [timestamp, title, content, fields]
-    payload = [timestamp, title_bytes, content_bytes, fields]
-    packed_payload = umsgpack.packb(payload)
-
-    # Compute hash: SHA256(dest_hash + source_hash + packed_payload)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    # Signed part: hashed_part + hash
-    signed_part = hashed_part + message_hash
-
-    return {
-        'packed_payload': bytes_to_hex(packed_payload),
-        'hashed_part': bytes_to_hex(hashed_part),
-        'message_hash': bytes_to_hex(message_hash),
-        'signed_part': bytes_to_hex(signed_part)
-    }
+    RNS = _get_full_rns()
+    from RNS.Interfaces.TCPInterface import HDLC
+    framed = hex_to_bytes(params['framed'])
+    start = framed.find(HDLC.FLAG)
+    if start == -1:
+        raise ValueError("no HDLC FLAG (0x7E) delimiter found in framed input")
+    end = framed.find(HDLC.FLAG, start + 1)
+    if end == -1:
+        raise ValueError("unterminated HDLC frame: only one FLAG delimiter")
+    frame = framed[start + 1:end]
+    frame = frame.replace(
+        bytes([HDLC.ESC, HDLC.FLAG ^ HDLC.ESC_MASK]), bytes([HDLC.FLAG])
+    )
+    frame = frame.replace(
+        bytes([HDLC.ESC, HDLC.ESC ^ HDLC.ESC_MASK]), bytes([HDLC.ESC])
+    )
+    return {'data': bytes_to_hex(frame)}
 
 
-def cmd_lxmf_unpack(params):
-    """Unpack LXMF message bytes to components.
+def cmd_kiss_deframe(params):
+    """Strip KISS framing and reverse the TFEND/TFESC transpose.
 
-    Follows LXMessage.unpack_from_bytes() logic.
-    Extracts stamp from payload if present, recomputes hash without stamp.
+    Reverses RNS's KISS framing (the framing KISSInterface uses:
+    FEND + CMD_DATA + KISS.escape(data) + FEND). Extracts the bytes between
+    the first two FEND (0xC0) delimiters, verifies the leading command byte is
+    CMD_DATA (0x00), then undoes the transpose with the inverse of RNS's
+    send-side escape: FESC+TFEND -> FEND, then FESC+TFESC -> FESC. Constants
+    are read off the real RNS.Interfaces.KISSInterface.KISS class.
     """
-    lxmf_bytes = hex_to_bytes(params['lxmf_bytes'])
-
-    DEST_LEN = 16  # LXMessage.DESTINATION_LENGTH
-    SIG_LEN = 64   # LXMessage.SIGNATURE_LENGTH
-
-    destination_hash = lxmf_bytes[:DEST_LEN]
-    source_hash = lxmf_bytes[DEST_LEN:2*DEST_LEN]
-    signature = lxmf_bytes[2*DEST_LEN:2*DEST_LEN+SIG_LEN]
-    packed_payload = lxmf_bytes[2*DEST_LEN+SIG_LEN:]
-
-    unpacked_payload = umsgpack.unpackb(packed_payload)
-
-    # Extract stamp if present (5th element)
-    stamp = None
-    if len(unpacked_payload) > 4:
-        stamp = unpacked_payload[4]
-        unpacked_payload = unpacked_payload[:4]
-        # Repack without stamp for hash computation
-        packed_payload = umsgpack.packb(unpacked_payload)
-
-    # Compute hash (always without stamp)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    # Decode title/content
-    title_bytes = unpacked_payload[1]
-    content_bytes = unpacked_payload[2]
-    title = title_bytes.decode('utf-8') if isinstance(title_bytes, bytes) else title_bytes
-    content = content_bytes.decode('utf-8') if isinstance(content_bytes, bytes) else content_bytes
-
-    return {
-        'destination_hash': bytes_to_hex(destination_hash),
-        'source_hash': bytes_to_hex(source_hash),
-        'signature': bytes_to_hex(signature),
-        'timestamp': unpacked_payload[0],
-        'title': title,
-        'content': content,
-        'fields': unpacked_payload[3],
-        'stamp': bytes_to_hex(stamp) if stamp else None,
-        'message_hash': bytes_to_hex(message_hash)
-    }
-
-
-def serialize_field_value(value):
-    """Recursively serialize field values for JSON transport.
-
-    Binary data is hex-encoded with type annotation.
-    Lists/tuples are recursively serialized.
-    """
-    if isinstance(value, bytes):
-        return {'type': 'bytes', 'hex': value.hex()}
-    elif isinstance(value, (list, tuple)):
-        return {'type': 'list', 'items': [serialize_field_value(v) for v in value]}
-    elif isinstance(value, dict):
-        return {'type': 'dict', 'items': {str(k): serialize_field_value(v) for k, v in value.items()}}
-    elif isinstance(value, int):
-        return {'type': 'int', 'value': value}
-    elif isinstance(value, float):
-        return {'type': 'float', 'value': value}
-    elif isinstance(value, str):
-        return {'type': 'str', 'value': value}
-    else:
-        return {'type': type(value).__name__, 'value': str(value)}
-
-
-def cmd_lxmf_unpack_with_fields(params):
-    """Unpack LXMF message with deep field serialization.
-
-    Like lxmf_unpack but returns fields_hex with all nested binary data hex-encoded.
-    Replaces 'fields' with 'fields_hex' to ensure JSON serializability.
-    """
-    result = cmd_lxmf_unpack(params)
-
-    # Serialize all field values for JSON transport
-    fields = result.get('fields', {})
-    fields_hex = {}
-    if fields:
-        for key, value in fields.items():
-            fields_hex[str(key)] = serialize_field_value(value)
-
-    # Replace fields with serialized version for JSON transport
-    result['fields_hex'] = fields_hex
-    del result['fields']  # Remove raw fields to avoid JSON serialization issues
-    return result
-
-
-def cmd_lxmf_hash(params):
-    """Compute LXMF message hash from components.
-
-    Hash = SHA256(destination_hash + source_hash + packed_payload)
-    This is the message_id used for stamp generation.
-    """
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    source_hash = hex_to_bytes(params['source_hash'])
-    timestamp = float(params['timestamp'])
-    title = params.get('title', '')
-    content = params.get('content', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Encode title and content
-    title_bytes = title.encode('utf-8') if isinstance(title, str) else title
-    content_bytes = content.encode('utf-8') if isinstance(content, str) else content
-
-    # Build payload and hash
-    payload = [timestamp, title_bytes, content_bytes, fields]
-    packed_payload = umsgpack.packb(payload)
-    hashed_part = destination_hash + source_hash + packed_payload
-    message_hash = hashlib.sha256(hashed_part).digest()
-
-    return {
-        'message_hash': bytes_to_hex(message_hash)
-    }
-
-
-def cmd_lxmf_stamp_workblock(params):
-    """Generate stamp workblock from message ID.
-
-    Uses LXStamper.stamp_workblock() for exact Python compatibility.
-    Default expand_rounds=3000 for standard LXMF stamps.
-    """
-    message_id = hex_to_bytes(params['message_id'])
-    expand_rounds = int(params.get('expand_rounds', 3000))
-
-    workblock = LXStamper.stamp_workblock(message_id, expand_rounds=expand_rounds)
-
-    return {
-        'workblock': bytes_to_hex(workblock),
-        'size': len(workblock)
-    }
-
-
-def cmd_lxmf_stamp_valid(params):
-    """Validate stamp against target cost and workblock.
-
-    Uses LXStamper.stamp_valid() and stamp_value() for exact Python compatibility.
-    """
-    stamp = hex_to_bytes(params['stamp'])
-    target_cost = int(params['target_cost'])
-    workblock = hex_to_bytes(params['workblock'])
-
-    valid = LXStamper.stamp_valid(stamp, target_cost, workblock)
-    value = LXStamper.stamp_value(workblock, stamp) if valid else 0
-
-    return {
-        'valid': valid,
-        'value': value
-    }
-
-
-def cmd_lxmf_stamp_generate(params):
-    """Generate stamp meeting target cost.
-
-    Uses LXStamper.generate_stamp() for exact Python compatibility.
-    WARNING: Can be slow for high costs. Use expand_rounds=25 for quick tests.
-    """
-    message_id = hex_to_bytes(params['message_id'])
-    stamp_cost = int(params['stamp_cost'])
-    expand_rounds = int(params.get('expand_rounds', 3000))
-
-    stamp, value = LXStamper.generate_stamp(message_id, stamp_cost, expand_rounds=expand_rounds)
-
-    return {
-        'stamp': bytes_to_hex(stamp) if stamp else None,
-        'value': value
-    }
+    RNS = _get_full_rns()
+    from RNS.Interfaces.KISSInterface import KISS
+    framed = hex_to_bytes(params['framed'])
+    start = framed.find(KISS.FEND)
+    if start == -1:
+        raise ValueError("no KISS FEND (0xC0) delimiter found in framed input")
+    end = framed.find(KISS.FEND, start + 1)
+    if end == -1:
+        raise ValueError("unterminated KISS frame: only one FEND delimiter")
+    inner = framed[start + 1:end]
+    if len(inner) < 1:
+        raise ValueError("empty KISS frame: no command byte")
+    command = inner[0]
+    if command != KISS.CMD_DATA:
+        raise ValueError(
+            f"unexpected KISS command byte {command:#04x}, expected "
+            f"CMD_DATA ({KISS.CMD_DATA:#04x})"
+        )
+    payload = inner[1:]
+    payload = payload.replace(
+        bytes([KISS.FESC, KISS.TFEND]), bytes([KISS.FEND])
+    )
+    payload = payload.replace(
+        bytes([KISS.FESC, KISS.TFESC]), bytes([KISS.FESC])
+    )
+    return {'data': bytes_to_hex(payload)}
 
 
 # ============================================================================
-# Live Reticulum/LXMF Networking Commands
+# Interface framing/deframing driven through the REAL RNS interface read/write
+# loops (not a bridge re-implementation).
+#
+# RNS does not expose its on-wire framing as standalone callables — the TX
+# framing is inline in TCPClientInterface.process_outgoing (TCPInterface.py:
+# 312-329) and the RX de-framing is inline in TCPClientInterface.read_loop
+# (TCPInterface.py:337-398). Rather than mirror those byte-replacements in the
+# bridge (which would be HANDROLLED), the two helpers below DRIVE the real RNS
+# methods directly: they build a minimal stand-in object carrying exactly the
+# attributes each method reads, hand it a capture/feed socket, and let RNS
+# produce/parse every protocol byte. The bridge assembles no wire bytes itself,
+# so these commands are honest live delegation to the implementation under test.
+
+
+def _capture_interface_tx(kiss_framing, data):
+    """Frame `data` exactly as RNS's TCPClientInterface.process_outgoing does.
+
+    Calls the real (unbound) RNS transmit method with a stand-in whose socket
+    captures the framed bytes RNS hands to sendall. All FLAG/FEND delimiting and
+    byte-stuffing is RNS's (TCPInterface.py:312-329); the bridge only reads back
+    what RNS produced."""
+    _get_full_rns()
+    from RNS.Interfaces.TCPInterface import TCPClientInterface
+    import types
+
+    class _CaptureSocket:
+        def __init__(self):
+            self.frames = []
+
+        def sendall(self, payload):
+            self.frames.append(payload)
+
+    sock = _CaptureSocket()
+    stand_in = types.SimpleNamespace(
+        online=True, detached=False, writing=False,
+        kiss_framing=kiss_framing, socket=sock, txb=0, parent_interface=None,
+    )
+    TCPClientInterface.process_outgoing(stand_in, data)
+    if not sock.frames:
+        raise RuntimeError("RNS process_outgoing produced no framed output")
+    return sock.frames[0]
+
+
+def _drive_interface_rx(kiss_framing, stream, hw_mtu):
+    """Run RNS's real TCPClientInterface.read_loop over `stream`, returning the
+    list of frames it delivers to process_incoming.
+
+    The entire de-framing — FLAG/FEND scan, byte-stuffing reversal, the
+    `len(frame) > HEADER_MINSIZE` runt drop, shared-FLAG buffer retention, KISS
+    port-nibble strip and non-CMD_DATA ignore (TCPInterface.py:337-398) — is run
+    by RNS. The bridge supplies only a feed socket (yields the stream once, then
+    an empty read to end the loop) and a capturing process_incoming; it parses
+    no protocol bytes itself."""
+    _get_full_rns()
+    from RNS.Interfaces.TCPInterface import TCPClientInterface
+    import types
+
+    delivered = []
+
+    class _FeedSocket:
+        def __init__(self, chunk):
+            self.pending = [chunk]
+
+        def recv(self, _n):
+            if self.pending:
+                return self.pending.pop(0)
+            return b""
+
+    stand_in = types.SimpleNamespace(
+        online=True, detached=False, initiator=False,
+        kiss_framing=kiss_framing, socket=_FeedSocket(stream), HW_MTU=hw_mtu,
+    )
+    stand_in.process_incoming = lambda frame: delivered.append(frame)
+    stand_in.teardown = lambda: None
+    TCPClientInterface.read_loop(stand_in)
+    return delivered
+
+
+def cmd_hdlc_frame(params):
+    """Frame a payload with RNS's HDLC transmit framing (FLAG + escape + FLAG).
+
+    Delegates to TCPClientInterface.process_outgoing (kiss_framing=False) and
+    returns the captured wire bytes, so tests can pin the FLAG-delimited output
+    and the ESC-before-FLAG escape order byte-for-byte."""
+    data = hex_to_bytes(params['data'])
+    return {'framed': bytes_to_hex(_capture_interface_tx(False, data))}
+
+
+def cmd_kiss_frame(params):
+    """Frame a payload with RNS's KISS transmit framing (FEND + CMD_DATA +
+    escape + FEND), via TCPClientInterface.process_outgoing (kiss_framing=True)."""
+    data = hex_to_bytes(params['data'])
+    return {'framed': bytes_to_hex(_capture_interface_tx(True, data))}
+
+
+def cmd_hdlc_deframe_stream(params):
+    """Deframe a TCP/HDLC byte stream through RNS's real read loop.
+
+    Returns every frame RNS delivers. Exercises the runt-drop rule
+    (frames <= RNS.Reticulum.HEADER_MINSIZE == 19 bytes are silently dropped),
+    multi-frame extraction and shared-FLAG buffer retention from one stream."""
+    _get_full_rns()
+    stream = hex_to_bytes(params['stream'])
+    hw_mtu = int(params.get('hw_mtu', 262144))
+    frames = _drive_interface_rx(False, stream, hw_mtu)
+    return {'frames': [bytes_to_hex(f) for f in frames]}
+
+
+def cmd_kiss_deframe_stream(params):
+    """Deframe a TCP/KISS byte stream through RNS's real read loop.
+
+    Mirrors the TCPInterface kiss_framing path: the leading byte's port nibble
+    is stripped (command = byte & 0x0F, so 0x10/0x20 with low nibble 0 are
+    accepted as CMD_DATA) and frames whose command != CMD_DATA are silently
+    ignored (no frame delivered)."""
+    _get_full_rns()
+    stream = hex_to_bytes(params['stream'])
+    hw_mtu = int(params.get('hw_mtu', 262144))
+    frames = _drive_interface_rx(True, stream, hw_mtu)
+    return {'frames': [bytes_to_hex(f) for f in frames]}
+
+
+def cmd_auto_discovery_token(params):
+    """Compute AutoInterface's peer-authentication token for a source address.
+
+    Delegates to RNS.Identity.full_hash exactly as AutoInterface.discovery_handler
+    does (AutoInterface.py:365): full_hash(group_id + ipv6_src.encode('utf-8')).
+    The bridge performs no hashing itself."""
+    RNS = _get_full_rns()
+    group_id = hex_to_bytes(params['group_id'])
+    addr = params['link_local_addr']
+    token = RNS.Identity.full_hash(group_id + addr.encode("utf-8"))
+    return {'token': bytes_to_hex(token)}
+
+
+# Interface classes that fix HW_MTU at class scope (readable without opening a
+# device). The serial-family interfaces (UDP/Pipe/Serial/KISS/RNode) set
+# self.HW_MTU per-instance inside __init__ and cannot be read this way.
+_CLASS_HW_MTU_INTERFACES = {
+    'TCPInterface': ('RNS.Interfaces.TCPInterface', 'TCPInterface'),
+    'AutoInterface': ('RNS.Interfaces.AutoInterface', 'AutoInterface'),
+    'BackboneInterface': ('RNS.Interfaces.BackboneInterface', 'BackboneInterface'),
+}
+
+
+def cmd_interface_hw_mtu(params):
+    """Read the class-level HW_MTU constant an RNS interface advertises.
+
+    Returns RNS's own declared HW_MTU for the named interface class (read off
+    the live class, not hardcoded in the bridge), letting tests pin the per-type
+    fixed MTUs against the documented spec values."""
+    _get_full_rns()
+    import importlib
+    itype = params['type']
+    if itype not in _CLASS_HW_MTU_INTERFACES:
+        return {'error': f"unsupported interface type {itype!r} "
+                f"(class-level HW_MTU only: {sorted(_CLASS_HW_MTU_INTERFACES)})"}
+    module_name, class_name = _CLASS_HW_MTU_INTERFACES[itype]
+    cls = getattr(importlib.import_module(module_name), class_name)
+    return {'hw_mtu': int(cls.HW_MTU)}
+
+
 # ============================================================================
-# These commands start actual Reticulum instances and LXMF routers for
-# end-to-end interoperability testing. Unlike the crypto-only commands above,
-# these use the full RNS import and manage network state.
+# Live Reticulum Networking Commands
+# ============================================================================
+# These commands start actual Reticulum instances for end-to-end
+# interoperability testing. Unlike the crypto-only commands above, these
+# use the full RNS import and manage network state.
 
 # Global state for live networking
 _rns_instance = None
-_lxmf_router = None
-_lxmf_identity = None
-_lxmf_destination = None
-_received_messages = []
 _rns_module = None  # Cached RNS module
+
+# Serialises the one-shot real `import RNS`. The genuine first load clears the
+# standalone crypto shims (RNS_HMAC, ...) and any half-imported RNS.* before
+# importing RNS cleanly; the lock makes that check-then-import atomic so two
+# threads cannot both decide to wipe+reimport concurrently.
+import threading as _threading
+_rns_import_lock = _threading.Lock()
 
 
 def _get_full_rns():
-    """Import full RNS module for networking.
+    """Return the process-wide real RNS module, importing it once if needed.
 
-    Returns the cached RNS module, or imports it if not already done.
-    IMPORTANT: This clears ALL RNS-related modules and reimports cleanly.
+    Why this is careful about NOT re-importing once RNS is resident:
+
+    This file is loaded under TWO distinct module identities — as ``__main__``
+    (run as a script) and as ``bridge_server`` (``from bridge_server import
+    _get_full_rns`` inside wire_tcp.py and friends). Each identity has its own
+    ``_rns_module`` global, so a naive "wipe sys.modules + import RNS" runs
+    ONCE PER IDENTITY. The second wipe lands AFTER the first identity has
+    already started a live Reticulum (background read_loop / jobloop /
+    watchdog / TCP serve_forever threads). Tearing RNS.Channel / RNS.Buffer out
+    of sys.modules and re-importing them while those threads run their lazy
+    ``from RNS.Channel import ...`` / ``from RNS.Buffer import ...`` races
+    CPython's per-module import lock -> ``_frozen_importlib._DeadlockError`` or
+    ``ImportError: cannot import name 'Channel' from partially initialized
+    module 'RNS.Channel' (circular import)`` — the conformance flake.
+
+    Fix: if a FULLY-initialised RNS is already resident in sys.modules (loaded
+    by the startup pre-warm or by the other module identity), adopt it verbatim
+    — never wipe+reimport a live module tree. The destructive clear only runs
+    on the genuine first load, under the lock, which by construction happens
+    before any Reticulum thread exists.
     """
     global _rns_module
 
     if _rns_module is not None:
         return _rns_module
 
-    import importlib
+    import importlib  # noqa: F401  (kept for parity with historical callers)
     import sys
 
-    # Remove ALL RNS-related modules to get a clean slate
-    # This includes fake modules (RNS_HMAC, etc.) and any partial imports
-    modules_to_remove = [k for k in list(sys.modules.keys())
-                         if k.startswith('RNS') or k.startswith('LXMF')]
-    for mod in modules_to_remove:
-        try:
-            del sys.modules[mod]
-        except KeyError:
-            pass
+    with _rns_import_lock:
+        # Re-check under the lock — another thread may have completed the load.
+        if _rns_module is not None:
+            return _rns_module
 
-    # Import real RNS fresh
-    import RNS
-    _rns_module = RNS
+        # If a real, fully-initialised RNS is already resident (startup
+        # pre-warm, or the other __main__/bridge_server identity loaded it),
+        # adopt it. A fully-initialised RNS has its Channel/Buffer submodules
+        # bound on the package AND present in sys.modules.
+        existing = sys.modules.get('RNS')
+        if (
+            existing is not None
+            and getattr(existing, 'Channel', None) is not None
+            and getattr(existing, 'Buffer', None) is not None
+            and 'RNS.Channel' in sys.modules
+            and 'RNS.Buffer' in sys.modules
+        ):
+            _rns_module = existing
+            return existing
+
+        # Genuine first load (or recovering from a partially-imported RNS):
+        # drop the standalone crypto shims (RNS_HMAC, ...) and the fake
+        # RNS / RNS.Cryptography stub so `import RNS` runs against a clean
+        # slate. Safe here because no Reticulum thread can exist before the
+        # first full import.
+        #
+        # Deliberately does NOT touch LXMF.*. Wiping a (possibly mid-import)
+        # LXMF out of sys.modules races a concurrent `from LXMF import
+        # LXStamper` on a handler/callback thread -> the exact "partially
+        # initialized module" / "No module named 'LXMF'" import race this
+        # clear was introduced to avoid for RNS. LXMF is instead pre-warmed
+        # once in main() (before READY, before any thread), so every later
+        # import just adopts the resident module. LXMF has no bearing on the
+        # crypto-shim swap above, so leaving it resident is always correct.
+        for mod in [
+            k for k in list(sys.modules.keys())
+            if k.startswith('RNS')
+        ]:
+            sys.modules.pop(mod, None)
+
+        import RNS
+        _rns_module = RNS
+        return RNS
+
+
+def _ensure_minimal_rns():
+    """Ensure a real RNS.Reticulum instance exists, creating a minimal,
+    no-interface, no-transport one if none does. Required for any operation
+    that registers a destination — RNS.Destination(__init__) calls
+    Transport.register_destination, which crashes without a Reticulum owner.
+
+    Reuses the live _rns_instance set by cmd_rns_start when present (RNS
+    Reticulum is a process-wide singleton, so a second `Reticulum(...)` call
+    returns the existing one regardless of the configdir passed). For the
+    static announce_* commands that need a destination but no network, a
+    minimal instance with `enable_transport = no` and no interfaces is
+    enough — and is much faster to start than the full cmd_rns_start path.
+    """
+    global _rns_instance
+    RNS = _get_full_rns()
+    if _rns_instance is None:
+        import tempfile
+        cfg = tempfile.mkdtemp(prefix='rns_minimal_')
+        cfg_file = os.path.join(cfg, "config")
+        if not os.path.isfile(cfg_file):
+            os.makedirs(cfg, exist_ok=True)
+            with open(cfg_file, "w") as f:
+                f.write(
+                    "[reticulum]\n"
+                    "enable_transport = no\n"
+                    "share_instance = no\n"
+                    "\n"
+                    "[interfaces]\n"
+                )
+        RNS.loglevel = int(
+            os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL))
+        )
+        _rns_instance = RNS.Reticulum(configdir=cfg)
     return RNS
+
+
+def _ensure_minimal_rns_on(rns_module):
+    """Ensure a minimal Reticulum instance exists on the GIVEN RNS module object.
+
+    `_ensure_minimal_rns` creates the instance on the bridge's CACHED RNS handle
+    (`_rns_module`). Across a long session that handle can diverge from
+    `sys.modules['RNS']`, which is what `from RNS import X` rebinds a submodule's
+    own `import RNS` to. A command that creates the instance via
+    `_ensure_minimal_rns` but then reaches RNS through such a submodule (e.g.
+    `Discovery.RNS`) sees `Reticulum.get_instance() == None` on that other module
+    and fails. Creating the instance on the EXACT module the submodule reads
+    keeps them consistent. No-op when that module already has a live instance.
+    """
+    if rns_module.Reticulum.get_instance() is None:
+        import tempfile
+        cfg = tempfile.mkdtemp(prefix="rns_minimal_")
+        cfg_file = os.path.join(cfg, "config")
+        with open(cfg_file, "w") as f:
+            f.write(
+                "[reticulum]\nenable_transport = no\nshare_instance = no\n\n[interfaces]\n"
+            )
+        rns_module.loglevel = int(
+            os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(rns_module.LOG_CRITICAL))
+        )
+        rns_module.Reticulum(configdir=cfg)
+    return rns_module
 
 
 def cmd_rns_start(params):
@@ -3149,7 +1844,7 @@ def cmd_rns_start(params):
 
     # Suppress RNS logging to avoid polluting JSON output on stdout
     # RNS logs go to stdout by default which breaks the bridge protocol
-    RNS.loglevel = RNS.LOG_CRITICAL
+    RNS.loglevel = int(os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL)))
 
     # Pre-create config file to:
     # 1. Prevent Reticulum from detecting/connecting to any running shared instance
@@ -3165,10 +1860,10 @@ def cmd_rns_start(params):
             f.write("  share_instance = No\n")
             f.write("\n[interfaces]\n")
 
-    # Start Reticulum with transport enabled (minimal logging)
+    # Start Reticulum with transport enabled (loglevel env-overridable)
     _rns_instance = RNS.Reticulum(
         configdir=config_path,
-        loglevel=RNS.LOG_CRITICAL  # Only log critical errors
+        loglevel=int(os.environ.get("CONFORMANCE_RNS_LOGLEVEL", str(RNS.LOG_CRITICAL)))
     )
 
     # Create TCP server interface using configuration dict
@@ -3221,496 +1916,6 @@ def cmd_rns_stop(params):
     }
 
 
-def cmd_lxmf_start_router(params):
-    """Start LXMF router with delivery destination.
-
-    params:
-        identity_hex (str, optional): 64-byte private key hex (X25519 + Ed25519)
-        display_name (str, optional): Display name for announcements
-
-    Returns:
-        identity_hash (hex): Hash of the router identity
-        destination_hash (hex): Hash of the delivery destination
-    """
-    global _lxmf_router, _lxmf_identity, _lxmf_destination, _received_messages
-
-    import tempfile
-
-    identity_hex = params.get('identity_hex')
-    display_name = params.get('display_name')
-
-    RNS = _get_full_rns()
-    import LXMF
-
-    # Create or restore identity
-    if identity_hex:
-        private_key = hex_to_bytes(identity_hex)
-        _lxmf_identity = RNS.Identity.from_bytes(private_key)
-    else:
-        _lxmf_identity = RNS.Identity()
-
-    # Create storage path
-    storage_path = tempfile.mkdtemp(prefix='lxmf_test_')
-
-    # Create LXMF router
-    _lxmf_router = LXMF.LXMRouter(
-        identity=_lxmf_identity,
-        storagepath=storage_path
-    )
-
-    # Register delivery identity
-    _lxmf_destination = _lxmf_router.register_delivery_identity(
-        _lxmf_identity,
-        display_name=display_name
-    )
-
-    # Clear received messages
-    _received_messages = []
-
-    # Set delivery callback
-    def delivery_callback(message):
-        global _received_messages
-        msg_data = {
-            'source_hash': bytes_to_hex(message.source_hash),
-            'destination_hash': bytes_to_hex(message.destination_hash),
-            'content': message.content.decode('utf-8') if isinstance(message.content, bytes) else message.content,
-            'title': message.title.decode('utf-8') if isinstance(message.title, bytes) else message.title,
-            'timestamp': message.timestamp,
-            'fields': {}
-        }
-        if hasattr(message, 'hash') and message.hash:
-            msg_data['hash'] = bytes_to_hex(message.hash)
-        if hasattr(message, 'fields') and message.fields:
-            for k, v in message.fields.items():
-                if isinstance(v, bytes):
-                    msg_data['fields'][str(k)] = bytes_to_hex(v)
-                else:
-                    msg_data['fields'][str(k)] = v
-        _received_messages.append(msg_data)
-
-    _lxmf_router.register_delivery_callback(delivery_callback)
-
-    return {
-        'identity_hash': bytes_to_hex(_lxmf_identity.hash),
-        'destination_hash': bytes_to_hex(_lxmf_destination.hash),
-        'identity_public_key': bytes_to_hex(_lxmf_identity.get_public_key())
-    }
-
-
-def cmd_lxmf_get_messages(params):
-    """Get received LXMF messages.
-
-    Returns list of received messages with decoded content.
-    """
-    global _received_messages
-
-    return {
-        'messages': _received_messages,
-        'count': len(_received_messages)
-    }
-
-
-def cmd_lxmf_clear_messages(params):
-    """Clear received messages list."""
-    global _received_messages
-    _received_messages = []
-
-    return {
-        'cleared': True
-    }
-
-
-def cmd_lxmf_announce(params):
-    """Announce the LXMF delivery destination.
-
-    This makes the LXMF destination known on the network so other nodes
-    can discover it and send messages.
-
-    Returns:
-        announced (bool): True if announced successfully
-        destination_hash (hex): Hash of the announced destination
-    """
-    global _lxmf_router, _lxmf_destination
-
-    if not _lxmf_router or not _lxmf_destination:
-        return {
-            'announced': False,
-            'error': 'LXMF router not started'
-        }
-
-    # Announce the delivery destination
-    _lxmf_router.announce(_lxmf_destination.hash)
-
-    return {
-        'announced': True,
-        'destination_hash': bytes_to_hex(_lxmf_destination.hash)
-    }
-
-
-def cmd_lxmf_send_direct(params):
-    """Send LXMF message via DIRECT delivery.
-
-    params:
-        destination_hash (hex): Destination hash (16 bytes)
-        content (str): Message content
-        title (str, optional): Message title
-        fields (dict, optional): Additional fields
-
-    Returns:
-        sent (bool): True if message was queued
-        message_hash (hex): Hash of the sent message
-        status (str): Status of the send operation
-
-    Note: This command requires that the destination has been announced
-    and is known to the transport layer. For testing, announce the
-    destination first before trying to send.
-    """
-    global _lxmf_router, _lxmf_identity, _lxmf_destination
-
-    if not _lxmf_router:
-        return {
-            'sent': False,
-            'status': 'error',
-            'error': 'LXMF router not started'
-        }
-
-    RNS = _get_full_rns()
-    import LXMF
-
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    content = params['content']
-    title = params.get('title', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Try to find the identity for this destination from recalled identities
-    # This is needed because LXMF requires a proper Destination object
-    identity = RNS.Identity.recall(destination_hash)
-    if identity is None:
-        # Check if we have a path at least
-        has_path = RNS.Transport.has_path(destination_hash)
-        return {
-            'sent': False,
-            'status': 'no_identity',
-            'error': f'No identity recalled for destination {destination_hash.hex()}',
-            'has_path': has_path
-        }
-
-    # Create an LXMF delivery destination from the recalled identity
-    # LXMF uses "lxmf" app name and "delivery" aspect
-    destination = RNS.Destination(
-        identity,
-        RNS.Destination.OUT,
-        RNS.Destination.SINGLE,
-        "lxmf",
-        "delivery"
-    )
-
-    # Create a message with DIRECT method
-    message = LXMF.LXMessage(
-        destination=destination,
-        source=_lxmf_destination,  # Our delivery destination as source
-        content=content,
-        title=title,
-        fields=fields if fields else None,
-        desired_method=LXMF.LXMessage.DIRECT
-    )
-
-    # Send via router
-    _lxmf_router.handle_outbound(message)
-
-    return {
-        'sent': True,
-        'status': 'queued',
-        'message_hash': bytes_to_hex(message.hash) if message.hash else None
-    }
-
-
-def cmd_lxmf_send_opportunistic(params):
-    """Send LXMF message via OPPORTUNISTIC delivery.
-
-    params:
-        destination_hash (hex): Destination hash (16 bytes)
-        content (str): Message content
-        title (str, optional): Message title
-        fields (dict, optional): Additional fields
-
-    Returns:
-        sent (bool): True if message was queued
-        message_hash (hex): Hash of the sent message
-        method (str): "opportunistic"
-
-    Note: This command requires that the destination has been announced
-    and the identity is known to the transport layer.
-    """
-    global _lxmf_router, _lxmf_identity, _lxmf_destination
-
-    if not _lxmf_router:
-        return {
-            'sent': False,
-            'error': 'LXMF router not started'
-        }
-
-    RNS = _get_full_rns()
-    import LXMF
-
-    destination_hash = hex_to_bytes(params['destination_hash'])
-    content = params['content']
-    title = params.get('title', '')
-    fields = params.get('fields', {})
-
-    # Convert string field keys to int
-    if fields:
-        fields = {int(k): v for k, v in fields.items()}
-
-    # Recall identity from destination hash
-    identity = RNS.Identity.recall(destination_hash)
-    if identity is None:
-        return {
-            'sent': False,
-            'error': f'Cannot recall identity for {destination_hash.hex()}'
-        }
-
-    # Create outbound destination
-    destination = RNS.Destination(
-        identity,
-        RNS.Destination.OUT,
-        RNS.Destination.SINGLE,
-        "lxmf",
-        "delivery"
-    )
-
-    # Create LXMF message with OPPORTUNISTIC method
-    message = LXMF.LXMessage(
-        destination=destination,
-        source=_lxmf_destination,
-        content=content,
-        title=title,
-        fields=fields if fields else None,
-        desired_method=LXMF.LXMessage.OPPORTUNISTIC
-    )
-
-    # Handle outbound
-    _lxmf_router.handle_outbound(message)
-
-    return {
-        'sent': True,
-        'message_hash': bytes_to_hex(message.hash) if message.hash else None,
-        'method': 'opportunistic'
-    }
-
-
-def cmd_propagation_node_start(params):
-    """Start propagation node with configurable stamp cost.
-
-    params:
-        stamp_cost (int, optional): Required stamp cost (default 8 for fast tests)
-        stamp_flexibility (int, optional): Stamp cost flexibility (default 0)
-
-    Returns:
-        propagation_hash (hex): Hash of the propagation destination
-        stamp_cost (int): Configured stamp cost
-        stamp_flexibility (int): Configured flexibility
-        identity_hash (hex): Hash of the router identity
-        identity_public_key (hex): Public key of the router identity
-    """
-    global _lxmf_router
-
-    if _lxmf_router is None:
-        return {'error': 'LXMF router not started'}
-
-    stamp_cost = int(params.get('stamp_cost', 8))
-    stamp_flexibility = int(params.get('stamp_flexibility', 0))
-
-    # Configure stamp cost before enabling propagation
-    _lxmf_router.propagation_stamp_cost = stamp_cost
-    _lxmf_router.propagation_stamp_cost_flexibility = stamp_flexibility
-
-    # Enable propagation node functionality
-    _lxmf_router.enable_propagation()
-
-    # Get the propagation destination hash
-    propagation_hash = _lxmf_router.propagation_destination.hash
-
-    return {
-        'propagation_hash': bytes_to_hex(propagation_hash),
-        'stamp_cost': stamp_cost,
-        'stamp_flexibility': stamp_flexibility,
-        'identity_hash': bytes_to_hex(_lxmf_router.identity.hash),
-        'identity_public_key': bytes_to_hex(_lxmf_router.identity.get_public_key())
-    }
-
-
-def cmd_propagation_node_get_messages(params):
-    """Get list of messages stored on propagation node.
-
-    Returns:
-        messages (list): List of stored messages with transient_id, destination_hash, etc.
-        count (int): Number of messages stored
-    """
-    global _lxmf_router
-
-    if _lxmf_router is None:
-        return {'error': 'LXMF router not started'}
-
-    if not _lxmf_router.propagation_node:
-        return {'error': 'Propagation not enabled'}
-
-    messages = []
-    for transient_id, entry in _lxmf_router.propagation_entries.items():
-        # entry = [dest_hash, filepath, received_time, size, handled_peers, unhandled_peers, stamp_value]
-        messages.append({
-            'transient_id': bytes_to_hex(transient_id),
-            'destination_hash': bytes_to_hex(entry[0]),
-            'received_time': entry[2],
-            'size': entry[3],
-            'stamp_value': entry[6] if len(entry) > 6 else 0
-        })
-
-    return {'messages': messages, 'count': len(messages)}
-
-
-def cmd_propagation_node_submit_for_recipient(params):
-    """Store a test message for a recipient on the propagation node.
-
-    This creates an LXMF message from the router's identity addressed to the
-    specified recipient and stores it directly in the propagation node's
-    message store for retrieval testing.
-
-    params:
-        recipient_hash (hex): Destination hash of the recipient (16 bytes)
-        content (str): Message content
-        title (str, optional): Message title
-        image_hex (hex, optional): Image content as hex string
-        image_extension (str, optional): Image file extension (e.g. "png")
-
-    Returns:
-        submitted (bool): True if message was stored
-        transient_id (hex): Transient ID of the stored message
-    """
-    global _lxmf_router, _lxmf_identity, _lxmf_destination
-
-    if _lxmf_router is None:
-        return {'error': 'LXMF router not started', 'submitted': False}
-
-    if not _lxmf_router.propagation_node:
-        return {'error': 'Propagation not enabled', 'submitted': False}
-
-    RNS = _get_full_rns()
-    import LXMF
-
-    recipient_hash = hex_to_bytes(params['recipient_hash'])
-    content = params.get('content', 'Test message for propagation')
-    title = params.get('title', '')
-
-    # Recall identity for the recipient or create a fake destination
-    # For test purposes, we need to create a message that can be stored
-    recipient_identity = RNS.Identity.recall(recipient_hash)
-
-    if recipient_identity is None:
-        # Create a temporary identity for encryption if recipient not known
-        # This is a test scenario - in production the recipient would be announced
-        return {
-            'error': f'Cannot recall identity for recipient {recipient_hash.hex()}. Announce the recipient first.',
-            'submitted': False
-        }
-
-    # Create destination for recipient
-    recipient_destination = RNS.Destination(
-        recipient_identity,
-        RNS.Destination.OUT,
-        RNS.Destination.SINGLE,
-        "lxmf",
-        "delivery"
-    )
-
-    # Create LXMF message with PROPAGATED method
-    message = LXMF.LXMessage(
-        destination=recipient_destination,
-        source=_lxmf_destination,
-        content=content,
-        title=title,
-        desired_method=LXMF.LXMessage.PROPAGATED
-    )
-
-    # Add image field if provided
-    image_hex = params.get('image_hex', None)
-    image_extension = params.get('image_extension', None)
-    if image_hex and image_extension:
-        image_bytes = bytes.fromhex(image_hex)
-        message.fields = {
-            LXMF.FIELD_IMAGE: [
-                image_extension.encode('utf-8'),
-                image_bytes
-            ]
-        }
-
-    # Pack the message for propagation format
-    # This encrypts it for the recipient and creates the propagation format
-    message.pack()
-
-    # Get the propagation-formatted data
-    # For propagation, the message is encrypted for the destination
-    lxmf_data = message.propagation_packed
-    if lxmf_data is None:
-        # Fallback: manually create propagation format
-        # propagation format = dest_hash + encrypted(source_hash + sig + payload)
-        encrypted_data = recipient_destination.encrypt(message.packed[LXMF.LXMessage.DESTINATION_LENGTH:])
-        lxmf_data = message.packed[:LXMF.LXMessage.DESTINATION_LENGTH] + encrypted_data
-
-    # Extract just the message data (without timebase wrapper)
-    # lxmf_propagation expects raw lxmf_data, not the propagation_packed wrapper
-    import time
-    transient_id = RNS.Identity.full_hash(lxmf_data)
-
-    # Store directly using lxmf_propagation method
-    # This handles all the storage logic including peer distribution
-    result = _lxmf_router.lxmf_propagation(
-        lxmf_data,
-        stamp_value=0,  # No stamp required for test messages
-        stamp_data=b''
-    )
-
-    if result:
-        return {
-            'submitted': True,
-            'transient_id': bytes_to_hex(transient_id),
-            'message_hash': bytes_to_hex(message.hash) if message.hash else None
-        }
-    else:
-        return {
-            'submitted': False,
-            'error': 'Failed to store message in propagation node'
-        }
-
-
-def cmd_propagation_node_announce(params):
-    """Announce the propagation node destination.
-
-    This makes the propagation node discoverable on the network.
-
-    Returns:
-        announced (bool): True if announced
-        propagation_hash (hex): Hash of the propagation destination
-    """
-    global _lxmf_router
-
-    if _lxmf_router is None:
-        return {'error': 'LXMF router not started', 'announced': False}
-
-    if not _lxmf_router.propagation_node:
-        return {'error': 'Propagation not enabled', 'announced': False}
-
-    # Announce the propagation destination
-    _lxmf_router.announce_propagation_node()
-
-    return {
-        'announced': True,
-        'propagation_hash': bytes_to_hex(_lxmf_router.propagation_destination.hash)
-    }
 
 
 # ============================================================================
@@ -4368,199 +2573,1336 @@ def cmd_rns_set_proof_strategy(params):
     return {'set': True, 'strategy': strategy_name}
 
 
-# ─── Local Client Reader ───────────────────────────────────────────
-# Raw TCP socket that connects to Kotlin's LocalServerInterface as a passive
-# packet reader. Used by E2E tests to inspect forwarded announce headers.
+# ─── Destination constructor / lifecycle (Destination.py) ────────────
+#
+# These commands drive RNS.Destination directly so the constructor guards,
+# announce()/encrypt()/set_proof_strategy()/rotate_ratchets() validation paths,
+# and the static name-helpers are observable. Everything delegates to real RNS:
+# no wire bytes are assembled here, RNS does all the hashing / signing / packing.
 
-_local_client_socket = None
-_local_client_thread = None
-_local_client_packets = []      # list of bytes (deframed packets)
-_local_client_lock = __import__('threading').Lock()
-_local_client_running = False
+def _resolve_dest_type(RNS, value):
+    """Map a friendly type keyword to the real RNS.Destination type constant,
+    or pass an integer straight through so RNS's own `type in types` guard can
+    reject an out-of-range value."""
+    mapping = {
+        'single': RNS.Destination.SINGLE,
+        'group': RNS.Destination.GROUP,
+        'plain': RNS.Destination.PLAIN,
+        'link': RNS.Destination.LINK,
+    }
+    if isinstance(value, str):
+        return mapping[value]
+    return value
 
 
-def _local_client_read_loop(sock):
-    """Background thread: read HDLC-framed packets from the socket."""
-    import socket as _socket
-    global _local_client_running
-    buf = bytearray()
-    in_frame = False
+def _resolve_dest_direction(RNS, value):
+    """Map a friendly direction keyword to the real RNS.Destination direction
+    constant, or pass an integer through for RNS's own guard to reject."""
+    mapping = {'in': RNS.Destination.IN, 'out': RNS.Destination.OUT}
+    if isinstance(value, str):
+        return mapping[value]
+    return value
 
+
+def _coerce_aspects(value):
+    if isinstance(value, list):
+        return value
+    if value:
+        return value.split(',')
+    return []
+
+
+def _make_destination(RNS, params, default_direction='in', default_type='single'):
+    """Construct a real RNS.Destination from request params, reusing an
+    already-registered destination with the same address (RNS raises KeyError
+    on a duplicate Transport.register_destination, but the conformance bridge
+    is a long-lived process that may construct the same destination across
+    tests). Validation errors (ValueError/TypeError) propagate so the caller
+    surfaces them as a BridgeError."""
+    type_val = _resolve_dest_type(RNS, params.get('type', default_type))
+    dir_val = _resolve_dest_direction(RNS, params.get('direction', default_direction))
+    app_name = params['app_name']
+    aspects = _coerce_aspects(params.get('aspects', []))
+    pk = params.get('identity_private_key')
+    identity = RNS.Identity.from_bytes(hex_to_bytes(pk)) if pk else None
     try:
-        while _local_client_running:
-            try:
-                chunk = sock.recv(4096)
-            except _socket.timeout:
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break
-
-            for b in chunk:
-                if b == HDLC_FLAG:
-                    if in_frame and len(buf) > 0:
-                        # End of frame — unescape and store
-                        unescaped = bytearray()
-                        i = 0
-                        while i < len(buf):
-                            if buf[i] == HDLC_ESC and i + 1 < len(buf):
-                                unescaped.append(buf[i + 1] ^ HDLC_ESC_MASK)
-                                i += 2
-                            else:
-                                unescaped.append(buf[i])
-                                i += 1
-                        with _local_client_lock:
-                            _local_client_packets.append(bytes(unescaped))
-                    # Start new frame
-                    buf = bytearray()
-                    in_frame = True
-                elif in_frame:
-                    buf.append(b)
-    except Exception:
-        pass
-    finally:
-        _local_client_running = False
+        return RNS.Destination(identity, dir_val, type_val, app_name, *aspects)
+    except KeyError:
+        # Duplicate registration — find and reuse the live destination.
+        if identity is not None and type_val != RNS.Destination.PLAIN:
+            expected = RNS.Destination.hash(identity, app_name, *aspects)
+        else:
+            expected = RNS.Destination.hash(None, app_name, *aspects)
+        for existing in RNS.Transport.destinations:
+            if existing.hash == expected:
+                return existing
+        raise
 
 
-def cmd_local_client_connect(params):
-    """Connect a raw TCP socket to a LocalServerInterface as a passive reader.
+def cmd_destination_construct(params):
+    """Construct a real RNS.Destination and report the address material RNS
+    derived, plus the auto-generated identity for the IN/non-PLAIN/no-identity
+    branch (Destination.__init__ appends `identity.hexhash` as an extra aspect
+    before computing name_hash). Drives the constructor guards directly:
 
-    params:
-        host (str): hostname (default '127.0.0.1')
-        port (int): TCP port
-    returns:
-        connected (bool)
+      * OUT + non-PLAIN + no identity -> ValueError
+      * PLAIN + identity -> TypeError
+      * out-of-range type/direction int -> ValueError
+
+    All such errors propagate to the bridge dispatcher as a BridgeError.
     """
-    import socket
-    import threading
+    RNS = _ensure_minimal_rns()
+    had_identity = bool(params.get('identity_private_key'))
+    dest = _make_destination(RNS, params)
+    result = {
+        'destination_hash': bytes_to_hex(dest.hash),
+        'name': dest.name,
+        'name_hash': bytes_to_hex(dest.name_hash),
+        'proof_strategy': dest.proof_strategy,
+        'type': dest.type,
+        'direction': dest.direction,
+    }
+    # IN, non-PLAIN, no supplied identity: RNS generated one and folded its
+    # hexhash into the aspect list. Report it so a test can assert the auto
+    # aspect is part of the name_hash preimage.
+    if not had_identity and dest.identity is not None:
+        result['auto_identity_hexhash'] = dest.identity.hexhash
+    return result
 
-    global _local_client_socket, _local_client_thread
-    global _local_client_packets, _local_client_running
 
-    host = params.get('host', '127.0.0.1')
-    port = int(params['port'])
+def cmd_destination_announce_attempt(params):
+    """Construct a destination and call announce(send=False). RNS raises
+    TypeError('Only SINGLE destination types can be announced') for
+    GROUP/PLAIN/LINK and TypeError('Only IN destination types can be
+    announced') for OUT — both surface as a BridgeError. A valid IN SINGLE
+    returns ok=True after RNS builds (but does not send) the announce packet.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    dest.announce(send=False)
+    return {'ok': True, 'destination_hash': bytes_to_hex(dest.hash)}
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    sock.connect((host, port))
-    sock.settimeout(1.0)        # non-blocking-ish for read loop
 
-    _local_client_socket = sock
-    _local_client_running = True
-    with _local_client_lock:
-        _local_client_packets.clear()
+def cmd_app_and_aspects_from_name(params):
+    """Delegate to RNS.Destination.app_and_aspects_from_name: split a dotted
+    full name into (app_name, [aspects...]) — the first component is the app
+    name, the rest are aspects."""
+    RNS = _get_full_rns()
+    app_name, aspects = RNS.Destination.app_and_aspects_from_name(params['full_name'])
+    return {'app_name': app_name, 'aspects': list(aspects)}
 
-    _local_client_thread = threading.Thread(
-        target=_local_client_read_loop, args=(sock,), daemon=True
+
+def cmd_hash_from_name_and_identity(params):
+    """Delegate to RNS.Destination.hash_from_name_and_identity: derive the
+    16-byte destination address from a dotted full name + a 16-byte identity
+    hash (RNS splits the name and feeds it through Destination.hash)."""
+    RNS = _get_full_rns()
+    identity_hash = hex_to_bytes(params['identity_hash'])
+    dest_hash = RNS.Destination.hash_from_name_and_identity(
+        params['full_name'], identity_hash
     )
-    _local_client_thread.start()
-
-    return {'connected': True}
+    return {'destination_hash': bytes_to_hex(dest_hash)}
 
 
-def cmd_local_client_read_packets(params):
-    """Return HDLC-deframed packets received from the shared instance.
+def cmd_destination_expand_name(params):
+    """Delegate to RNS.Destination.expand_name. With an identity, RNS appends
+    `'.' + identity.hexhash` to the dotted app/aspects join; without one it
+    returns the bare dotted join. Lets a test observe the trailing-identity
+    suffix form that no other command exposes."""
+    RNS = _get_full_rns()
+    app_name = params['app_name']
+    aspects = _coerce_aspects(params.get('aspects', []))
+    pk = params.get('identity_private_key')
+    identity = RNS.Identity.from_bytes(hex_to_bytes(pk)) if pk else None
+    name = RNS.Destination.expand_name(identity, app_name, *aspects)
+    out = {'name': name}
+    if identity is not None:
+        out['identity_hexhash'] = identity.hexhash
+    return out
 
-    params:
-        timeout_ms (int, optional): max wait for at least one packet (default 5000)
-    returns:
-        packets (list of hex strings)
-        count (int)
-    """
-    import time
 
-    timeout_ms = int(params.get('timeout_ms', 5000))
-    deadline = time.time() + timeout_ms / 1000.0
+def cmd_destination_set_proof_strategy_raw(params):
+    """Construct a destination and call set_proof_strategy with the raw value
+    so RNS's own validation runs: a strategy not in Destination.proof_strategies
+    raises TypeError('Unsupported proof strategy') -> BridgeError. The three
+    valid strategy constants are accepted and reflected back."""
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    dest.set_proof_strategy(params['strategy_value'])
+    return {'set': True, 'proof_strategy': dest.proof_strategy}
 
-    # Wait until at least one packet or timeout
-    while time.time() < deadline:
-        with _local_client_lock:
-            if _local_client_packets:
-                break
-        time.sleep(0.05)
 
-    with _local_client_lock:
-        packets = list(_local_client_packets)
-        _local_client_packets.clear()
+def cmd_destination_rotate_ratchets(params):
+    """Construct a destination and call rotate_ratchets(). Without
+    enable_ratchets first, self.ratchets is None and RNS raises
+    SystemError('Cannot rotate ratchet ... ratchets are not enabled') ->
+    BridgeError. With enable=True, RNS initialises a ratchet file and the
+    rotation succeeds."""
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    if params.get('enable'):
+        import tempfile
+        rdir = tempfile.mkdtemp(prefix='rns_dest_ratchets_')
+        dest.enable_ratchets(os.path.join(rdir, 'ratchets.bin'))
+        dest.ratchet_interval = 0
+    rotated = dest.rotate_ratchets()
+    return {'rotated': bool(rotated), 'has_ratchets': dest.ratchets is not None}
 
+
+def cmd_destination_group_encrypt(params):
+    """Construct a GROUP destination and call encrypt(). Without create_keys()
+    the GROUP path has no symmetric Token key and RNS raises ValueError('No
+    private key held by GROUP destination') -> BridgeError. With create_keys
+    RNS generates a key and the encryption succeeds (and round-trips through
+    decrypt)."""
+    RNS = _ensure_minimal_rns()
+    params = dict(params)
+    params['type'] = 'group'
+    params['direction'] = params.get('direction', 'in')
+    dest = _make_destination(RNS, params)
+    if params.get('create_keys'):
+        dest.create_keys()
+    plaintext = hex_to_bytes(params['plaintext'])
+    ciphertext = dest.encrypt(plaintext)
+    roundtrip = dest.decrypt(ciphertext)
     return {
-        'packets': [bytes_to_hex(p) for p in packets],
-        'count': len(packets),
+        'ciphertext': bytes_to_hex(ciphertext),
+        'roundtrip': bytes_to_hex(roundtrip) if roundtrip is not None else None,
+        'has_key': hasattr(dest, 'prv') and dest.prv is not None,
     }
 
 
-def cmd_local_client_disconnect(params):
-    """Close the local client socket."""
-    global _local_client_socket, _local_client_thread, _local_client_running
+def cmd_destination_default_app_data(params):
+    """Set a destination's default_app_data, then announce(send=False) with
+    app_data=None so RNS substitutes Destination.default_app_data into the
+    signed/announce stream (Destination.py:289-295 — bytes are used directly, a
+    callable is invoked and its bytes return value used). The app_data carried
+    on the wire is read back off the RNS-produced announce_data at the offsets
+    RNS itself wrote, so a test can assert the default was folded in.
 
-    _local_client_running = False
-
-    if _local_client_socket:
-        try:
-            _local_client_socket.close()
-        except Exception:
-            pass
-        _local_client_socket = None
-
-    if _local_client_thread:
-        _local_client_thread.join(timeout=2.0)
-        _local_client_thread = None
-
-    return {'disconnected': True}
-
-
-def cmd_packet_parse_header(params):
-    """Parse a raw packet's header fields.
-
-    params:
-        raw (hex): raw packet bytes
-    returns:
-        header_type (int): 0=HEADER_1, 1=HEADER_2
-        transport_type (int): 0=BROADCAST, 1=TRANSPORT
-        destination_type (int): 0=SINGLE, 1=GROUP, 2=PLAIN, 3=LINK
-        packet_type (int): 0=DATA, 1=ANNOUNCE, 2=LINKREQUEST, 3=PROOF
-        context_flag (int): 0=UNSET, 1=SET
-        hops (int)
-        transport_id (hex or null)
-        destination_hash (hex)
-        context (int)
+    default_kind selects: 'bytes' (use default_value), 'callable' (a function
+    returning default_value), or 'none' (no default set). override_app_data, if
+    given, is passed explicitly to announce() and must take precedence.
     """
-    raw = hex_to_bytes(params['raw'])
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
 
-    if len(raw) < 2:
-        raise ValueError("Packet too short")
+    default_kind = params.get('default_kind', 'bytes')
+    default_value = hex_to_bytes(params['default_value']) if params.get('default_value') else b""
+    if default_kind == 'bytes':
+        dest.set_default_app_data(default_value)
+    elif default_kind == 'callable':
+        dest.set_default_app_data(lambda: default_value)
+    # 'none' -> leave default_app_data as None
 
-    flags = raw[0]
-    hops = raw[1]
+    override = hex_to_bytes(params['override_app_data']) if params.get('override_app_data') else None
+    packet = dest.announce(app_data=override, send=False)
+    packet.pack()
 
-    header_type     = (flags >> 6) & 0x01
-    context_flag    = (flags >> 5) & 0x01
-    transport_type  = (flags >> 4) & 0x01
-    destination_type = (flags >> 2) & 0x03
-    packet_type     = flags & 0x03
-
-    HASH_LEN = 16
-
-    if header_type == 0:  # HEADER_1
-        transport_id = None
-        destination_hash = raw[2:2 + HASH_LEN]
-        context = raw[2 + HASH_LEN] if len(raw) > 2 + HASH_LEN else 0
-    else:  # HEADER_2
-        transport_id = raw[2:2 + HASH_LEN]
-        destination_hash = raw[2 + HASH_LEN:2 + 2 * HASH_LEN]
-        context = raw[2 + 2 * HASH_LEN] if len(raw) > 2 + 2 * HASH_LEN else 0
+    # Read app_data off the announce_data tail using live RNS field sizes — the
+    # same offsets cmd_announce_build parses. No bytes are assembled here.
+    keysize = RNS.Identity.KEYSIZE // 8
+    name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+    ratchet_size = RNS.Identity.RATCHETSIZE // 8
+    sig_len = RNS.Identity.SIGLENGTH // 8
+    random_hash_len = 10
+    data = packet.data
+    cursor = keysize + name_hash_len + random_hash_len
+    if packet.context_flag == RNS.Packet.FLAG_SET:
+        cursor += ratchet_size
+    cursor += sig_len
+    app_data_on_wire = data[cursor:]
 
     return {
-        'header_type': header_type,
-        'transport_type': transport_type,
-        'destination_type': destination_type,
-        'packet_type': packet_type,
-        'context_flag': context_flag,
-        'hops': hops,
-        'transport_id': bytes_to_hex(transport_id) if transport_id else None,
-        'destination_hash': bytes_to_hex(destination_hash),
-        'context': context,
+        'app_data': bytes_to_hex(app_data_on_wire),
+        'default_app_data_set': dest.default_app_data is not None,
+    }
+
+
+def cmd_destination_register_request_handler_validate(params):
+    """Construct a destination and call register_request_handler with
+    caller-controlled argument validity so RNS's own checks run:
+
+      * empty/None path -> ValueError('Invalid path specified')
+      * non-callable response_generator -> ValueError('Invalid response generator specified')
+      * allow policy not in request_policies -> ValueError('Invalid request policy')
+
+    All surface as a BridgeError; a fully-valid registration returns ok.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    path = params.get('path', '/test/echo')
+    if params.get('generator_valid', True):
+        def response_generator(p, data, request_id, link_id, remote_identity, requested_at):
+            return data
+        gen = response_generator
+    else:
+        gen = None
+    allow = params.get('allow', RNS.Destination.ALLOW_ALL)
+    dest.register_request_handler(path, response_generator=gen, allow=allow)
+    return {'registered': True, 'handler_count': len(dest.request_handlers)}
+
+
+def cmd_destination_path_response_cache(params):
+    """Drive Destination.announce(path_response=True, tag=...) twice and report
+    whether RNS reused the cached announce_data (path_responses[tag]) on the
+    second call. RNS evicts entries older than PR_TAG_WINDOW seconds at the top
+    of announce(), so pinning the wall-clock advance between the two calls lets
+    a test assert both the cache-hit branch (advance=0 -> identical data) and
+    the eviction branch (advance>PR_TAG_WINDOW -> fresh data rebuilt).
+
+    Time is pinned by patching time.time for the duration of each announce()
+    call, so RNS still does all the real signing/packing — it just sees the
+    wall-clock value we pin. No wire bytes are assembled here.
+    """
+    RNS = _ensure_minimal_rns()
+    dest = _make_destination(RNS, params)
+    tag = hex_to_bytes(params['tag'])
+    advance = float(params.get('advance_seconds', 0))
+    base = 1_000_000.0
+
+    import time as _time
+
+    def announce_at(ts):
+        orig = _time.time
+        _time.time = lambda: float(ts)
+        try:
+            return dest.announce(path_response=True, tag=tag, send=False)
+        finally:
+            _time.time = orig
+
+    p1 = announce_at(base)
+    p2 = announce_at(base + advance)
+    return {
+        'first_announce_data': bytes_to_hex(p1.data),
+        'second_announce_data': bytes_to_hex(p2.data),
+        'reused': p1.data == p2.data,
+        'cache_size': len(dest.path_responses),
+        'pr_tag_window': RNS.Destination.PR_TAG_WINDOW,
+        'first_is_path_response': p1.context == RNS.Packet.PATH_RESPONSE,
+    }
+
+
+def cmd_packet_constants(params):
+    """Return the live RNS wire-size / header constants so tests can pin them
+    against the spec literals (not against another read of the same value).
+
+    Every field is read straight off real RNS (RNS.Reticulum.*, RNS.Packet.*,
+    RNS.Link.*, RNS.Identity.*) — no arithmetic is reconstructed here, the test
+    asserts each against its documented literal.
+    """
+    RNS = _get_full_rns()
+    R = RNS.Reticulum
+    P = RNS.Packet
+    L = RNS.Link
+    I = RNS.Identity
+    return {
+        'mtu': int(R.MTU),
+        'header_minsize': int(R.HEADER_MINSIZE),
+        'header_maxsize': int(R.HEADER_MAXSIZE),
+        'mdu': int(R.MDU),
+        'ifac_min_size': int(R.IFAC_MIN_SIZE),
+        'packet_mdu': int(P.MDU),
+        'packet_plain_mdu': int(P.PLAIN_MDU),
+        'packet_encrypted_mdu': int(P.ENCRYPTED_MDU),
+        'link_mdu': int(L.MDU),
+        'hashlength': int(I.HASHLENGTH),
+        'siglength': int(I.SIGLENGTH),
+        'truncated_hashlength': int(I.TRUNCATED_HASHLENGTH),
+        'keysize': int(I.KEYSIZE),
+        'name_hash_length': int(I.NAME_HASH_LENGTH),
+        'token_overhead': int(I.TOKEN_OVERHEAD),
+        'aes128_blocksize': int(I.AES128_BLOCKSIZE),
+    }
+
+
+def cmd_packet_context_constants(params):
+    """Return the live RNS.Packet context-byte code points so a test can pin each
+    named context against its spec literal (not against another read of the same
+    value).
+
+    Every value is read straight off real RNS.Packet.* — no byte is reconstructed.
+    These are the assignments at RNS/Packet.py:72-92; the conformance test asserts
+    each against its documented literal (e.g. COMMAND == 0x0C), which together with
+    a packet_build that places the byte on the wire byte-pins the whole context
+    code-point table — including the link-control (LINKIDENTIFY/LINKCLOSE/LINKPROOF)
+    and resource (RESOURCE_HMU/ICL/RCL) and command (COMMAND/COMMAND_STATUS) codes
+    that the protocol otherwise only implies through interop.
+    """
+    RNS = _get_full_rns()
+    P = RNS.Packet
+    return {
+        'NONE': int(P.NONE),
+        'RESOURCE': int(P.RESOURCE),
+        'RESOURCE_ADV': int(P.RESOURCE_ADV),
+        'RESOURCE_REQ': int(P.RESOURCE_REQ),
+        'RESOURCE_HMU': int(P.RESOURCE_HMU),
+        'RESOURCE_PRF': int(P.RESOURCE_PRF),
+        'RESOURCE_ICL': int(P.RESOURCE_ICL),
+        'RESOURCE_RCL': int(P.RESOURCE_RCL),
+        'CACHE_REQUEST': int(P.CACHE_REQUEST),
+        'RESPONSE': int(P.RESPONSE),
+        'PATH_RESPONSE': int(P.PATH_RESPONSE),
+        'COMMAND': int(P.COMMAND),
+        'COMMAND_STATUS': int(P.COMMAND_STATUS),
+        'CHANNEL': int(P.CHANNEL),
+        'KEEPALIVE': int(P.KEEPALIVE),
+        'LINKIDENTIFY': int(P.LINKIDENTIFY),
+        'LINKCLOSE': int(P.LINKCLOSE),
+        'LINKPROOF': int(P.LINKPROOF),
+        'LRRTT': int(P.LRRTT),
+        'LRPROOF': int(P.LRPROOF),
+    }
+
+
+def cmd_announce_queue_constants(params):
+    """Return the live RNS announce-bandwidth / per-interface egress-queue
+    constants so a test can pin them against the documented spec literals (not
+    against another read of the same value).
+
+    Every field is read straight off real RNS.Reticulum.* — no value is
+    reconstructed here. These govern the 2% default announce bandwidth cap
+    (ANNOUNCE_CAP), the per-interface queue depth ceiling before announces are
+    dropped (MAX_QUEUED_ANNOUNCES, Transport.py:1262 / Interface.process_announce_queue),
+    and how long a queued announce survives before it is purged as stale
+    (QUEUED_ANNOUNCE_LIFE, Interface.py:332). The conformance test asserts each
+    against its documented literal (16384, 86400 == 24h, 2)."""
+    RNS = _get_full_rns()
+    R = RNS.Reticulum
+    return {
+        'announce_cap': int(R.ANNOUNCE_CAP),
+        'max_queued_announces': int(R.MAX_QUEUED_ANNOUNCES),
+        'queued_announce_life': int(R.QUEUED_ANNOUNCE_LIFE),
+    }
+
+
+def cmd_identity_random_hash(params):
+    """Return one RNS.Identity.get_random_hash() value (hex).
+
+    Delegates to real RNS; the test asserts it is the documented length and that
+    repeated calls differ (non-repetition over a sample)."""
+    RNS = _get_full_rns()
+    return {'random_hash': bytes_to_hex(RNS.Identity.get_random_hash())}
+
+
+def cmd_hdlc_escape(params):
+    """Apply RNS's HDLC send-side byte-stuffing (the forward primitive
+    RNS.Interfaces.TCPInterface.HDLC.escape) to a payload.
+
+    Delegates entirely to the real exposed staticmethod — the inverse
+    (hdlc_deframe) is already tested as a round-trip; this exposes the forward
+    direction so the ESC-before-FLAG escape order can be pinned directly."""
+    RNS = _get_full_rns()
+    from RNS.Interfaces.TCPInterface import HDLC
+    data = hex_to_bytes(params['data'])
+    return {'escaped': bytes_to_hex(HDLC.escape(data))}
+
+
+# ---------------------------------------------------------------------------
+# Interface-discovery subsystem (RNS.Discovery) — pure-function KATs.
+#
+# These commands drive the REAL RNS.Discovery announce builder / receiver and
+# the REAL LXMF LXStamper proof-of-work used by on-network interface discovery.
+# Nothing about the msgpack info layout, the flag byte, the stamp, or the
+# address validation is reconstructed here: the announce bytes come straight
+# out of InterfaceAnnouncer.get_interface_announce_data, the receive decision
+# out of InterfaceAnnounceHandler.received_announce, and the stamp out of
+# LXMF.LXStamper. The commands only set up the environmental RNS state the real
+# code reads (Transport.identity, transport_enabled, network_identity,
+# interface_discovery_sources) and split/report the buffers the real code
+# returns.
+# ---------------------------------------------------------------------------
+
+def cmd_discovery_build_announce_appdata(params):
+    """Build interface-discovery announce app_data via the REAL
+    RNS.Discovery.InterfaceAnnouncer.get_interface_announce_data
+    (Discovery.py:96-186).
+
+    A lightweight stand-in interface object (a dynamically-named class so
+    ``type(iface).__name__ == interface_type`` — exactly what RNS keys on)
+    carries the ``discovery_*`` attributes RNS reads. The announce bytes, the
+    msgpack ``info`` dict, the LXStamper proof-of-work stamp and the flag byte
+    are ALL produced by real RNS / real LXMF. This command only splits the
+    returned buffer at ``LXStamper.STAMP_SIZE`` and reports the parts — it
+    assembles no protocol bytes itself.
+    """
+    # Bind to the EXACT RNS module object the announce builder reads through its
+    # own `import RNS` (Discovery.RNS). _get_full_rns() only guarantees the real
+    # (non-stub) RNS is loaded; across a long session its cached handle can
+    # diverge from the live sys.modules['RNS'] that `from RNS import Discovery`
+    # rebinds Discovery.RNS to, so setting transport_enabled / Transport.identity
+    # on the cached handle would be invisible to get_interface_announce_data.
+    _get_full_rns()
+    from RNS import Discovery
+    from LXMF import LXStamper
+    RNS = Discovery.RNS
+
+    interface_type = params['interface_type']
+    fields = params.get('fields') or {}
+    stamp_value = params.get('stamp_value', 14)
+    encrypt = bool(params.get('encrypt', False))
+
+    # Environmental RNS state the announce builder reads: the TRANSPORT field
+    # (Reticulum.transport_enabled()) and the TRANSPORT_ID field
+    # (Transport.identity.hash). Set on real RNS; not reconstructed.
+    transport_enabled = bool(params.get('transport_enabled', False))
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', transport_enabled)
+    if params.get('transport_identity_priv'):
+        RNS.Transport.identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['transport_identity_priv']))
+    elif RNS.Transport.identity is None:
+        RNS.Transport.identity = RNS.Identity()
+
+    net_identity = None
+    if params.get('network_identity_priv'):
+        net_identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['network_identity_priv']))
+
+    class _Owner:
+        def has_network_identity(self_o):
+            return net_identity is not None
+    owner = _Owner()
+    owner.network_identity = net_identity
+    owner.identity = None
+
+    # Real InterfaceAnnouncer, bypassing __init__ (which only builds the
+    # discovery Destination / starts networking we do not need here).
+    announcer = Discovery.InterfaceAnnouncer.__new__(Discovery.InterfaceAnnouncer)
+    announcer.owner = owner
+    announcer.stamp_cache = {}
+    announcer.stamper = LXStamper
+
+    iface = type(interface_type, (), {})()
+    iface.discovery_stamp_value = stamp_value
+    iface.discovery_name = fields.get('name')
+    iface.discovery_latitude = fields.get('latitude')
+    iface.discovery_longitude = fields.get('longitude')
+    iface.discovery_height = fields.get('height')
+    iface.discovery_publish_ifac = bool(fields.get('publish_ifac', False))
+    iface.ifac_netname = fields.get('ifac_netname')
+    iface.ifac_netkey = fields.get('ifac_netkey')
+    iface.discovery_encrypt = encrypt
+    iface.kiss_framing = bool(fields.get('kiss_framing', False))
+    iface.reachable_on = fields.get('reachable_on')
+    iface.bind_port = fields.get('port')
+    iface.connectable = bool(fields.get('connectable', False))
+    iface.b32 = fields.get('b32')
+    iface.frequency = fields.get('frequency')
+    iface.bandwidth = fields.get('bandwidth')
+    iface.sf = fields.get('sf')
+    iface.cr = fields.get('cr')
+    iface.discovery_frequency = fields.get('frequency')
+    iface.discovery_bandwidth = fields.get('bandwidth')
+    iface.discovery_channel = fields.get('channel')
+    iface.discovery_modulation = fields.get('modulation')
+
+    app_data = announcer.get_interface_announce_data(iface)
+    if app_data is None:
+        return {'aborted': True, 'app_data': None}
+
+    stamp_size = LXStamper.STAMP_SIZE
+    flags = app_data[0]
+    packed = app_data[1:-stamp_size]
+    stamp = app_data[-stamp_size:]
+    infohash = RNS.Identity.full_hash(packed)
+    return {
+        'aborted': False,
+        'app_data': bytes_to_hex(app_data),
+        'flags': flags,
+        'packed_info': bytes_to_hex(packed),
+        'stamp': bytes_to_hex(stamp),
+        'infohash': bytes_to_hex(infohash),
+        'stamp_size': stamp_size,
+        'transport_id': bytes_to_hex(RNS.Transport.identity.hash),
+        'transport_enabled': transport_enabled,
+        # Pure read of the sender default-stamp constant (Discovery.py:34) so a
+        # test can pin it without the cost passing through this command's own
+        # 14-fallback default.
+        'default_stamp_value': Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE,
+    }
+
+
+def cmd_discovery_receive_announce(params):
+    """Feed an app_data buffer to the REAL
+    RNS.Discovery.InterfaceAnnounceHandler.received_announce
+    (Discovery.py:214-362) and report whether RNS accepted it (callback fired
+    with a populated ``info`` dict) or silently dropped it.
+
+    All the receive-path decisions — minimum length, source allowlist, stamp
+    validity / value threshold, FLAG_ENCRYPTED decrypt, field-type validation,
+    interface-type whitelist — are made by real RNS. This command only sets the
+    environmental state RNS reads and captures the callback.
+    """
+    # Bind to the EXACT RNS module object received_announce reads through its
+    # own `import RNS` (Discovery.RNS) — see cmd_discovery_build_announce_appdata
+    # for why the cached _get_full_rns() handle is not used directly here.
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+
+    app_data = hex_to_bytes(params['app_data'])
+    required_value = params.get('required_value', 14)
+
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled',
+            bool(params.get('transport_enabled', False)))
+
+    if params.get('network_identity_priv'):
+        RNS.Transport.network_identity = RNS.Identity.from_bytes(
+            hex_to_bytes(params['network_identity_priv']))
+    else:
+        RNS.Transport.network_identity = None
+
+    sources = params.get('discovery_sources')
+    if sources is None:
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources', [])
+    else:
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+                [hex_to_bytes(s) for s in sources])
+
+    if params.get('announce_identity_priv'):
+        announced = RNS.Identity.from_bytes(
+            hex_to_bytes(params['announce_identity_priv']))
+    else:
+        announced = RNS.Identity()
+
+    if params.get('destination_hash'):
+        dest_hash = hex_to_bytes(params['destination_hash'])
+    else:
+        dest_hash = announced.hash
+
+    captured = {}
+    invoked = {'n': 0, 'info_none': False}
+
+    def _cb(info):
+        invoked['n'] += 1
+        if info is None:
+            invoked['info_none'] = True
+        else:
+            captured.update(info)
+
+    # When default_required_value is requested, build the handler WITHOUT
+    # passing required_value so the impl's own default
+    # (InterfaceAnnounceHandler.__init__ default = InterfaceAnnouncer.
+    # DEFAULT_STAMP_VALUE) applies — lets a test pin the receiver's default
+    # acceptance threshold rather than an explicitly-supplied one.
+    if params.get('default_required_value'):
+        handler = Discovery.InterfaceAnnounceHandler(callback=_cb)
+    else:
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=required_value, callback=_cb)
+    handler.received_announce(dest_hash, announced, app_data)
+
+    out = {
+        'callback_invoked': invoked['n'] > 0,
+        'callback_info_none': invoked['info_none'],
+        'info_present': bool(captured),
+        'accepted': bool(captured),
+        'announce_identity_hash': bytes_to_hex(announced.hash),
+        # Pure reads off the real handler / announcer for receiver-wiring and
+        # default-threshold assertions (Discovery.py:200,192,34).
+        'aspect_filter': handler.aspect_filter,
+        'required_value': handler.required_value,
+        'default_stamp_value': Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE,
+    }
+    if captured:
+        safe = {}
+        for k, v in captured.items():
+            safe[k] = bytes_to_hex(v) if isinstance(v, bytes) else v
+        out['info'] = safe
+    return out
+
+
+def cmd_discovery_stamp(params):
+    """Expose the LXMF LXStamper proof-of-work primitives used by interface
+    discovery (Discovery.py:172,235-237): stamp_workblock / stamp_value /
+    stamp_valid / generate_stamp. Thin delegation to real LXMF.LXStamper.
+    """
+    from LXMF import LXStamper
+    op = params['op']
+    if op == 'workblock':
+        material = hex_to_bytes(params['material'])
+        rounds = params.get('expand_rounds', 20)
+        wb = LXStamper.stamp_workblock(material, expand_rounds=rounds)
+        return {'workblock': bytes_to_hex(wb), 'length': len(wb)}
+    elif op == 'value':
+        wb = hex_to_bytes(params['workblock'])
+        stamp = hex_to_bytes(params['stamp'])
+        return {'value': LXStamper.stamp_value(wb, stamp)}
+    elif op == 'valid':
+        wb = hex_to_bytes(params['workblock'])
+        stamp = hex_to_bytes(params['stamp'])
+        cost = params['cost']
+        return {'valid': bool(LXStamper.stamp_valid(stamp, cost, wb))}
+    elif op == 'generate':
+        material = hex_to_bytes(params['material'])
+        cost = params['cost']
+        rounds = params.get('expand_rounds', 20)
+        stamp, value = LXStamper.generate_stamp(
+            material, stamp_cost=cost, expand_rounds=rounds)
+        return {
+            'stamp': bytes_to_hex(stamp) if stamp else None,
+            'value': value,
+            'stamp_size': LXStamper.STAMP_SIZE,
+        }
+    elif op == 'default_cost':
+        # Read the impl's OWN documented default proof-of-work cost for
+        # interface-discovery announce stamps straight off real RNS
+        # (Discovery.py:34, InterfaceAnnouncer.DEFAULT_STAMP_VALUE). The
+        # receiver-side InterfaceAnnounceHandler defaults its required_value to
+        # the SAME constant (Discovery.py:192), so we surface both — read
+        # directly off the class attribute and off the real constructor
+        # signature default — so a test can pin that the cost the receiver
+        # enforces by default == the cost the sender targets by default,
+        # against the documented literal 14.
+        import inspect as _inspect
+        from RNS import Discovery
+        ia_default = int(Discovery.InterfaceAnnouncer.DEFAULT_STAMP_VALUE)
+        handler_default = _inspect.signature(
+            Discovery.InterfaceAnnounceHandler.__init__
+        ).parameters['required_value'].default
+        return {
+            'default_stamp_value': ia_default,
+            'handler_default_required_value': int(handler_default),
+        }
+    else:
+        raise ValueError(f"unknown discovery_stamp op: {op}")
+
+
+def cmd_discovery_validate_address(params):
+    """Expose RNS.Discovery.is_ip_address / is_hostname / is_ygg_ipv6
+    (Discovery.py:769-785). Thin delegation to real RNS.
+    """
+    RNS = _get_full_rns()
+    from RNS import Discovery
+    addr = params['address']
+    out = {
+        'is_ip_address': bool(Discovery.is_ip_address(addr)),
+        'is_ygg_ipv6': bool(Discovery.is_ygg_ipv6(addr)),
+    }
+    try:
+        out['is_hostname'] = bool(Discovery.is_hostname(addr))
+    except Exception:
+        out['is_hostname'] = False
+    return out
+
+
+def cmd_discovery_sanitize_name(params):
+    """Expose RNS interface-name sanitization: the receiver-side
+    InterfaceAnnounceHandler.sanitize_name (Discovery.py:205-212) and the
+    sender-side InterfaceAnnouncer.sanitize newline/CR strip (Discovery.py:89-94).
+    Thin delegation to real RNS.
+    """
+    RNS = _get_full_rns()
+    from RNS import Discovery
+    name = params.get('name')
+    announcer = Discovery.InterfaceAnnouncer.__new__(Discovery.InterfaceAnnouncer)
+    return {
+        'sanitize_name': Discovery.InterfaceAnnounceHandler.sanitize_name(name),
+        'sanitize': announcer.sanitize(name),
+    }
+
+
+def cmd_discovery_craft_announce(params):
+    """ADVERSARIAL announce crafter for the interface-discovery receive path.
+
+    Starts from a GENUINE announce produced by the real
+    InterfaceAnnouncer.get_interface_announce_data (via
+    cmd_discovery_build_announce_appdata), unpacks its info map with RNS's OWN
+    vendored umsgpack (RNS.vendor.umsgpack — the exact serializer RNS uses for
+    this record), applies ONE semantic mutation to the decoded dict, then
+    re-packs with that SAME serializer and re-stamps with the real LXMF
+    LXStamper proof-of-work before re-emitting app_data for replay through the
+    real received_announce.
+
+    Supported mutations (each exercises a distinct receive-path rejection
+    branch, Discovery.py:247-261):
+      * drop_field        -> remove a mandatory msgpack key (KeyError / the
+                             INTERFACE_TYPE-absent callback(None) path)
+      * set_interface_type-> overwrite INTERFACE_TYPE with a non-whitelisted
+                             string (ValueError at the DISCOVERABLE list gate)
+      * set_fields        -> wrong-type / wrong-length a field (TRANSPORT,
+                             TRANSPORT_ID, REACHABLE_ON, ...) for the type gates
+
+    No protocol logic is reconstructed: the field-key numbering, the flag byte,
+    the msgpack framing and the stamp PoW all come from real RNS / real LXMF;
+    only the *decoded dict* is edited. The byte buffer is `b"\\x00" + packed +
+    stamp` — the flag byte is the spec-literal 0x00 RNS emits for an unencrypted
+    announce and the parts are RNS's own. Used purely to prove the real receiver
+    REJECTS the malformation; pinned in ADVERSARIAL_CORRUPTORS.
+    """
+    _get_full_rns()
+    from RNS import Discovery
+    from RNS.vendor import umsgpack
+    from LXMF import LXStamper
+    RNS = Discovery.RNS
+
+    base = cmd_discovery_build_announce_appdata(params)
+    if base.get('aborted'):
+        return {'aborted': True, 'app_data': None}
+
+    # Decode the genuine RNS-produced info map with RNS's own serializer.
+    packed = hex_to_bytes(base['packed_info'])
+    info = umsgpack.unpackb(packed)
+
+    drop = params.get('drop_field')
+    if drop is not None:
+        info.pop(int(drop), None)
+
+    set_type = params.get('set_interface_type')
+    if set_type is not None:
+        info[Discovery.INTERFACE_TYPE] = set_type
+
+    for spec in (params.get('set_fields') or []):
+        key = int(spec['key'])
+        kind = spec.get('kind', 'str')
+        val = spec['value']
+        if kind == 'bytes':
+            val = hex_to_bytes(val)
+        elif kind == 'int':
+            val = int(val)
+        elif kind == 'float':
+            val = float(val)
+        elif kind == 'bool':
+            val = bool(val)
+        info[key] = val
+
+    # Re-pack with RNS's own serializer and re-stamp with real LXStamper, so the
+    # mutated announce still clears the genuine stamp gate and the rejection is
+    # attributable to the mutation alone.
+    new_packed = umsgpack.packb(info)
+    infohash = RNS.Identity.full_hash(new_packed)
+    stamp_value = params.get('stamp_value', 14)
+    rounds = Discovery.InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS
+    stamp, value = LXStamper.generate_stamp(
+        infohash, stamp_cost=stamp_value, expand_rounds=rounds)
+    if not stamp:
+        return {'aborted': True, 'app_data': None}
+
+    # Layout: flags(0x00, unencrypted) || packed || stamp — flag literal and
+    # parts are RNS's; nothing protocol-specific assembled.
+    app_data = b"\x00" + new_packed + stamp
+    return {
+        'aborted': False,
+        'app_data': bytes_to_hex(app_data),
+        'stamp_value': value,
+        'stamp_size': LXStamper.STAMP_SIZE,
+    }
+
+
+def cmd_discovery_announce_identity(params):
+    """Run the REAL InterfaceAnnouncer.__init__ identity selection
+    (Discovery.py:54-58) and report which identity the discovery Destination is
+    built under.
+
+    A lightweight owner stand-in carries `has_network_identity()`,
+    `network_identity` and `identity`; the real constructor picks the network
+    identity when has_network_identity() is True else the transport identity,
+    and builds the real RNS.Destination(identity, IN, SINGLE, "rnstransport",
+    "discovery", "interface"). The destination hash is read off that real
+    Destination — not recomputed here. Returns the chosen identity hash and both
+    candidate hashes so a test can anchor the selection against the naming
+    oracle (hash_from_name_and_identity).
+    """
+    # A real Reticulum instance must exist: InterfaceAnnouncer.__init__ builds a
+    # real Destination, whose registration needs Transport.owner set. Bind to the
+    # EXACT module Discovery reads (Discovery.RNS) and ensure the instance lives
+    # there — the cached _ensure_minimal_rns handle can diverge across a session.
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+
+    has_net = bool(params.get('has_network_identity'))
+    net_priv = params.get('network_identity_priv')
+    id_priv = params.get('identity_priv')
+    net_identity = (RNS.Identity.from_bytes(hex_to_bytes(net_priv))
+                    if net_priv else None)
+    base_identity = (RNS.Identity.from_bytes(hex_to_bytes(id_priv))
+                     if id_priv else None)
+
+    class _Owner:
+        def has_network_identity(self_o):
+            return has_net
+    owner = _Owner()
+    owner.network_identity = net_identity
+    owner.identity = base_identity
+
+    announcer = Discovery.InterfaceAnnouncer(owner)
+    dest = announcer.discovery_destination
+    chosen = net_identity if has_net else base_identity
+    return {
+        'discovery_destination_hash': bytes_to_hex(dest.hash),
+        'chosen_identity_hash': bytes_to_hex(chosen.hash),
+        'network_identity_hash': (bytes_to_hex(net_identity.hash)
+                                  if net_identity else None),
+        'identity_hash': (bytes_to_hex(base_identity.hash)
+                          if base_identity else None),
+        'app_name': Discovery.APP_NAME,
+    }
+
+
+def cmd_discovery_feature_defaults(params):
+    """Report the interface-discovery opt-in gates for a freshly-initialised
+    node, read straight off real RNS:
+
+      * a fresh base RNS Interface's `discoverable` / `supports_discovery`
+        (Interface.py:105-106)
+      * Reticulum's master `discover_interfaces` gate (Reticulum.py:259)
+      * should_autoconnect_discovered_interfaces() / max_autoconnected_
+        interfaces() (Reticulum.py:1802-1807)
+
+    Lets a test assert every discovery feature defaults OFF (opt-in). Pure
+    attribute / getter reads on real RNS — nothing reconstructed.
+    """
+    # Bind to the live RNS module (== Discovery.RNS) and ensure the instance is
+    # on it, so Interface() / should_autoconnect see a live get_instance().
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+    Interface = RNS.Interfaces.Interface.Interface
+    iface = Interface()
+    return {
+        'interface_discoverable': iface.discoverable,
+        'interface_supports_discovery': iface.supports_discovery,
+        'discover_interfaces': getattr(
+            RNS.Reticulum, '_Reticulum__discover_interfaces'),
+        'should_autoconnect_discovered_interfaces':
+            RNS.Reticulum.should_autoconnect_discovered_interfaces(),
+        'max_autoconnected_interfaces':
+            RNS.Reticulum.max_autoconnected_interfaces(),
+    }
+
+
+def cmd_discovery_inject_records(params):
+    """Drive the REAL InterfaceDiscovery.list_discovered_interfaces
+    (Discovery.py:402-448) over genuine discovery records with controlled ages.
+
+    For each requested record this builds a GENUINE announce, runs it through
+    the real received_announce to obtain the real `info` dict, back-dates only
+    its `last_heard`/`received` timestamp (and optionally overrides the stamp
+    `value` for the sort key), and writes it via the real
+    InterfaceDiscovery.interface_discovered — which msgpack-serialises and
+    stores the record itself. list_discovered_interfaces is then invoked and its
+    real status assignment / staleness removal / sort order reported. The bridge
+    only chooses each record's age and reads back RNS's verdict; the threshold
+    comparisons, status codes and sort are 100% RNS.
+    """
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+    import time as _time
+
+    # No source allowlist configured -> the allowlist removal branch is inert.
+    setattr(RNS.Reticulum, '_Reticulum__interface_sources', [])
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', True)
+
+    disc = Discovery.InterfaceDiscovery(discover_interfaces=False)
+
+    def _clean():
+        for fn in os.listdir(disc.storagepath):
+            try:
+                os.unlink(os.path.join(disc.storagepath, fn))
+            except OSError:
+                pass
+
+    _clean()
+
+    now = _time.time()
+    requested = []
+    for rec in params['records']:
+        name = rec['name']
+        age = float(rec['age_seconds'])
+        built = cmd_discovery_build_announce_appdata({
+            'interface_type': 'TCPServerInterface',
+            'stamp_value': rec.get('stamp_value', 6),
+            'transport_enabled': True,
+            'fields': {'name': name, 'reachable_on': 'example.com',
+                       'port': 4242},
+        })
+        app_data = hex_to_bytes(built['app_data'])
+        captured = {}
+
+        def _cb(info, _c=captured):
+            if info:
+                _c.update(info)
+
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=rec.get('stamp_value', 6), callback=_cb)
+        announced = RNS.Identity()
+        handler.received_announce(announced.hash, announced, app_data)
+        if not captured:
+            raise ValueError(f"could not build genuine record for {name!r}")
+
+        captured['received'] = now - age
+        if 'value' in rec:
+            captured['value'] = int(rec['value'])
+        disc.interface_discovered(captured)
+        requested.append({
+            'name': name,
+            'discovery_hash': bytes_to_hex(captured['discovery_hash']),
+        })
+
+    listed = disc.list_discovered_interfaces()
+    out_records = []
+    for info in listed:
+        out_records.append({
+            'name': info.get('name'),
+            'status': info.get('status'),
+            'status_code': info.get('status_code'),
+            'value': info.get('value'),
+            'last_heard': info.get('last_heard'),
+            'discovery_hash': bytes_to_hex(info['discovery_hash'])
+            if isinstance(info.get('discovery_hash'), bytes)
+            else info.get('discovery_hash'),
+        })
+
+    _clean()
+    return {
+        'requested': requested,
+        'listed': out_records,
+        'threshold_unknown': Discovery.InterfaceDiscovery.THRESHOLD_UNKNOWN,
+        'threshold_stale': Discovery.InterfaceDiscovery.THRESHOLD_STALE,
+        'threshold_remove': Discovery.InterfaceDiscovery.THRESHOLD_REMOVE,
+        'status_available': Discovery.InterfaceDiscovery.STATUS_AVAILABLE,
+        'status_unknown': Discovery.InterfaceDiscovery.STATUS_UNKNOWN,
+        'status_stale': Discovery.InterfaceDiscovery.STATUS_STALE,
+    }
+
+
+def cmd_discovery_store_record(params):
+    """Drive the REAL InterfaceDiscovery storage/listing whitelist + dedup paths
+    over a GENUINE discovery record.
+
+    Exercises three resolver-store decisions that are made entirely by RNS:
+      * the storage-acceptance type whitelist in interface_discovered — a record
+        whose type is NOT in InterfaceDiscovery.DISCOVERABLE_TYPES (notably
+        TCPClientInterface, which the handler-level DISCOVERABLE_INTERFACE_TYPES
+        DOES accept) is received but never written to disk (Discovery.py:457);
+      * the re-announce dedup / heard_count increment for a repeated record
+        (same transport_id+name -> same discovery_hash filename, Discovery.py:
+        356-357,476-495);
+      * the listing trust-revocation purge — with an interface_discovery_sources
+        allowlist applied at LIST time, a stored record whose network_id is not
+        in the allowlist is removed (Discovery.py:417-418).
+
+    The record is a real announce built by get_interface_announce_data (and, when
+    set_interface_type forces a type the sender would otherwise rewrite,
+    re-stamped through the real craft path), received through real
+    received_announce to obtain the genuine info dict, then stored via real
+    interface_discovered. The bridge reconstructs no storage logic; it only
+    chooses the type/repeat/source allowlist and reads RNS's verdict back: stored
+    is a filesystem existence check on the record file RNS wrote, and heard_count
+    is read off the info dict real list_discovered_interfaces returns.
+    """
+    _get_full_rns()
+    from RNS import Discovery
+    RNS = Discovery.RNS
+    _ensure_minimal_rns_on(RNS)
+
+    setattr(RNS.Reticulum, '_Reticulum__transport_enabled', True)
+    # Source allowlist seen by received_announce while building the record.
+    recv_sources = params.get('recv_sources')
+    setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+            [hex_to_bytes(s) for s in recv_sources] if recv_sources else [])
+
+    disc = Discovery.InterfaceDiscovery(discover_interfaces=False)
+
+    def _clean():
+        for fn in os.listdir(disc.storagepath):
+            try:
+                os.unlink(os.path.join(disc.storagepath, fn))
+            except OSError:
+                pass
+
+    _clean()
+
+    set_type = params.get('set_interface_type')
+    repeat = int(params.get('repeat', 1))
+    stamp_value = params.get('stamp_value', 6)
+    fields = params.get('fields') or {
+        'name': params.get('name', 'Node'),
+        'reachable_on': 'example.com', 'port': 4242}
+
+    if params.get('announce_identity_priv'):
+        announced = RNS.Identity.from_bytes(
+            hex_to_bytes(params['announce_identity_priv']))
+    else:
+        announced = RNS.Identity()
+
+    base = {'interface_type': 'TCPServerInterface', 'stamp_value': stamp_value,
+            'transport_enabled': True, 'fields': fields}
+    if set_type:
+        crafted = cmd_discovery_craft_announce({**base, 'set_interface_type': set_type})
+        app_data = hex_to_bytes(crafted['app_data'])
+    else:
+        built = cmd_discovery_build_announce_appdata(base)
+        app_data = hex_to_bytes(built['app_data'])
+
+    record_type = None
+    discovery_hash = None
+    received_ok = False
+    for _ in range(repeat):
+        captured = {}
+
+        def _cb(info, _c=captured):
+            if info:
+                _c.update(info)
+
+        handler = Discovery.InterfaceAnnounceHandler(
+            required_value=stamp_value, callback=_cb)
+        handler.received_announce(announced.hash, announced, app_data)
+        if not captured:
+            break
+        received_ok = True
+        record_type = captured.get('type')
+        discovery_hash = captured.get('discovery_hash')
+        disc.interface_discovered(captured)
+
+    fname = RNS.hexrep(discovery_hash, delimit=False) if discovery_hash else None
+    fpath = os.path.join(disc.storagepath, fname) if fname else None
+    stored = bool(fpath and os.path.isfile(fpath))
+
+    # Optional trust-revocation purge: apply a (possibly different) allowlist at
+    # LIST time and let list_discovered_interfaces enforce it.
+    if 'list_sources' in params:
+        ls = params['list_sources']
+        setattr(RNS.Reticulum, '_Reticulum__interface_sources',
+                [hex_to_bytes(s) for s in (ls or [])])
+    listed = disc.list_discovered_interfaces()
+    listed_names = [i.get('name') for i in listed]
+
+    # heard_count comes off the info dict RNS's list_discovered_interfaces
+    # returns (it unpacks the stored record itself); never decoded in-bridge.
+    heard_count = None
+    for i in listed:
+        ih = i.get('discovery_hash')
+        if discovery_hash is not None and ih == discovery_hash:
+            heard_count = i.get('heard_count')
+            break
+
+    _clean()
+    return {
+        'received': received_ok,
+        'record_type': record_type,
+        'stored': stored,
+        'heard_count': heard_count,
+        'discovery_hash': bytes_to_hex(discovery_hash) if discovery_hash else None,
+        'listed_names': listed_names,
+        'announce_identity_hash': bytes_to_hex(announced.hash),
+        'discoverable_types': list(Discovery.InterfaceDiscovery.DISCOVERABLE_TYPES),
+        'discoverable_interface_types':
+            list(Discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES),
+    }
+
+
+# Probe interface source: a minimal real RNS Interface subclass that opens no
+# sockets/hardware. Loaded via RNS's own external-interface mechanism
+# (Reticulum._synthesize_interface -> exec of a module exporting interface_class,
+# Reticulum.py:999-1021) so that the full real config-parsing pipeline
+# (mode-forcing, bitrate/announce_cap/ifac_size bound checks, discovery-interval
+# floor) runs and writes its results onto a genuine interface object we can read.
+_CONFIG_PARSE_PROBE_SRC = '''
+class ConfigParseProbeInterface(Interface):
+    AUTOCONFIGURE_MTU = False
+    DEFAULT_IFAC_SIZE = 16
+    def __init__(self, owner, configuration):
+        super().__init__()
+        self.owner = owner
+        self.online = False
+        self.IN = True
+        self.OUT = True
+        self.bitrate = 62500
+    def process_outgoing(self, data):
+        pass
+    def __str__(self):
+        return "ConfigParseProbeInterface[probe]"
+interface_class = ConfigParseProbeInterface
+'''
+
+_CONFIG_PARSE_PROBE_TYPE = "ConfigParseProbeInterface"
+
+
+def _ensure_config_parse_probe(RNS):
+    """Write the no-op probe interface module into the live instance's
+    interfacepath so RNS's external-interface loader can instantiate it."""
+    path = os.path.join(RNS.Reticulum.interfacepath,
+                        f"{_CONFIG_PARSE_PROBE_TYPE}.py")
+    if not os.path.isfile(path):
+        os.makedirs(RNS.Reticulum.interfacepath, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(_CONFIG_PARSE_PROBE_SRC)
+
+
+_MODE_NAMES = {
+    0x01: "full", 0x02: "pointtopoint", 0x03: "access_point",
+    0x04: "roaming", 0x05: "boundary", 0x06: "gateway",
+}
+
+
+def cmd_config_parse_interface(params):
+    """Push a raw RNS config string through RNS's OWN interface config parser
+    and read back the stored interface attributes.
+
+    Delegates entirely to real RNS: the raw text is parsed by RNS's vendored
+    ConfigObj (the exact parser Reticulum uses on its config file), and the
+    resulting section is handed to the live Reticulum instance's real
+    `_synthesize_interface` (Reticulum.py:685-1034). That method performs all
+    the config-derived decisions under test — interface_mode selection and the
+    discoverable=true mode-forcing (Reticulum.py:807-848), the
+    bitrate>=MINIMUM_BITRATE bound (:765-768), the announce_cap (0,100] bound
+    (:791-794), the ifac_size>=IFAC_MIN_SIZE*8 bound (:719-722), and the
+    discovery announce-interval 5-minute floor / 6h default (:824-828) — and
+    writes them onto a genuine Interface object. The interface is the no-op
+    ConfigParseProbeInterface (a real RNS Interface subclass that opens nothing),
+    loaded through RNS's external-interface mechanism, so no sockets/hardware are
+    touched. We then read the stored attrs straight off RNS and detach the probe.
+
+    params:
+        config_text (str): raw config text containing a single [interfaces]
+            subsection; the interface `type` must be ConfigParseProbeInterface.
+        interface_name (str): the subsection name to synthesize.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS.vendor.configobj import ConfigObj
+    import io as _io
+
+    name = params['interface_name']
+    config_text = params['config_text']
+    _ensure_config_parse_probe(RNS)
+
+    co = ConfigObj(_io.StringIO(config_text))
+    if 'interfaces' not in co or name not in co['interfaces']:
+        return {'error': f'config_text has no [[{name}]] under [interfaces]'}
+    section = co['interfaces'][name]
+
+    inst = _rns_instance
+    before = set(id(i) for i in RNS.Transport.interfaces)
+    inst._synthesize_interface(section, name)
+    created = [i for i in RNS.Transport.interfaces if id(i) not in before]
+
+    result = {
+        # selected_interface_mode and configured_bitrate are written back into
+        # the config section by _synthesize_interface (Reticulum.py:925-926).
+        'selected_interface_mode': section.get('selected_interface_mode'),
+        'configured_bitrate': section.get('configured_bitrate'),
+    }
+    iface = created[0] if created else None
+    if iface is not None:
+        mode = int(iface.mode)
+        result.update({
+            'mode': mode,
+            'mode_name': _MODE_NAMES.get(mode),
+            'bitrate': int(iface.bitrate),
+            'announce_cap': float(iface.announce_cap),
+            'ifac_size': int(iface.ifac_size),
+            'default_ifac_size': int(iface.DEFAULT_IFAC_SIZE),
+            'discoverable': bool(iface.discoverable),
+            'discovery_announce_interval': iface.discovery_announce_interval,
+            # IFAC credential resolution (Reticulum.py:724-738, :895-916). RNS
+            # stores the resolved network name / passphrase straight onto the
+            # interface; an empty-string config value resolves to None (unset),
+            # and the networkname/network_name and passphrase/pass_phrase aliases
+            # both feed the same attribute. ifac_active reflects whether RNS
+            # actually derived an IFAC identity (interface.ifac_identity is set
+            # iff netname or netkey is non-None).
+            'ifac_netname': getattr(iface, 'ifac_netname', None),
+            'ifac_netkey': getattr(iface, 'ifac_netkey', None),
+            'ifac_active': getattr(iface, 'ifac_identity', None) is not None,
+            # Per-interface ingress-control (ic_*) knobs. RNS 1.3.1's
+            # Interface.__init__ seeds these from Reticulum.get_instance().
+            # _default_ic_* (Interface.py:120-130, falling back to the
+            # Interface class constants), and _synthesize_interface overrides
+            # them from the [[interface]] config when present
+            # (Reticulum.py:744-892). We read them straight off the live
+            # interface object so tests can pin both the override path and the
+            # class-constant default fallback.
+            'ic_max_held_announces': _maybe_num(getattr(iface, 'ic_max_held_announces', None)),
+            'ic_burst_hold': _maybe_num(getattr(iface, 'ic_burst_hold', None)),
+            'ic_burst_freq_new': _maybe_num(getattr(iface, 'ic_burst_freq_new', None)),
+            'ic_burst_freq': _maybe_num(getattr(iface, 'ic_burst_freq', None)),
+            'ic_new_time': _maybe_num(getattr(iface, 'ic_new_time', None)),
+            'ic_burst_penalty': _maybe_num(getattr(iface, 'ic_burst_penalty', None)),
+            'ic_held_release_interval': _maybe_num(getattr(iface, 'ic_held_release_interval', None)),
+        })
+        RNS.Transport.remove_interface(iface)
+    return result
+
+
+def cmd_interface_default_ifac_size(params):
+    """Return the per-class DEFAULT_IFAC_SIZE constants for the RNS interface
+    types, read straight off the interface CLASS objects.
+
+    Delegates entirely to real RNS: each value is the class attribute
+    `<Interface>.DEFAULT_IFAC_SIZE` (e.g. SerialInterface.py:53 == 8,
+    TCPInterface.py:77 == 16). These are static class constants, so the classes
+    are merely imported and the attribute read — no instance is built and no
+    device/socket is opened (the serial/KISS/RNode classes only touch hardware
+    at __init__, which we never call). This pins the spec rule that
+    low-bandwidth, framed-serial media (Serial/KISS/AX25KISS/RNode/Pipe) default
+    to an 8-byte IFAC authentication tag while packet/IP media (TCP/UDP/Auto)
+    default to 16 — an impl that used 16 on serial-class media would partition
+    itself from conformant peers on those networks.
+    """
+    RNS = _ensure_minimal_rns()
+    from RNS.Interfaces.SerialInterface import SerialInterface
+    from RNS.Interfaces.KISSInterface import KISSInterface
+    from RNS.Interfaces.AX25KISSInterface import AX25KISSInterface
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    from RNS.Interfaces.PipeInterface import PipeInterface
+    from RNS.Interfaces.TCPInterface import TCPServerInterface, TCPClientInterface
+    from RNS.Interfaces.UDPInterface import UDPInterface
+
+    classes = {
+        "SerialInterface": SerialInterface,
+        "KISSInterface": KISSInterface,
+        "AX25KISSInterface": AX25KISSInterface,
+        "RNodeInterface": RNodeInterface,
+        "PipeInterface": PipeInterface,
+        "TCPServerInterface": TCPServerInterface,
+        "TCPClientInterface": TCPClientInterface,
+        "UDPInterface": UDPInterface,
+    }
+    return {
+        "default_ifac_size": {
+            name: int(cls.DEFAULT_IFAC_SIZE) for name, cls in classes.items()
+        },
+        "ifac_min_size": int(RNS.Reticulum.IFAC_MIN_SIZE),
+    }
+
+
+def cmd_interface_optimise_mtu(params):
+    """Run RNS's real Interface.optimise_mtu bitrate->HW_MTU tier mapping.
+
+    Delegates to the live (unbound) RNS.Interfaces.Interface.optimise_mtu
+    (Interface.py:198-221), driven over a stand-in carrying exactly the two
+    attributes that method reads (AUTOCONFIGURE_MTU, bitrate) and the HW_MTU
+    slot it writes — the same stand-in pattern used by the framing read/write
+    hooks. The bridge computes no MTU itself: RNS picks the bitrate tier and
+    assigns HW_MTU. When autoconfigure is False, RNS leaves HW_MTU untouched
+    (the pre-seeded sentinel is returned), pinning that the tier table only
+    fires for AUTOCONFIGURE_MTU interfaces.
+
+    params:
+        bitrate (int): the interface bitrate (bps) to map.
+        autoconfigure (bool, default True): the AUTOCONFIGURE_MTU flag.
+    """
+    _get_full_rns()
+    import types
+    from RNS.Interfaces.Interface import Interface
+
+    bitrate = int(params['bitrate'])
+    autoconfigure = bool(params.get('autoconfigure', True))
+    # Sentinel HW_MTU so a no-op (autoconfigure off) is observable as unchanged.
+    sentinel = -1
+    stand_in = types.SimpleNamespace(
+        AUTOCONFIGURE_MTU=autoconfigure, bitrate=bitrate, HW_MTU=sentinel,
+    )
+    Interface.optimise_mtu(stand_in)
+    return {
+        'hw_mtu': stand_in.HW_MTU,
+        'unchanged': stand_in.HW_MTU == sentinel,
     }
 
 
@@ -4580,111 +3922,59 @@ COMMANDS = {
     'pkcs7_unpad': cmd_pkcs7_unpad,
     'aes_encrypt': cmd_aes_encrypt,
     'aes_decrypt': cmd_aes_decrypt,
+    'aes_256_cbc_encrypt': cmd_aes_256_cbc_encrypt,
+    'aes_256_cbc_decrypt': cmd_aes_256_cbc_decrypt,
     'token_encrypt': cmd_token_encrypt,
     'token_decrypt': cmd_token_decrypt,
     'token_verify_hmac': cmd_token_verify_hmac,
+    'token_generate_key': cmd_token_generate_key,
+    'crypto_provider_op': cmd_crypto_provider_op,
     'identity_from_private_key': cmd_identity_from_private_key,
     'identity_encrypt': cmd_identity_encrypt,
     'identity_decrypt': cmd_identity_decrypt,
     'identity_sign': cmd_identity_sign,
     'identity_verify': cmd_identity_verify,
     'identity_hash': cmd_identity_hash,
+    'identity_to_file': cmd_identity_to_file,
+    'identity_from_file': cmd_identity_from_file,
     'destination_hash': cmd_destination_hash,
     'truncated_hash': cmd_truncated_hash,
     'name_hash': cmd_name_hash,
-    'packet_flags': cmd_packet_flags,
-    'packet_parse_flags': cmd_packet_parse_flags,
-    'packet_pack': cmd_packet_pack,
+    'packet_build': cmd_packet_build,
     'packet_unpack': cmd_packet_unpack,
     'packet_hash': cmd_packet_hash,
+    'packet_constants': cmd_packet_constants,
+    'packet_context_constants': cmd_packet_context_constants,
+    'announce_queue_constants': cmd_announce_queue_constants,
+    'packet_build_raw_header2': cmd_packet_build_raw_header2,
+    'packet_resend_observe': cmd_packet_resend_observe,
+    'identity_random_hash': cmd_identity_random_hash,
     'hdlc_escape': cmd_hdlc_escape,
-    'hdlc_frame': cmd_hdlc_frame,
-    'kiss_escape': cmd_kiss_escape,
-    'kiss_frame': cmd_kiss_frame,
-    # Link operations
-    'link_id_from_packet': cmd_link_id_from_packet,
-    'link_derive_key': cmd_link_derive_key,
-    'link_encrypt': cmd_link_encrypt,
-    'link_decrypt': cmd_link_decrypt,
-    'link_prove': cmd_link_prove,
-    'link_verify_proof': cmd_link_verify_proof,
-    'link_signalling_bytes': cmd_link_signalling_bytes,
-    'link_parse_signalling': cmd_link_parse_signalling,
-    'link_rtt_pack': cmd_link_rtt_pack,
-    'link_rtt_unpack': cmd_link_rtt_unpack,
-    'link_request_pack': cmd_link_request_pack,
-    'link_request_unpack': cmd_link_request_unpack,
-    'link_response_pack': cmd_link_response_pack,
-    'link_response_unpack': cmd_link_response_unpack,
     # Ratchet operations
     'ratchet_id': cmd_ratchet_id,
     'ratchet_public_from_private': cmd_ratchet_public_from_private,
-    'ratchet_derive_key': cmd_ratchet_derive_key,
     'ratchet_encrypt': cmd_ratchet_encrypt,
     'ratchet_decrypt': cmd_ratchet_decrypt,
-    'ratchet_storage_format': cmd_ratchet_storage_format,
-    'ratchet_extract_from_announce': cmd_ratchet_extract_from_announce,
-    'ratchet_file_write': cmd_ratchet_file_write,
-    'ratchet_file_read': cmd_ratchet_file_read,
+    'identity_remember': cmd_identity_remember,
+    'identity_keyless_op': cmd_identity_keyless_op,
     # Announce operations
-    'random_hash': cmd_random_hash,
-    'announce_pack': cmd_announce_pack,
-    'announce_unpack': cmd_announce_unpack,
-    'announce_sign': cmd_announce_sign,
-    'announce_verify': cmd_announce_verify,
-    # Channel operations
-    'envelope_pack': cmd_envelope_pack,
-    'envelope_unpack': cmd_envelope_unpack,
-    'stream_msg_pack': cmd_stream_msg_pack,
-    'stream_msg_unpack': cmd_stream_msg_unpack,
-    # Transport operations
-    'path_entry_serialize': cmd_path_entry_serialize,
-    'path_entry_deserialize': cmd_path_entry_deserialize,
-    'path_request_pack': cmd_path_request_pack,
-    'path_request_unpack': cmd_path_request_unpack,
-    'packet_hashlist_pack': cmd_packet_hashlist_pack,
-    'packet_hashlist_unpack': cmd_packet_hashlist_unpack,
-    # Resource operations
-    'resource_adv_pack': cmd_resource_adv_pack,
-    'resource_adv_unpack': cmd_resource_adv_unpack,
-    'resource_hash': cmd_resource_hash,
-    'resource_flags': cmd_resource_flags,
-    'hashmap_pack': cmd_hashmap_pack,
-    'resource_map_hash': cmd_resource_map_hash,
-    'resource_build_hashmap': cmd_resource_build_hashmap,
-    'resource_proof': cmd_resource_proof,
-    'resource_find_part': cmd_resource_find_part,
-    # IFAC operations
-    'ifac_derive_key': cmd_ifac_derive_key,
-    'ifac_compute': cmd_ifac_compute,
-    'ifac_verify': cmd_ifac_verify,
-    'ifac_mask_packet': cmd_ifac_mask_packet,
-    'ifac_unmask_packet': cmd_ifac_unmask_packet,
+    'announce_build': cmd_announce_build,
+    'announce_validate': cmd_announce_validate,
     # Compression operations
     'bz2_compress': cmd_bz2_compress,
     'bz2_decompress': cmd_bz2_decompress,
-    # LXMF operations
-    'lxmf_pack': cmd_lxmf_pack,
-    'lxmf_unpack': cmd_lxmf_unpack,
-    'lxmf_unpack_with_fields': cmd_lxmf_unpack_with_fields,
-    'lxmf_hash': cmd_lxmf_hash,
-    'lxmf_stamp_workblock': cmd_lxmf_stamp_workblock,
-    'lxmf_stamp_valid': cmd_lxmf_stamp_valid,
-    'lxmf_stamp_generate': cmd_lxmf_stamp_generate,
-    # Live Reticulum/LXMF networking
+    # Interface framing (HDLC / KISS deframing)
+    'hdlc_deframe': cmd_hdlc_deframe,
+    'kiss_deframe': cmd_kiss_deframe,
+    # Interface framing driven through the real RNS read/write loops
+    'hdlc_frame': cmd_hdlc_frame,
+    'kiss_frame': cmd_kiss_frame,
+    'hdlc_deframe_stream': cmd_hdlc_deframe_stream,
+    'kiss_deframe_stream': cmd_kiss_deframe_stream,
+    'auto_discovery_token': cmd_auto_discovery_token,
+    'interface_hw_mtu': cmd_interface_hw_mtu,
     'rns_start': cmd_rns_start,
     'rns_stop': cmd_rns_stop,
-    'lxmf_start_router': cmd_lxmf_start_router,
-    'lxmf_get_messages': cmd_lxmf_get_messages,
-    'lxmf_clear_messages': cmd_lxmf_clear_messages,
-    'lxmf_announce': cmd_lxmf_announce,
-    'lxmf_send_direct': cmd_lxmf_send_direct,
-    'lxmf_send_opportunistic': cmd_lxmf_send_opportunistic,
-    # Propagation node operations
-    'propagation_node_start': cmd_propagation_node_start,
-    'propagation_node_get_messages': cmd_propagation_node_get_messages,
-    'propagation_node_submit_for_recipient': cmd_propagation_node_submit_for_recipient,
-    'propagation_node_announce': cmd_propagation_node_announce,
     # Live RNS protocol operations (link, resource, ratchet)
     'rns_create_destination': cmd_rns_create_destination,
     'rns_get_established_link': cmd_rns_get_established_link,
@@ -4710,11 +4000,33 @@ COMMANDS = {
     'rns_clear_request_responses': cmd_rns_clear_request_responses,
     # Proof strategy
     'rns_set_proof_strategy': cmd_rns_set_proof_strategy,
-    # Local client reader (raw socket for E2E announce forwarding tests)
-    'local_client_connect': cmd_local_client_connect,
-    'local_client_read_packets': cmd_local_client_read_packets,
-    'local_client_disconnect': cmd_local_client_disconnect,
-    'packet_parse_header': cmd_packet_parse_header,
+    # Destination constructor / lifecycle (Destination.py)
+    'destination_construct': cmd_destination_construct,
+    'destination_announce_attempt': cmd_destination_announce_attempt,
+    'app_and_aspects_from_name': cmd_app_and_aspects_from_name,
+    'hash_from_name_and_identity': cmd_hash_from_name_and_identity,
+    'destination_expand_name': cmd_destination_expand_name,
+    'destination_set_proof_strategy_raw': cmd_destination_set_proof_strategy_raw,
+    'destination_rotate_ratchets': cmd_destination_rotate_ratchets,
+    'destination_group_encrypt': cmd_destination_group_encrypt,
+    'destination_default_app_data': cmd_destination_default_app_data,
+    'destination_register_request_handler_validate': cmd_destination_register_request_handler_validate,
+    'destination_path_response_cache': cmd_destination_path_response_cache,
+    # Interface-discovery subsystem (Discovery.py) — pure-function KATs
+    'discovery_build_announce_appdata': cmd_discovery_build_announce_appdata,
+    'discovery_receive_announce': cmd_discovery_receive_announce,
+    'discovery_stamp': cmd_discovery_stamp,
+    'discovery_validate_address': cmd_discovery_validate_address,
+    'discovery_sanitize_name': cmd_discovery_sanitize_name,
+    'discovery_craft_announce': cmd_discovery_craft_announce,
+    'discovery_announce_identity': cmd_discovery_announce_identity,
+    'discovery_feature_defaults': cmd_discovery_feature_defaults,
+    'discovery_inject_records': cmd_discovery_inject_records,
+    'discovery_store_record': cmd_discovery_store_record,
+    # Reticulum config parsing — raw config string through RNS's own parser
+    'config_parse_interface': cmd_config_parse_interface,
+    'interface_default_ifac_size': cmd_interface_default_ifac_size,
+    'interface_optimise_mtu': cmd_interface_optimise_mtu,
 }
 
 # Behavioral conformance commands (black-box Transport tests).
@@ -4731,15 +4043,6 @@ except ImportError:
 try:
     from wire_tcp import WIRE_COMMANDS
     COMMANDS.update(WIRE_COMMANDS)
-except ImportError:
-    pass
-
-# LXMF-layer conformance commands (propagation E2E tests). Layered on top
-# of wire_tcp — lxmf_start binds to an existing wire handle rather than
-# reinitializing RNS. See lxmf_bridge.py for the rationale.
-try:
-    from lxmf_bridge import LXMF_COMMANDS
-    COMMANDS.update(LXMF_COMMANDS)
 except ImportError:
     pass
 
@@ -4775,8 +4078,58 @@ def handle_request(request):
 
 def main():
     """Main server loop."""
+    # Pre-warm the FULL real RNS once, single-threaded, before READY — i.e.
+    # before any command runs and before any Reticulum background thread can
+    # exist. `import RNS` transitively loads RNS.Channel + RNS.Buffer (its
+    # __init__ does `from .Channel import ...` / `from .Buffer import ...`),
+    # which is what the wire/channel/buffer handlers pull in lazily
+    # (`from RNS.Channel import ...`) on RNS callback threads.
+    #
+    # Crucially we route through `_get_full_rns()` rather than a bare
+    # `import RNS.Channel`: that POPULATES the module cache AND, by leaving a
+    # fully-initialised RNS resident in sys.modules, makes every later
+    # `_get_full_rns()` — including the SEPARATE `bridge_server` module-identity
+    # copy used by wire_tcp — ADOPT this RNS instead of wiping+reimporting it.
+    # The old bare-import pre-warm cached nothing, so the first wire command
+    # still wiped (single-threaded) and a later __main__ command wiped AGAIN
+    # while Reticulum threads ran — the import-lock race that produced the
+    # flaky `_DeadlockError` / "partially initialized module 'RNS.Channel'".
+    #
+    # Best-effort: a resolution failure must not abort the bridge. If the load
+    # genuinely fails it leaves no fully-initialised RNS resident, so the first
+    # real command's `_get_full_rns()` recovers it (still single-threaded,
+    # before any thread) via the clean-slate path.
+    try:
+        _get_full_rns()
+    except Exception:
+        pass
+
+    # Pre-warm the FULL real LXMF once, single-threaded, before READY — same
+    # rationale as the RNS pre-warm above. The interface-discovery commands
+    # (cmd_discovery_stamp / cmd_discovery_build_announce_appdata / ...) lazily
+    # do `from LXMF import LXStamper` while RNS background threads run. LXMF's
+    # package __init__ is a HEAVY transitive import (LXMessage, LXMRouter,
+    # LXMF.LXStamper, and a wide slice of RNS). Importing it for the first time
+    # on a handler thread under parallel CPU contention races itself / the RNS
+    # submodule loader -> "partially initialized module 'LXMF'" / "No module
+    # named 'LXMF'" (the LXMF twin of the RNS.Channel import race). Loading it
+    # here — after real RNS is resident, before any thread exists — makes every
+    # later `from LXMF import ...` a pure sys.modules lookup. Best-effort: a
+    # failure must not abort the bridge; the command path imports on demand.
+    try:
+        import LXMF.LXStamper  # noqa: F401
+    except Exception:
+        pass
+
     # Signal ready
     print("READY", flush=True)
+
+    # After READY, reroute stdout to stderr so RNS.log() (which writes to
+    # sys.stdout by default) doesn't pollute the JSON-RPC channel — and
+    # so its diagnostics are actually visible when wrapping the bridge
+    # for stderr capture.
+    _stdout_for_rpc = sys.stdout
+    sys.stdout = sys.stderr
 
     # Process commands
     for line in sys.stdin:
@@ -4787,14 +4140,14 @@ def main():
         try:
             request = json.loads(line)
             response = handle_request(request)
-            print(json.dumps(response), flush=True)
+            print(json.dumps(response), flush=True, file=_stdout_for_rpc)
         except json.JSONDecodeError as e:
             error_response = {
                 'id': 'parse_error',
                 'success': False,
                 'error': f"JSON parse error: {e}"
             }
-            print(json.dumps(error_response), flush=True)
+            print(json.dumps(error_response), flush=True, file=_stdout_for_rpc)
 
 
 if __name__ == '__main__':

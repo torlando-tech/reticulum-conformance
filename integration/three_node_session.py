@@ -203,33 +203,41 @@ class ThreeNodeSession:
         c_to_b_r, c_to_b_w = os.pipe()
         b_to_c_r, b_to_c_w = os.pipe()
 
-        if self.target_cmd is None:
-            # All-Python mode: B is in-process
-            self._start_python_b(
-                b_mode_a, b_mode_c,
-                a_to_b_r, b_to_a_w,
-                c_to_b_r, b_to_c_w,
-            )
-        else:
-            # Target subprocess mode (Swift)
-            self._start_target_b(
-                b_mode_a, b_mode_c,
-                a_to_b_r, b_to_a_w,
-                c_to_b_r, b_to_c_w,
-            )
+        # If any step below raises (e.g. an in-process RNS start that creates
+        # the Reticulum singleton then fails on _add_interface), tear down so
+        # the leaked singleton does not poison the next test with
+        # "Attempt to reinitialise Reticulum".
+        try:
+            if self.target_cmd is None:
+                # All-Python mode: B is in-process
+                self._start_python_b(
+                    b_mode_a, b_mode_c,
+                    a_to_b_r, b_to_a_w,
+                    c_to_b_r, b_to_c_w,
+                )
+            else:
+                # Target subprocess mode (Swift)
+                self._start_target_b(
+                    b_mode_a, b_mode_c,
+                    a_to_b_r, b_to_a_w,
+                    c_to_b_r, b_to_c_w,
+                )
 
-        # Start peer A: reads from b_to_a_r, writes to a_to_b_w
-        self.peer_a = self._make_peer(a_action, extra_env=a_env, cmd_override=a_cmd)
-        self.peer_a.start(b_to_a_r, a_to_b_w)
-        # Close these fds in parent — peer inherited them
-        os.close(b_to_a_r)
-        os.close(a_to_b_w)
+            # Start peer A: reads from b_to_a_r, writes to a_to_b_w
+            self.peer_a = self._make_peer(a_action, extra_env=a_env, cmd_override=a_cmd)
+            self.peer_a.start(b_to_a_r, a_to_b_w)
+            # Close these fds in parent — peer inherited them
+            os.close(b_to_a_r)
+            os.close(a_to_b_w)
 
-        # Start peer C: reads from b_to_c_r, writes to c_to_b_w
-        self.peer_c = self._make_peer(c_action, extra_env=c_env, cmd_override=c_cmd)
-        self.peer_c.start(b_to_c_r, c_to_b_w)
-        os.close(b_to_c_r)
-        os.close(c_to_b_w)
+            # Start peer C: reads from b_to_c_r, writes to c_to_b_w
+            self.peer_c = self._make_peer(c_action, extra_env=c_env, cmd_override=c_cmd)
+            self.peer_c.start(b_to_c_r, c_to_b_w)
+            os.close(b_to_c_r)
+            os.close(c_to_b_w)
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self):
         if self.peer_a:
@@ -248,7 +256,10 @@ class ThreeNodeSession:
                 self.b_process.kill()
                 self.b_process.wait()
         if self.b_reticulum:
-            self.RNS.Reticulum.exit_handler()
+            try:
+                self.RNS.Reticulum.exit_handler()
+            except Exception:
+                pass
             self.RNS.Reticulum._Reticulum__instance = None
             T = self.RNS.Transport
             T.interfaces = []
@@ -269,12 +280,14 @@ class ThreeNodeSession:
             T.local_client_q_cache = []
             if hasattr(T, 'rate_table'):
                 T.rate_table = {}
-            # Reticulum 2026-05-05+ has a Transport._should_run kill switch that
-            # exit_handler() flips False; Transport.start() doesn't reset it, so
-            # the *next* Reticulum() in this process gets a dead jobloop and
-            # silently drops announces / path requests. Re-arm it here, since
-            # this harness deliberately creates multiple Reticulum instances
-            # per process. Upstream commit a3cd1ea8 introduced this state.
+            # RNS gates the Transport jobloop on a class-level
+            # Transport._should_run flag (RNS 1.3.1 Transport.py:210, jobloop
+            # at :501; introduced upstream in commit a3cd1ea8). exit_handler()
+            # flips it False (Transport.py:3401) but Transport.start() never
+            # resets it, so the *next* in-process Reticulum() gets a dead jobloop
+            # that silently drops announces and path requests. This harness
+            # creates one Reticulum (Node B) per test, so re-arm the flag here
+            # alongside the other Transport state.
             if hasattr(T, "_should_run"):
                 T._should_run = True
             self.b_reticulum = None
@@ -429,6 +442,11 @@ class ThreeNodeSession:
         from RNS.Interfaces.Interface import Interface as BaseInterface
 
         class _HdlcPipe(BaseInterface):
+            # RNS 1.3.1 Reticulum._add_interface reads interface.DEFAULT_IFAC_SIZE
+            # (Reticulum.py:1050) when no ifac_size is supplied; the base
+            # Interface class defines no default, so omitting this raises
+            # AttributeError. PipeInterface.DEFAULT_IFAC_SIZE is 8; match it.
+            DEFAULT_IFAC_SIZE = 8
             FLAG = 0x7E
             ESC = 0x7D
             ESC_MASK = 0x20

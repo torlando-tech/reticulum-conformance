@@ -55,6 +55,12 @@ catch silent duplicate deliveries.
 import secrets
 import time
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 _SETTLE_SEC = 1.5
 _LINK_TIMEOUT_MS = 15000
@@ -138,6 +144,13 @@ def _assert_no_leak(
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "get_received_packets", "link_open", "link_send", "link_poll",
+    ],
+    verifies="A correctly-routing transport hub delivers in-Link DATA only to the addressed receiver: after the sender opens a Link through the hub and sends a 32-byte random marker payload, the receiver gets the payload while the witness's inbound tap contains zero packets embedding either the payload bytes or the receiver's destination hash (no fan-out leak).",
+)
 def test_link_data_does_not_leak_to_witness(wire_hub_isolation):
     """Scenario 1 — Link DATA exclusivity.
 
@@ -188,6 +201,13 @@ def test_link_data_does_not_leak_to_witness(wire_hub_isolation):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "get_received_packets", "request_path",
+    ],
+    verifies="A correctly-routing transport hub replies to a path-request only to the asker: after the sender fires a path-request for the receiver's destination, the witness's inbound tap contains zero packets embedding the receiver's destination hash (no path-response fan-out leak to a bystander peer).",
+)
 def test_path_request_response_does_not_leak_to_witness(wire_hub_isolation):
     """Scenario 2 — Path-response exclusivity.
 

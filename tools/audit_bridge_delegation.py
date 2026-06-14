@@ -168,11 +168,12 @@ MIRRORS_RNS_RECEIVE: dict[str, str] = {
 ADVERSARIAL_CORRUPTORS: dict[str, str] = {
     "cmd_wire_send_undecryptable":
         "Builds a real SINGLE DATA packet to the recalled OUT destination via "
-        "RNS.Packet.pack (genuine RNS encryption + receipt), then damages one "
-        "ciphertext byte so the receiver's Token HMAC verification fails and "
-        "Destination.receive returns False. Asserts the receiver delivers nothing "
-        "and emits no proof — the real decrypt/reject path is under test; no "
-        "protocol is assembled here.",
+        "RNS.Packet.pack (genuine RNS encryption + receipt), then DAMAGES only "
+        "the ciphertext — either bumping one Token HMAC tail byte (decrypt fails, "
+        "dropped at Destination.receive) or stripping the ciphertext entirely "
+        "(rejected at the deframe/parse layer). Asserts the receiver delivers "
+        "nothing and emits no proof — the real decrypt/reject path is under test; "
+        "no protocol is assembled here (truncation removes bytes, it adds none).",
     "cmd_wire_inject_tampered_link_data":
         "Packs a real DATA packet to an established link via RNS.Packet.pack, "
         "damages one byte (or truncates), and feeds it to the real link.receive; "

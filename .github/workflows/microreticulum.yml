@@ -75,19 +75,24 @@ jobs:
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         # Tier 2A scope: stateless primitives. Skip suites that need
         # commands the bridge doesn't implement yet:
-        #   wire/, behavioral/, lxmf/  — Tier 2B transport layer
-        #   test_ratchet, test_ratchet_lifecycle  — RNS 1.x ratchet API
-        #   test_compression  — libbz2 not built into the bridge
-        #   test_channel  — msgpack-dependent
+        #   wire/, behavioral/, lxmf/  — Tier 2B transport layer (the bridge
+        #     has no networking / rns_start / full LXMF router)
+        #   test_compression  — bz2_compress/decompress; libbz2 is stripped
+        #     from the bridge build (BZ2.cpp excluded in CMakeLists)
+        #
+        # test_ratchet, test_ratchet_lifecycle and test_channel now pass and
+        # are no longer ignored (announce_*, ratchet_*, envelope_*,
+        # stream_msg_* commands implemented).
         #
         # Specific tests deselected within otherwise-passing suites:
-        #   test_hkdf_with_info, test_aes_encrypt_decrypt — downstream of
-        #     microReticulum HMAC/PKCS7 bugs (filing deferred — see
-        #     project_microreticulum_pkcs7_hmac_bugs.md)
-        #   test_identity_encrypt_decrypt, test_token_cross_decrypt — same
-        #   test_announce_pack_unpack/verify, test_link_encrypt_decrypt /
-        #     request_pack_unpack / rtt_pack_unpack, test_path_request /
-        #     packet_hashlist  — msgpack-dependent (Tier 2B)
+        #   test_hkdf_with_info, test_aes_encrypt_decrypt — the reference
+        #     pads/derives via paths microReticulum's standalone HKDF-with-info
+        #     and raw AES command paths don't match byte-for-byte (the Token
+        #     AES path IS byte-equivalent — see passing test_token/test_ratchet).
+        #     Filing deferred — see project_microreticulum_pkcs7_hmac_bugs.md
+        #   test_link_request_pack_unpack / rtt_pack_unpack,
+        #     test_packet_hashlist_pack_unpack — msgpack-encoded; the bridge
+        #     build excludes microReticulum's MsgPack (Tier 2B).
         #   test_ifac_mask/unmask/cross/wrong-key/small-size in
         #     test_transport.py — flag-bit ordering bug in bridge's
         #     ifac mask impl, plus param naming mismatch (masked_packet
@@ -99,20 +104,11 @@ jobs:
             --ignore=tests/behavioral \
             --ignore=tests/lxmf \
             --ignore=tests/test_lxmf.py \
-            --ignore=tests/test_ratchet.py \
-            --ignore=tests/test_ratchet_lifecycle.py \
             --ignore=tests/test_compression.py \
-            --ignore=tests/test_channel.py \
             --deselect tests/test_crypto.py::test_hkdf_with_info \
             --deselect tests/test_crypto.py::test_aes_encrypt_decrypt \
-            --deselect tests/test_identity.py::test_identity_encrypt_decrypt \
-            --deselect tests/test_token.py::test_token_cross_decrypt \
-            --deselect tests/test_announce.py::test_announce_pack_unpack \
-            --deselect tests/test_announce.py::test_announce_verify \
-            --deselect tests/test_link.py::test_link_encrypt_decrypt \
             --deselect tests/test_link.py::test_link_request_pack_unpack \
             --deselect tests/test_link.py::test_link_rtt_pack_unpack \
-            --deselect tests/test_transport.py::test_path_request_pack_unpack \
             --deselect tests/test_transport.py::test_packet_hashlist_pack_unpack \
             --deselect tests/test_ifac.py::test_ifac_mask_packet \
             --deselect tests/test_transport.py::test_ifac_mask_packet \

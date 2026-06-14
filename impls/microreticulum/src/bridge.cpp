@@ -2,7 +2,9 @@
 
 #include "Bytes.h"
 #include "Cryptography/HMAC.h"
+#include "Cryptography/AES.h"
 
+#include <random>
 #include <stdexcept>
 
 namespace bridge {
@@ -118,6 +120,66 @@ Bytes hmac_sha256(const Bytes& key, const Bytes& msg) {
     hmac.update(RNS::Bytes(msg.data(), msg.size()));
     auto h = hmac.digest();
     return Bytes(h.data(), h.data() + h.size());
+}
+
+Bytes random_bytes(size_t n) {
+    Bytes out(n);
+    std::random_device rd;
+    for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)(rd() & 0xFF);
+    return out;
+}
+
+Bytes token_seal(const Bytes& key64, const Bytes& plaintext, const Bytes& iv) {
+    if (key64.size() != 64) {
+        throw std::runtime_error("token_seal: key must be 64 bytes");
+    }
+    if (iv.size() != 16) {
+        throw std::runtime_error("token_seal: iv must be 16 bytes");
+    }
+    Bytes signing_key(key64.begin(), key64.begin() + 32);
+    Bytes encryption_key(key64.begin() + 32, key64.end());
+
+    Bytes padded = pkcs7_pad(plaintext);
+    RNS::Bytes ct = RNS::Cryptography::AES_256_CBC::encrypt(
+        RNS::Bytes(padded.data(), padded.size()),
+        RNS::Bytes(encryption_key.data(), encryption_key.size()),
+        RNS::Bytes(iv.data(), iv.size()));
+
+    Bytes signed_parts(iv);
+    signed_parts.insert(signed_parts.end(), ct.data(), ct.data() + ct.size());
+    Bytes mac = hmac_sha256(signing_key, signed_parts);
+
+    Bytes token = signed_parts;
+    token.insert(token.end(), mac.begin(), mac.end());
+    return token;
+}
+
+Bytes token_open(const Bytes& key64, const Bytes& token) {
+    if (key64.size() != 64) {
+        throw std::runtime_error("token_open: key must be 64 bytes");
+    }
+    // iv(16) + at least one AES-CBC block(16) + hmac(32).
+    if (token.size() < 16 + 16 + 32) {
+        throw std::runtime_error("token_open: token too short");
+    }
+    Bytes signing_key(key64.begin(), key64.begin() + 32);
+    Bytes encryption_key(key64.begin() + 32, key64.end());
+
+    Bytes iv(token.begin(), token.begin() + 16);
+    Bytes ct(token.begin() + 16, token.end() - 32);
+    Bytes mac_recv(token.end() - 32, token.end());
+    Bytes signed_parts(token.begin(), token.end() - 32);
+
+    Bytes mac_calc = hmac_sha256(signing_key, signed_parts);
+    if (!consttime_memequal(mac_recv.data(), mac_calc.data(), 32)) {
+        throw std::runtime_error("token_open: HMAC verification failed");
+    }
+
+    RNS::Bytes pt_padded = RNS::Cryptography::AES_256_CBC::decrypt(
+        RNS::Bytes(ct.data(), ct.size()),
+        RNS::Bytes(encryption_key.data(), encryption_key.size()),
+        RNS::Bytes(iv.data(), iv.size()));
+    return pkcs7_unpad(Bytes(pt_padded.data(), pt_padded.data() + pt_padded.size()));
 }
 
 }  // namespace bridge

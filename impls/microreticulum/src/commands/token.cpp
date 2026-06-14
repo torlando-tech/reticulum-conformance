@@ -39,28 +39,15 @@ void split_key(const bridge::Bytes& key, bridge::Bytes& signing, bridge::Bytes& 
 REGISTER_COMMAND(token_encrypt, {
     auto key = bridge::hex_param(p, "key");
     auto plaintext = bridge::hex_param(p, "plaintext");
+    // A pinned IV gives deterministic, cross-impl-comparable output; when the
+    // caller omits it we generate a random IV like a real RNS Token does, so
+    // SUT-encrypt -> reference-decrypt round trips still work.
     auto iv = bridge::hex_param_or_empty(p, "iv");
-    if (iv.empty()) {
-        throw std::runtime_error("token_encrypt: iv is required for deterministic output");
-    }
+    if (iv.empty()) iv = bridge::random_bytes(16);
     if (iv.size() != 16) {
         throw std::runtime_error("token_encrypt: iv must be 16 bytes");
     }
-
-    bridge::Bytes signing_key, encryption_key;
-    split_key(key, signing_key, encryption_key);
-
-    auto padded = bridge::pkcs7_pad(plaintext);
-    auto ct = RNS::Cryptography::AES_256_CBC::encrypt(to_rns(padded), to_rns(encryption_key), to_rns(iv));
-
-    bridge::Bytes signed_parts;
-    signed_parts.insert(signed_parts.end(), iv.begin(), iv.end());
-    signed_parts.insert(signed_parts.end(), ct.data(), ct.data() + ct.size());
-
-    auto hmac = bridge::hmac_sha256(signing_key, signed_parts);
-    bridge::Bytes token = signed_parts;
-    token.insert(token.end(), hmac.begin(), hmac.end());
-
+    auto token = bridge::token_seal(key, plaintext, iv);
     return bridge::json{{"token", bridge::to_hex(token)}};
 })
 

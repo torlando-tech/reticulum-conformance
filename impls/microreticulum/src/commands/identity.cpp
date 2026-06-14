@@ -101,14 +101,13 @@ REGISTER_COMMAND(identity_encrypt, {
     }
     bridge::Bytes x25519_pub(pub.begin(), pub.begin() + 32);
 
-    // Ephemeral key — caller may provide for determinism; otherwise generate.
+    // Ephemeral key — caller may pin it for determinism; otherwise generate a
+    // fresh one (real Identity.encrypt always uses a random ephemeral key).
     bridge::Bytes ephemeral_priv;
     if (p.contains("ephemeral_private") && !p["ephemeral_private"].is_null()) {
         ephemeral_priv = bridge::from_hex(p["ephemeral_private"].get<std::string>());
     } else {
-        // Generate from a deterministic seed for repeatability across runs
-        // when caller doesn't pass one. Conformance tests pass ephemeral_private.
-        throw std::runtime_error("identity_encrypt: ephemeral_private is required");
+        ephemeral_priv = bridge::random_bytes(32);
     }
 
     auto eph = RNS::Cryptography::X25519PrivateKey::from_private_bytes(to_rns(ephemeral_priv));
@@ -129,6 +128,7 @@ REGISTER_COMMAND(identity_encrypt, {
     bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
     auto iv = bridge::hex_param_or_empty(p, "iv");
+    if (iv.empty()) iv = bridge::random_bytes(16);
     if (iv.size() != 16) {
         throw std::runtime_error("identity_encrypt: iv must be 16 bytes");
     }

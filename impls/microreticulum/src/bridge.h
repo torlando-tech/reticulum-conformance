@@ -86,4 +86,19 @@ Bytes hmac_sha256(const Bytes& key, const Bytes& msg);
 // Returns true iff a[0..n] == b[0..n].
 bool consttime_memequal(const uint8_t* a, const uint8_t* b, size_t n);
 
+// Cryptographically-seeded random bytes (std::random_device). Used to
+// generate IVs / ephemeral scalars when the caller doesn't pin them.
+Bytes random_bytes(size_t n);
+
+// Reticulum Token (modified Fernet) seal/open. The Token is keyed by a
+// 64-byte key split as signing_key(32) || encryption_key(32) and laid out as:
+//   iv(16) || AES-256-CBC(pkcs7(plaintext), encryption_key, iv)
+//          || HMAC-SHA256(signing_key, iv || ciphertext)
+// These delegate AES to microReticulum's RNS::Cryptography (same primitive
+// the conformance suite proves byte-equivalent via test_token) and use the
+// spec-correct bridge pkcs7/hmac helpers. token_open throws on HMAC mismatch
+// or corrupt padding.
+Bytes token_seal(const Bytes& key64, const Bytes& plaintext, const Bytes& iv);
+Bytes token_open(const Bytes& key64, const Bytes& token);
+
 }  // namespace bridge

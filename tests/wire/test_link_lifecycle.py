@@ -263,7 +263,7 @@ def test_silent_peer_times_out_active_link(wire_peers):
 @conformance_case(
     commands=[
         "start_tcp_server", "start_tcp_client", "listen", "poll_path",
-        "link_open", "link_await_status",
+        "link_open", "link_await_status", "link_set_watchdog",
     ],
     verifies="Positive control distinguishing a clean close from a timeout: when the peer shuts down gracefully (its Reticulum exit handler sends a link teardown), the initiator's link closes with teardown_reason DESTINATION_CLOSED — NOT TIMEOUT",
 )

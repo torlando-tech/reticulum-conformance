@@ -143,26 +143,19 @@ jobs:
         # Sanity check: the Python reference should always pass every
         # test on its own, with no xfails. A red here means either a
         # test is broken or something drifted in Python RNS — either
-        # way a signal worth catching before shipping.
+        # way a signal worth catching before shipping. Serial, like the
+        # kotlin pass.
         #
-        # SCOPE NOTE: this baseline never actually executed in CI until the
-        # kotlin leg above started passing (a failing kotlin step skipped this
-        # one), so a body of behavioral [reference]-leg tests has latent,
-        # pre-existing breakage that was never exercised: under --reference-only
-        # the reference bridge double-inits Reticulum (idempotency guard misses
-        # the running singleton) and the transport-forwarding behavioral tests
-        # get a no-transport minimal instance. That is a multi-layer fix tracked
-        # as a FOLLOW-UP (see UPSTREAM_ISSUES.md / project notes) — it is NOT a
-        # regression from this PR. To keep the baseline meaningful for the legs
-        # that DO work, the known-broken reference-leg tests are excluded here
-        # (tests/behavioral wholesale + two announce-cap reference tests that
-        # hit the same reference-only init path). Serial, like the kotlin pass.
+        # The behavioral [reference] leg + two announce-cap reference tests
+        # were previously scoped out here: this baseline had never run in CI
+        # (a failing kotlin step always skipped it), hiding pre-existing
+        # breakage in the reference bridge under --reference-only (Reticulum
+        # double-init + a no-transport minimal instance for forwarding tests).
+        # That is now FIXED in reference/bridge_server.py (adopt the running
+        # Reticulum singleton; build a transport-enabled instance where
+        # forwarding is needed), so the full baseline runs again — no scope-out.
         working-directory: reticulum-conformance
         env:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        run: |
-          python3 -m pytest tests/ --reference-only -v --tb=short \
-            --ignore=tests/behavioral \
-            --deselect "tests/wire/test_announce_cap_rate.py::test_announce_cap_spaces_forwarded_announce_egress" \
-            --deselect "tests/wire/test_announce_cap_rate.py::test_announce_rate_suppresses_duplicate_dest_rebroadcast"
+        run: python3 -m pytest tests/ --reference-only -v --tb=short

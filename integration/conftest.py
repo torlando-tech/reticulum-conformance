@@ -7,6 +7,8 @@ via PipeInterface (HDLC-framed stdin/stdout).
 import os
 import pytest
 
+from _rns_paths import resolve_rns_path
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -24,7 +26,17 @@ def pytest_addoption(parser):
 
 @pytest.fixture(scope="session")
 def peer_cmd(request):
-    """Resolve the command to launch the target pipe peer."""
+    """Resolve the command to launch the target pipe peer.
+
+    --python-only: use the in-repo pipe_peer_local.py so PipeSession-based
+    tests (announce / IFAC / channel) exercise the reference end-to-end with
+    no external Swift/Kotlin binary required.
+    --peer-cmd X: use X (typically a built SUT binary).
+    Otherwise: auto-detect a Swift PipePeer build, else skip.
+    """
+    if request.config.getoption("--python-only"):
+        local = os.path.join(os.path.dirname(__file__), "pipe_peer_local.py")
+        return f"python3 {local}"
     cmd = request.config.getoption("--peer-cmd")
     if cmd:
         return cmd
@@ -38,22 +50,12 @@ def peer_cmd(request):
 
 @pytest.fixture(scope="session")
 def rns_path():
-    """Find the Python RNS reference implementation."""
-    env = os.environ.get("PYTHON_RNS_PATH")
-    if env:
-        return env
-    home = os.path.expanduser("~")
-    for candidate in [
-        os.path.join(home, "repos/Reticulum"),
-        os.path.join(home, "repos/public/Reticulum"),
-    ]:
-        if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "RNS")):
-            return candidate
+    """Find the Python RNS reference implementation.
+
+    Skip (rather than fail) if RNS can't be located — the integration suite
+    treats Python RNS as an optional reference for pipe-based tests.
+    """
     try:
-        import importlib.util
-        spec = importlib.util.find_spec("RNS")
-        if spec and spec.origin:
-            return os.path.dirname(os.path.dirname(spec.origin))
-    except (ImportError, ValueError):
-        pass
-    pytest.skip("Cannot find Python RNS. Install with: pip install rns")
+        return resolve_rns_path()
+    except RuntimeError as e:
+        pytest.skip(str(e))

@@ -38,15 +38,6 @@ def local_peer_cmd():
 
 
 @pytest.fixture(scope="session")
-def kt_peer_cmd():
-    """Path to the Kotlin pipe_peer.py."""
-    path = os.path.expanduser("~/repos/reticulum-kt/python-bridge/pipe_peer.py")
-    if not os.path.exists(path):
-        pytest.skip("pipe_peer.py not found")
-    return f"python3 {path}"
-
-
-@pytest.fixture(scope="session")
 def target_cmd(request):
     """Target command for Node B (None = Python, or Swift path)."""
     if request.config.getoption("--python-only"):
@@ -71,7 +62,7 @@ class TestDiscoverPathsGateway:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -81,7 +72,7 @@ class TestDiscoverPathsGateway:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         s.start(
             b_mode_a="full", b_mode_c="gateway",
@@ -133,7 +124,7 @@ class TestDiscoverPathsAP:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -143,7 +134,7 @@ class TestDiscoverPathsAP:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         s.start(
             b_mode_a="full", b_mode_c="ap",
@@ -190,7 +181,7 @@ class TestDiscoverPathsRoaming:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -200,7 +191,7 @@ class TestDiscoverPathsRoaming:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         s.start(
             b_mode_a="full", b_mode_c="roaming",
@@ -250,7 +241,7 @@ class TestDiscoverPathsFullBlocked:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -260,7 +251,7 @@ class TestDiscoverPathsFullBlocked:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         s.start(
             b_mode_a="full", b_mode_c="full",
@@ -309,7 +300,7 @@ class TestDiscoverPathsBoundaryBlocked:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -319,7 +310,7 @@ class TestDiscoverPathsBoundaryBlocked:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         s.start(
             b_mode_a="full", b_mode_c="boundary",
@@ -368,7 +359,7 @@ class TestKnownPathResponse:
     """
 
     @pytest.fixture
-    def session(self, rns_path, target_cmd, kt_peer_cmd, local_peer_cmd):
+    def session(self, rns_path, target_cmd, local_peer_cmd):
         hash_file = tempfile.NamedTemporaryFile(
             prefix="dest_hash_", suffix=".txt", delete=False
         )
@@ -378,7 +369,7 @@ class TestKnownPathResponse:
         s = ThreeNodeSession(
             rns_path=rns_path,
             target_cmd=target_cmd,
-            pipe_peer_cmd=kt_peer_cmd,
+            pipe_peer_cmd=local_peer_cmd,
         )
         # A announces (B learns path), C sends path request.
         # C's interface is full — announce forwarding full→full works,

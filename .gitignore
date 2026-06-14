@@ -5,13 +5,18 @@ impls/kotlin/build/
 impls/kotlin/gradle/
 impls/kotlin/gradlew
 impls/kotlin/gradlew.bat
+impls/microreticulum/build/
 
 # Python
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 
 # IDE
 .idea/
 *.swp
 .DS_Store
+
+# Editor backups
+*.bak

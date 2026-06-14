@@ -35,6 +35,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 _APP_NAME = "linkpostprove"
 _ASPECTS = ["test"]
@@ -78,6 +84,13 @@ _RESIDUAL_BUG_REASON = (
 
 
 @pytest.mark.xfail(strict=False, reason=_RESIDUAL_BUG_REASON)
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "set_race_inducer", "link_open", "link_send", "link_poll",
+    ],
+    verifies="The receiver-side post-prove invariant (reticulum-kt#54): with a Kotlin receiver stuck in an induced 2000ms post-prove sleep, the sender's first DATA packet sent immediately after link establishment is still delivered, proving all inbound link-DATA dispatch bookkeeping (registerLink into activeLinks, etc.) completes before link.prove() returns",
+)
 def test_first_data_arrives_during_induced_post_prove_window(wire_trio, wire_3peer):
     """Sender sends DATA immediately after link establishment; receiver is
     stuck in a 2000ms post-prove sleep. The DATA must still be delivered.

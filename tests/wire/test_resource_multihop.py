@@ -27,6 +27,13 @@ receiver_impl) triples the link-multihop test uses.
 import secrets
 import time
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
+
 _SETTLE_SEC = 1.5
 _LINK_TIMEOUT_MS = 15000
 _RESOURCE_TIMEOUT_MS = 30000
@@ -83,6 +90,13 @@ def _setup_three_peer_topology(wire_3peer, *, ifac: bool = False):
     return sender, receiver, dest_hash, link_id
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "resource_send", "resource_poll",
+    ],
+    verifies="A sub-MDU 256-byte Resource sent over a Link across a sender->transport->receiver multi-hop topology round-trips so the receiver gets the identical bytes (RESOURCE_ADV->REQ->DATA->PROOF works in the trivial unchunked case).",
+)
 def test_small_resource_multihop(wire_trio, wire_3peer):
     """A sub-MDU resource: exercises the Resource API without chunking.
 
@@ -108,6 +122,13 @@ def test_small_resource_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "resource_send", "resource_poll",
+    ],
+    verifies="A 16 KiB Resource requiring multi-packet chunking (mirroring the Columba image-send size) is sent over a multi-hop Link and reassembled byte-for-byte by the receiver.",
+)
 def test_chunked_resource_multihop(wire_trio, wire_3peer):
     """A larger resource that definitely requires chunking across
     multiple link DATA packets. ~16 KB mirrors the size Columba was
@@ -135,6 +156,13 @@ def test_chunked_resource_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "resource_send", "resource_poll",
+    ],
+    verifies="A 16 KiB chunked Resource sent over an IFAC-protected (per-packet tagged + XOR-masked) multi-hop Link round-trips intact, exercising the IFAC masking code path for Resource chunks.",
+)
 def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     """Same as test_chunked_resource_multihop but with IFAC enabled on
     every peer. Every on-wire packet gets a 16-byte IFAC tag and XOR
@@ -166,6 +194,13 @@ def test_chunked_resource_with_ifac_multihop(wire_trio, wire_3peer):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "link_open", "resource_send", "resource_poll",
+    ],
+    verifies="A 256 KiB Resource spanning many link DATA packets is sent over a multi-hop Link and reassembled byte-for-byte by the receiver, stress-testing back-to-back DATA transmission and reassembly.",
+)
 def test_large_resource_multihop(wire_trio, wire_3peer):
     """A resource large enough to guarantee many link DATA packets even
     at the TCP interface's large MTU. 256 KB split into chunks of

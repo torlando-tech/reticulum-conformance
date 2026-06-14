@@ -10,6 +10,7 @@ import warnings
 
 import pytest
 
+from _rns_paths import resolve_rns_path
 from bridge_client import BridgeClient
 
 # Bridge commands for each implementation.
@@ -95,23 +96,35 @@ def pytest_configure(config):
 
 
 def get_impl_list(config):
-    """Get list of implementations to test."""
+    """Get list of implementations to test.
+
+    Returns the impls to parametrize `sut` over. `--reference-only` is the
+    EXPLICIT escape that makes the reference its own SUT (a sanity run);
+    `--impl=X` selects one impl. With neither flag, the default is every
+    registered non-reference impl whose bridge is actually built on disk —
+    which may be EMPTY. An empty default result is NOT silently mapped to
+    reference (that was the false-confidence hole, V3 §7.4); pytest_generate_tests
+    hard-fails on it so a certification run can never self-certify by accident.
+    """
     impl = config.getoption("--impl")
     if impl:
         return [impl]
     if config.getoption("--reference-only"):
-        return []
-    # Default: test all registered implementations except reference
+        # Explicit operator choice: run the reference as its own SUT.
+        return ["reference"]
+    # Default: test every registered implementation (except reference) whose
+    # bridge binary/JAR is actually present on disk. The existence gate applies
+    # uniformly to all non-reference impls (swift, kotlin, microreticulum, ...):
+    # a registered-but-unbuilt impl must NOT be parametrized in, or the suite
+    # fails at subprocess spawn instead of cleanly skipping. The last
+    # whitespace-split token of the resolved command is the executable/JAR path
+    # (this also handles the `java -jar X.jar` form).
     impls = []
     for name in BRIDGE_COMMANDS:
         if name == "reference":
             continue
         cmd = resolve_command(name)
-        # Check if the bridge executable/JAR exists
-        if name in ("swift", "kotlin"):
-            if os.path.exists(cmd.split()[-1]):
-                impls.append(name)
-        else:
+        if os.path.exists(cmd.split()[-1]):
             impls.append(name)
     return impls
 
@@ -121,14 +134,7 @@ def reference():
     """Reference implementation bridge (Python RNS)."""
     cmd = resolve_command("reference")
     env = {
-        "PYTHON_RNS_PATH": os.environ.get(
-            "PYTHON_RNS_PATH",
-            os.path.expanduser("~/repos/Reticulum"),
-        ),
-        "PYTHON_LXMF_PATH": os.environ.get(
-            "PYTHON_LXMF_PATH",
-            os.path.expanduser("~/repos/LXMF"),
-        ),
+        "PYTHON_RNS_PATH": resolve_rns_path(),
     }
     client = BridgeClient(cmd, env=env)
     yield client
@@ -140,8 +146,37 @@ def pytest_generate_tests(metafunc):
     if "sut" in metafunc.fixturenames:
         impls = get_impl_list(metafunc.config)
         if not impls:
-            # reference-only mode: use reference as SUT
-            impls = ["reference"]
+            # Collection-only passes execute NO tests, so they need no SUT
+            # bridge: the @conformance_case drift guard
+            # (tools/check_conformance_decorated.py) and the TESTS.md generator
+            # (tools/generate_tests_md.py) both run `pytest --collect-only` with
+            # no --impl and may run where no bridge is built (e.g. the `honesty`
+            # CI job, which installs no bridge). §7.4's anti-self-certification
+            # gate is about RUNS, not metadata enumeration — so exempt
+            # --collect-only and parametrize a harmless placeholder (never spawned
+            # under --collect-only) so test items still generate for the guard.
+            if metafunc.config.getoption("collectonly", False):
+                metafunc.parametrize(
+                    "sut_impl", ["reference"], indirect=True, scope="session"
+                )
+                return
+            # No --impl, no --reference-only, and no built bridge on disk. Do
+            # NOT silently fall back to reference-as-SUT — that lets a
+            # certification run self-certify (V3 §7.4). Hard-fail with an
+            # actionable message; --reference-only is the explicit escape for a
+            # reference-vs-reference sanity run.
+            checked = ", ".join(
+                f"{name} ({resolve_command(name).split()[-1]})"
+                for name in BRIDGE_COMMANDS
+                if name != "reference"
+            )
+            raise pytest.UsageError(
+                "No system-under-test bridge resolved: --impl was not given, "
+                "--reference-only was not set, and no registered bridge is built "
+                f"on disk (checked: {checked}). A certification run must target a "
+                "real implementation. Pass --impl=<name>, build a bridge, or pass "
+                "--reference-only to explicitly run reference-as-SUT."
+            )
         metafunc.parametrize("sut_impl", impls, indirect=True, scope="session")
 
 
@@ -153,14 +188,7 @@ def sut_impl(request):
     env = {}
     if impl_name == "reference":
         env = {
-            "PYTHON_RNS_PATH": os.environ.get(
-                "PYTHON_RNS_PATH",
-                os.path.expanduser("~/repos/Reticulum"),
-            ),
-            "PYTHON_LXMF_PATH": os.environ.get(
-                "PYTHON_LXMF_PATH",
-                os.path.expanduser("~/repos/LXMF"),
-            ),
+            "PYTHON_RNS_PATH": resolve_rns_path(),
         }
     client = BridgeClient(cmd, env=env)
     yield client
@@ -173,16 +201,47 @@ def sut(sut_impl):
     return sut_impl
 
 
+@pytest.fixture
+def sut_impl_name(request):
+    """The impl name this test's `sut` is parametrized with ('reference',
+    'kotlin', ...). For impl-keyed xfails: assert the reference arm FIRST,
+    then xfail the SUT arm, so the waiver never weakens reference pinning."""
+    # `callspec` is None for a non-parametrized item. Every current caller also
+    # requests `sut` (so pytest_generate_tests parametrizes sut_impl and sets
+    # callspec), but guard anyway so a future caller without `sut` cleanly
+    # defaults to "reference" rather than crashing with AttributeError at
+    # collection.
+    callspec = getattr(request.node, "callspec", None)
+    if callspec is None:
+        return "reference"
+    return callspec.params.get("sut_impl", "reference")
+
+
 # Utility functions for tests
 def random_hex(n):
     """Generate n random bytes as hex string."""
     return os.urandom(n).hex()
 
 
-def assert_hex_equal(actual, expected, msg=""):
-    """Assert two hex strings are equal (case-insensitive)."""
+def assert_hex_equal(actual, expected, msg="", allow_empty=False):
+    """Assert two hex strings are equal (case-insensitive).
+
+    By default this REFUSES the both-empty / both-None case: two absent
+    optional fields (e.g. a missing ``transport_id`` on a HEADER_1 packet)
+    would otherwise each coalesce to ``""`` and compare equal, so the
+    assertion would vacuously pass while asserting nothing (audit finding L6).
+    Pass ``allow_empty=True`` only when an empty value on both sides is the
+    intended, meaningful assertion.
+    """
     actual_lower = actual.lower() if actual else ""
     expected_lower = expected.lower() if expected else ""
+    if not allow_empty:
+        assert actual_lower or expected_lower, (
+            f"{msg}: refusing to compare two empty/None hex values "
+            f"(actual={actual!r}, expected={expected!r}); both sides are "
+            f"absent so this comparison would vacuously pass. Pass "
+            f"allow_empty=True if an empty value is the intended assertion."
+        )
     assert actual_lower == expected_lower, (
         f"{msg}: expected {expected_lower}, got {actual_lower}"
     )

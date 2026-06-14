@@ -103,12 +103,13 @@ class PipeSession:
             self.RNS.Transport.path_table = {}
             self.RNS.Transport.packet_hashlist = set()
             self.RNS.Transport.identity = None
-            # Reticulum 2026-05-05+ has a Transport._should_run kill switch that
-            # exit_handler() flips False; Transport.start() doesn't reset it, so
-            # the *next* Reticulum() in this process gets a dead jobloop and
-            # silently drops announces / path requests. Re-arm it here, since
-            # this harness deliberately creates multiple Reticulum instances
-            # per process. Upstream commit a3cd1ea8 introduced this state.
+            # RNS gates the Transport jobloop on a class-level
+            # Transport._should_run flag (RNS 1.3.1 Transport.py:210/3401;
+            # introduced upstream in commit a3cd1ea8). exit_handler() flips it
+            # False; Transport.start() never resets it, so the next in-process
+            # Reticulum() gets a dead jobloop that silently drops announces /
+            # path requests. This harness creates multiple Reticulum instances
+            # per process, so re-arm it here.
             if hasattr(self.RNS.Transport, "_should_run"):
                 self.RNS.Transport._should_run = True
             self.reticulum = None
@@ -137,32 +138,13 @@ class PipeSession:
         self.reticulum = RNS.Reticulum(configdir=self._config_path, loglevel=RNS.LOG_CRITICAL)
 
     def _configure_ifac(self, passphrase, netname):
-        """Configure IFAC on the Python-side pipe interface."""
-        if passphrase is None and netname is None:
-            return
-        if self.pipe_iface is None:
-            return
+        """Configure IFAC on the Python-side pipe interface.
 
-        RNS = self.RNS
-
-        # Derive IFAC key exactly as Python Reticulum._add_interface does
-        ifac_origin = b""
-        if netname is not None:
-            ifac_origin += RNS.Identity.full_hash(netname.encode("utf-8"))
-        if passphrase is not None:
-            ifac_origin += RNS.Identity.full_hash(passphrase.encode("utf-8"))
-
-        ifac_origin_hash = RNS.Identity.full_hash(ifac_origin)
-        ifac_key = RNS.Cryptography.hkdf(
-            length=64,
-            derive_from=ifac_origin_hash,
-            salt=RNS.Reticulum.IFAC_SALT,
-            context=None,
-        )
-
-        self.pipe_iface.ifac_key = ifac_key
-        self.pipe_iface.ifac_identity = RNS.Identity.from_bytes(ifac_key)
-        self.pipe_iface.ifac_size = 16
+        Delegates to integration/ifac_util.py so the derivation stays byte-for-byte
+        identical to pipe_peer_local.py (shared single source of truth).
+        """
+        from .ifac_util import configure_ifac
+        configure_ifac(self.RNS, self.pipe_iface, passphrase, netname)
 
     def _create_pipe_interface(self):
         """Create StdioPipeInterface connected to subprocess stdin/stdout."""

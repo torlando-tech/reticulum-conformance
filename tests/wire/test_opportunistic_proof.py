@@ -80,6 +80,12 @@ import time
 
 import pytest
 
+from conformance import conformance_case
+
+
+__category_title__ = "Wire Interop"
+__category_order__ = 18
+
 
 # Settle budgets:
 # - Announce learning: matches what the link-multihop tests use (1.5s
@@ -185,6 +191,13 @@ def _setup_two_peer_topology(wire_peers, *, ifac: bool):
     return sender, receiver, dest_hash
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "get_received_packets", "send_opportunistic",
+    ],
+    verifies="Every auto-proof PROOF packet a receiver emits for an opportunistic SINGLE-destination DATA packet carries destination-type bits = SINGLE (0b00) in flag byte 0, not PLAIN (0b10); inspected via the sender-side inbound tap",
+)
 def test_opportunistic_proof_destination_type(wire_pair, wire_peers):
     """Proof packet wire-format destination-type bits = SINGLE (0b00).
 
@@ -320,6 +333,13 @@ def test_opportunistic_proof_destination_type(wire_pair, wire_peers):
     )
 
 
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "poll_path",
+        "send_opportunistic",
+    ],
+    verifies="An opportunistic SINGLE DATA packet sent over an IFAC-protected interface gets its sender's PacketReceipt resolved DELIVERED, proving the receiver's auto-proof round-tripped the applyIFAC tag-and-mask pipeline rather than being dropped by the IFAC validator",
+)
 def test_opportunistic_proof_through_ifac(wire_pair, wire_peers):
     """Proof packet round-trips correctly on an IFAC-configured interface.
 

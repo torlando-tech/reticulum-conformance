@@ -341,6 +341,14 @@ REGISTER_COMMAND(crypto_provider_op, {
     if (op == "ed25519_sign") {
         auto priv_bytes = bridge::hex_param(p, "private_key");
         auto message = bridge::hex_param(p, "message");
+        // Mirror the standalone ed25519_sign command: a 64-byte key is the
+        // seed||public form RNS stores; only the first 32 (the seed) feed the
+        // primitive. Any other length is rejected rather than read past.
+        if (priv_bytes.size() == 64) {
+            priv_bytes.assign(priv_bytes.begin(), priv_bytes.begin() + 32);
+        } else if (priv_bytes.size() != 32) {
+            throw std::runtime_error("ed25519_sign: private_key must be 32 or 64 bytes");
+        }
         auto priv = RNS::Cryptography::Ed25519PrivateKey::from_private_bytes(to_rns(priv_bytes));
         auto sig = priv->sign(to_rns(message));
         return bridge::json{{"result", bridge::to_hex(from_rns(sig))}};

@@ -249,6 +249,12 @@ REGISTER_COMMAND(identity_from_file, {
     if (read != 64 || extra != EOF) {
         return bridge::json{{"found", false}};
     }
+    // identity_to_file writes a fresh per-call temp blob that is only ever read
+    // once (the round-trip / cross-impl tests each load a given path a single
+    // time). Remove it now that we hold its 64 bytes so a long CI run does not
+    // leak one /tmp file per identity. The round-trip contract is unaffected:
+    // the bytes are already in `priv`.
+    ::unlink(path.c_str());
 
     bridge::Bytes x25519_priv(priv.begin(), priv.begin() + 32);
     bridge::Bytes ed25519_priv(priv.begin() + 32, priv.end());

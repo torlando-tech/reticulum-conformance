@@ -1116,26 +1116,31 @@ def cmd_announce_build(params):
         destination = RNS.Destination(
             identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
         )
-    if enable_ratchets:
-        # RNS controls the ratchet lifecycle via Destination.enable_ratchets
-        # against a state file; on enable() + the first rotate_ratchets()
-        # inside announce() it generates a fresh ratchet and writes it. We
-        # use a fresh path (no file yet — _reload_ratchets initialises a new
-        # one) to honour that contract; the bridge does not inject a
-        # specific ratchet, tests must read what RNS produced.
-        import tempfile
-        ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
-        destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
-
-    # An optional `emission_ts` lets a caller pin the announce's wall-clock
-    # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
-    # random_hash and stamps `now = time.time()` on the path response. The
-    # behavioral path-replacement tests rely on this to compare fresh and
-    # stale announces. Rather than synthesise the embed by hand we patch
-    # `time.time` for the duration of one announce() call, so RNS still does
-    # all the real work — it just sees the wall-clock value we pin.
-    import time as _time
+    # Guard EVERY path after creation with the deregister `finally` below — if
+    # enable_ratchets() (or anything after it) raises, a destination THIS call
+    # registered must not leak onto the shared Transport for the rest of the
+    # session. So `try:` opens immediately after construction, not just around
+    # announce().
     try:
+        if enable_ratchets:
+            # RNS controls the ratchet lifecycle via Destination.enable_ratchets
+            # against a state file; on enable() + the first rotate_ratchets()
+            # inside announce() it generates a fresh ratchet and writes it. We
+            # use a fresh path (no file yet — _reload_ratchets initialises a new
+            # one) to honour that contract; the bridge does not inject a
+            # specific ratchet, tests must read what RNS produced.
+            import tempfile
+            ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
+            destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
+
+        # An optional `emission_ts` lets a caller pin the announce's wall-clock
+        # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
+        # random_hash and stamps `now = time.time()` on the path response. The
+        # behavioral path-replacement tests rely on this to compare fresh and
+        # stale announces. Rather than synthesise the embed by hand we patch
+        # `time.time` for the duration of one announce() call, so RNS still does
+        # all the real work — it just sees the wall-clock value we pin.
+        import time as _time
         if emission_ts is not None:
             _orig_time = _time.time
             _time.time = lambda: float(emission_ts)
@@ -1782,12 +1787,17 @@ def _ensure_minimal_rns():
     that registers a destination — RNS.Destination(__init__) calls
     Transport.register_destination, which crashes without a Reticulum owner.
 
-    Reuses the live _rns_instance set by cmd_rns_start when present (RNS
-    Reticulum is a process-wide singleton, so a second `Reticulum(...)` call
-    returns the existing one regardless of the configdir passed). For the
-    static announce_* commands that need a destination but no network, a
-    minimal instance with `enable_transport = no` and no interfaces is
-    enough — and is much faster to start than the full cmd_rns_start path.
+    Reuses the live _rns_instance set by cmd_rns_start when present. RNS
+    Reticulum is a process-wide singleton, but a second `Reticulum(...)` call
+    does NOT return the existing one — its __init__ RAISES "Attempt to
+    reinitialise Reticulum" when one is already running. So when this
+    identity's _rns_instance is None yet a singleton already exists (e.g.
+    started under another module identity), we ADOPT the running instance via
+    RNS.Reticulum.get_instance() instead of re-initialising. Only when no
+    instance exists at all do we construct a minimal one with
+    `enable_transport = no` and no interfaces — enough for the static
+    announce_* commands that need a destination but no network, and much
+    faster to start than the full cmd_rns_start path.
     """
     global _rns_instance
     RNS = _get_full_rns()

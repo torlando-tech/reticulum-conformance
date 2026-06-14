@@ -3593,9 +3593,24 @@ def cmd_wire_send_undecryptable(params):
         # HMAC verification fails and decrypt returns None.
         raw[-1] = (raw[-1] + 1) % 256
     elif corruption == "truncate":
-        # HEADER_1 / no-IFAC layout: flags(1) hops(1) dest_hash(16) context(1)
-        # = 19 bytes of header, then ciphertext. Strip the ciphertext so the
-        # frame is rejected before it ever reaches the decrypt step.
+        # Strip the ciphertext, leaving a header-only frame that is rejected
+        # before the decrypt step.
+        #
+        # PRECONDITION (why 19 is correct here): packet.raw at this point is the
+        # pack()-level frame for a *direct* OUT SINGLE DATA packet — a HEADER_1
+        # frame with no transport_id. RNS.Packet.pack lays that out as
+        #   flags(1) + hops(1) + dest_hash(16) + context(1) = 19 bytes
+        # of header, then the ciphertext, so byte 19 is the ciphertext boundary.
+        # Two things would move that boundary, neither of which applies here:
+        #   * HEADER_2 (transport-relayed) prepends a 16-byte transport_id,
+        #     pushing the boundary to 35 — but this command always builds a
+        #     direct packet, which is HEADER_1.
+        #   * IFAC inserts an access-code field after the flags/hops bytes, but
+        #     that is an interface-layer wrapping applied AFTER pack() and
+        #     stripped again before the receiver parses; it never lands in this
+        #     pack-level raw (and these test interfaces run no-IFAC regardless).
+        # If either precondition were ever broken, offset 19 would cut into the
+        # header and silently mis-corrupt instead of cleanly stripping ciphertext.
         _CIPHERTEXT_OFFSET = 19
         if len(raw) <= _CIPHERTEXT_OFFSET:
             raise RuntimeError(

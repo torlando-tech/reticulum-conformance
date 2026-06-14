@@ -232,8 +232,36 @@ def test_undecryptable_opportunistic_is_dropped(wire_pair, wire_peers, corruptio
     # dropped at the parse layer before Transport.inbound (the tap point).
     check_arrival = receiver_is_reference and corruption == "ciphertext"
     if check_arrival:
-        pre = receiver.get_received_packets(since_seq=0)
-        base_seq = int(pre.get("highest_seq", 0))
+        # Anchor base_seq to the positive-control DATA packet's OWN tap seq,
+        # not a bare highest_seq snapshot. A plain highest_seq read can race the
+        # tap: if the control frame's tap write lags, highest_seq is still 0, so
+        # base_seq=0, and the later since_seq=0 arrival query would also match
+        # the *control* DATA (same dest_hash) — letting the corrupted-packet
+        # arrival assertion pass vacuously. The control was already proven
+        # delivered AND surfaced above, so its DATA frame must reach the tap;
+        # bounded-poll for it, then anchor base_seq to its seq. That makes
+        # base_seq strictly positive AND excludes the control from the later
+        # query, so a non-empty arrival result can only be the corrupted packet.
+        base_seq = 0
+        _anchor_deadline = time.monotonic() + (_POLL_TIMEOUT_MS / 1000.0)
+        while time.monotonic() < _anchor_deadline:
+            pre = receiver.get_received_packets(since_seq=0)
+            control_data_seqs = [
+                int(pkt["seq"]) for pkt in pre.get("packets", [])
+                if (pkt.get("packet_type") == _PACKET_TYPE_DATA)
+                and (pkt.get("destination_hash_hex") == dest_hash.hex())
+            ]
+            if control_data_seqs:
+                base_seq = max(control_data_seqs)
+                break
+            time.sleep(0.05)
+        assert base_seq > 0, (
+            f"positive-control DATA packet never surfaced in the receiver's "
+            f"inbound tap within {_POLL_TIMEOUT_MS}ms, so base_seq could not be "
+            f"anchored above 0. Snapshotting here would make the corrupted-"
+            f"packet arrival check vacuous (since_seq=0 would also match the "
+            f"control DATA), so abort rather than assert vacuously."
+        )
 
     bad_payload = b"undecryptable-" + secrets.token_hex(4).encode()
     bad = sender.send_undecryptable(

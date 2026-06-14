@@ -47,6 +47,16 @@ class BridgeClient:
         else:
             shell = False
 
+        # start_new_session=True puts the bridge in its OWN session/process
+        # group, distinct from the test runner's. This is what makes kill()
+        # able to reap the WHOLE bridge tree (see kill()): with shell=True a
+        # string command runs as `/bin/sh -c "<cmd>"`, and on platforms/loads
+        # where the shell does not exec-replace itself with the target
+        # interpreter, self._proc is the shell — not the RNS/JVM process it
+        # spawned as a child. Without a dedicated process group, killing that
+        # child reliably would be impossible (and killing the shell's group
+        # would otherwise risk the runner's own group). Each bridge getting a
+        # fresh group lets kill() target exactly this bridge's processes.
         self._proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -56,6 +66,7 @@ class BridgeClient:
             env=proc_env,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
 
         # Drain stderr in a background thread. Without this, verbose stderr
@@ -149,6 +160,53 @@ class BridgeClient:
 
         return response.get("result", {})
 
+    def _killpg(self):
+        """SIGKILL the bridge's entire process group.
+
+        Targets the session created by start_new_session=True, so a shell
+        wrapper AND the interpreter/JVM it spawned both die — even when
+        self._proc is only the shell. Best-effort; a missing group/process is
+        not an error.
+        """
+        if self._proc is None:
+            return
+        try:
+            pgid = os.getpgid(self._proc.pid)
+            # Safety: only group-kill when the bridge is in its OWN group
+            # (start_new_session=True). If session isolation somehow didn't
+            # take, pgid could be the test runner's own group — never SIGKILL
+            # that; fall back to the direct handle.
+            if pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            # Group already gone, or no permission — fall back to the direct
+            # handle below.
+            pass
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+    def kill(self):
+        """Forcibly and abruptly terminate the bridge (SIGKILL, no graceful
+        shutdown) — the whole process tree, not just self._proc.
+
+        Used by tests that must make a peer go genuinely SILENT (a stalled,
+        not cleanly-closed, peer): e.g. driving an RNS Link through the
+        watchdog ACTIVE->STALE->CLOSED/TIMEOUT path. self._proc.kill() alone
+        is NOT sufficient — when the bridge runs under a shell that did not
+        exec-replace itself with the RNS process, SIGKILLing the shell orphans
+        the still-living RNS process, which keeps answering link keepalives so
+        the peer never appears silent (the link's no_inbound_for never climbs
+        and it never times out). Killing the process group guarantees the RNS
+        process actually stops.
+        """
+        self._killpg()
+        try:
+            self._proc.wait(timeout=5)
+        except Exception:
+            pass
+
     def close(self):
         """Shut down the bridge server subprocess."""
         if self._proc and self._proc.poll() is None:
@@ -156,8 +214,15 @@ class BridgeClient:
             try:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
+                # Graceful stdin-EOF shutdown stalled; reap the whole group so
+                # a surviving shell wrapper can't leave the RNS process
+                # orphaned (which would linger and could interfere with other
+                # tests under xdist).
+                self._killpg()
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    pass
 
     def __enter__(self):
         return self

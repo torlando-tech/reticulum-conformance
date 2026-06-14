@@ -235,11 +235,16 @@ def test_silent_peer_times_out_active_link(wire_peers):
     # clean DESTINATION_CLOSED. (Reaching into the BridgeClient subprocess is
     # the only way to simulate a stalled peer; the wire command surface has
     # no "go silent" verb by design.)
-    server.bridge._proc.kill()
-    try:
-        server.bridge._proc.wait(timeout=5)
-    except Exception:
-        pass
+    #
+    # bridge.kill() reaps the bridge's whole process GROUP, not just
+    # bridge._proc. BridgeClient launches string commands via the shell
+    # (shell=True); on platforms/loads where the shell does not exec-replace
+    # itself with the Python RNS process, bridge._proc is the shell, and
+    # SIGKILLing only it would orphan a still-living RNS process that keeps
+    # answering this link's keepalives — so the link's no_inbound never climbs
+    # and it never reaches the STALE->CLOSED/TIMEOUT path this test asserts
+    # (observed as a flaky failure under xdist on slower runners).
+    server.bridge.kill()
     # Prevent the fixture finalizer from issuing wire_stop to the dead process.
     server.handle = None
 

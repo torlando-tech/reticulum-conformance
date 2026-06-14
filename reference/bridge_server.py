@@ -136,16 +136,32 @@ sys.modules['RNS_Token'] = token_module
 Token = token_module
 
 # Pre-register a fake RNS.Cryptography.Hashes module to satisfy eddsa.py import
-# This prevents triggering the full RNS import chain
-fake_rns = type(sys)('RNS')
-fake_crypto = type(sys)('RNS.Cryptography')
-fake_hashes = type(sys)('RNS.Cryptography.Hashes')
-fake_hashes.sha512 = lambda data: hashlib.sha512(data).digest()
-sys.modules['RNS'] = fake_rns
-sys.modules['RNS.Cryptography'] = fake_crypto
-sys.modules['RNS.Cryptography.Hashes'] = fake_hashes
-fake_rns.Cryptography = fake_crypto
-fake_crypto.Hashes = fake_hashes
+# This prevents triggering the full RNS import chain for the crypto-only path.
+#
+# CONDITIONAL: only install the stub when a real, fully-initialised RNS is NOT
+# already resident. This file is executed under TWO module identities — as
+# `__main__` (run as a script) and as `bridge_server` (`from bridge_server
+# import ...` inside wire_tcp.py). The SECOND execution would otherwise clobber
+# sys.modules['RNS'] — which the first identity's startup pre-warm already
+# populated with the genuine full RNS — back down to this stub. That forces the
+# second identity's `_get_full_rns()` to wipe + reimport the LIVE RNS module
+# tree (RNS.Channel / RNS.Buffer), which races RNS's background callback threads
+# (their lazy `from RNS.Channel import ...`) on CPython's import lock ->
+# `_DeadlockError` / "partially initialized module 'RNS.Channel'". Leaving the
+# real RNS in place lets `_get_full_rns()` adopt it instead of re-importing.
+# (The real RNS exposes the genuine RNS.Cryptography.Hashes.sha512, so the
+# crypto-only path is satisfied either way.)
+_existing_rns = sys.modules.get('RNS')
+if _existing_rns is None or getattr(_existing_rns, 'Channel', None) is None:
+    fake_rns = type(sys)('RNS')
+    fake_crypto = type(sys)('RNS.Cryptography')
+    fake_hashes = type(sys)('RNS.Cryptography.Hashes')
+    fake_hashes.sha512 = lambda data: hashlib.sha512(data).digest()
+    sys.modules['RNS'] = fake_rns
+    sys.modules['RNS.Cryptography'] = fake_crypto
+    sys.modules['RNS.Cryptography.Hashes'] = fake_hashes
+    fake_rns.Cryptography = fake_crypto
+    fake_crypto.Hashes = fake_hashes
 
 
 
@@ -1637,35 +1653,79 @@ def cmd_interface_hw_mtu(params):
 _rns_instance = None
 _rns_module = None  # Cached RNS module
 
+# Serialises the one-shot real `import RNS`. The genuine first load clears the
+# standalone crypto shims (RNS_HMAC, ...) and any half-imported RNS.* before
+# importing RNS cleanly; the lock makes that check-then-import atomic so two
+# threads cannot both decide to wipe+reimport concurrently.
+import threading as _threading
+_rns_import_lock = _threading.Lock()
+
 
 def _get_full_rns():
-    """Import full RNS module for networking.
+    """Return the process-wide real RNS module, importing it once if needed.
 
-    Returns the cached RNS module, or imports it if not already done.
-    IMPORTANT: This clears ALL RNS-related modules and reimports cleanly.
+    Why this is careful about NOT re-importing once RNS is resident:
+
+    This file is loaded under TWO distinct module identities — as ``__main__``
+    (run as a script) and as ``bridge_server`` (``from bridge_server import
+    _get_full_rns`` inside wire_tcp.py and friends). Each identity has its own
+    ``_rns_module`` global, so a naive "wipe sys.modules + import RNS" runs
+    ONCE PER IDENTITY. The second wipe lands AFTER the first identity has
+    already started a live Reticulum (background read_loop / jobloop /
+    watchdog / TCP serve_forever threads). Tearing RNS.Channel / RNS.Buffer out
+    of sys.modules and re-importing them while those threads run their lazy
+    ``from RNS.Channel import ...`` / ``from RNS.Buffer import ...`` races
+    CPython's per-module import lock -> ``_frozen_importlib._DeadlockError`` or
+    ``ImportError: cannot import name 'Channel' from partially initialized
+    module 'RNS.Channel' (circular import)`` — the conformance flake.
+
+    Fix: if a FULLY-initialised RNS is already resident in sys.modules (loaded
+    by the startup pre-warm or by the other module identity), adopt it verbatim
+    — never wipe+reimport a live module tree. The destructive clear only runs
+    on the genuine first load, under the lock, which by construction happens
+    before any Reticulum thread exists.
     """
     global _rns_module
 
     if _rns_module is not None:
         return _rns_module
 
-    import importlib
+    import importlib  # noqa: F401  (kept for parity with historical callers)
     import sys
 
-    # Remove ALL RNS-related modules to get a clean slate
-    # This includes fake modules (RNS_HMAC, etc.) and any partial imports
-    modules_to_remove = [k for k in list(sys.modules.keys())
-                         if k.startswith('RNS') or k.startswith('LXMF')]
-    for mod in modules_to_remove:
-        try:
-            del sys.modules[mod]
-        except KeyError:
-            pass
+    with _rns_import_lock:
+        # Re-check under the lock — another thread may have completed the load.
+        if _rns_module is not None:
+            return _rns_module
 
-    # Import real RNS fresh
-    import RNS
-    _rns_module = RNS
-    return RNS
+        # If a real, fully-initialised RNS is already resident (startup
+        # pre-warm, or the other __main__/bridge_server identity loaded it),
+        # adopt it. A fully-initialised RNS has its Channel/Buffer submodules
+        # bound on the package AND present in sys.modules.
+        existing = sys.modules.get('RNS')
+        if (
+            existing is not None
+            and getattr(existing, 'Channel', None) is not None
+            and getattr(existing, 'Buffer', None) is not None
+            and 'RNS.Channel' in sys.modules
+            and 'RNS.Buffer' in sys.modules
+        ):
+            _rns_module = existing
+            return existing
+
+        # Genuine first load (or recovering from a partially-imported RNS):
+        # drop the standalone crypto shims (RNS_HMAC, ...) and any half-built
+        # RNS.* / LXMF.* so `import RNS` runs against a clean slate. Safe here
+        # because no Reticulum thread can exist before the first full import.
+        for mod in [
+            k for k in list(sys.modules.keys())
+            if k.startswith('RNS') or k.startswith('LXMF')
+        ]:
+            sys.modules.pop(mod, None)
+
+        import RNS
+        _rns_module = RNS
+        return RNS
 
 
 def _ensure_minimal_rns():
@@ -3991,18 +4051,29 @@ def handle_request(request):
 
 def main():
     """Main server loop."""
-    # Pre-warm the submodule imports that wire/channel/buffer handlers pull in
-    # lazily (`from RNS.Channel import ...`, `from RNS.Buffer import ...`). RNS
-    # fires link/transport callbacks on background threads; if such a thread
-    # first-imports RNS.Channel at the same instant a handler does, CPython's
-    # import lock raises `_frozen_importlib._DeadlockError` — observed as a flaky
-    # ~1-in-1200 reference-side failure ("deadlock detected by
-    # _ModuleLock('RNS.Channel')"). Forcing the first import here, single-threaded
-    # before any RNS thread spawns, removes the race. Best-effort: a resolution
-    # failure must not abort the bridge — the lazy imports remain the fallback.
+    # Pre-warm the FULL real RNS once, single-threaded, before READY — i.e.
+    # before any command runs and before any Reticulum background thread can
+    # exist. `import RNS` transitively loads RNS.Channel + RNS.Buffer (its
+    # __init__ does `from .Channel import ...` / `from .Buffer import ...`),
+    # which is what the wire/channel/buffer handlers pull in lazily
+    # (`from RNS.Channel import ...`) on RNS callback threads.
+    #
+    # Crucially we route through `_get_full_rns()` rather than a bare
+    # `import RNS.Channel`: that POPULATES the module cache AND, by leaving a
+    # fully-initialised RNS resident in sys.modules, makes every later
+    # `_get_full_rns()` — including the SEPARATE `bridge_server` module-identity
+    # copy used by wire_tcp — ADOPT this RNS instead of wiping+reimporting it.
+    # The old bare-import pre-warm cached nothing, so the first wire command
+    # still wiped (single-threaded) and a later __main__ command wiped AGAIN
+    # while Reticulum threads ran — the import-lock race that produced the
+    # flaky `_DeadlockError` / "partially initialized module 'RNS.Channel'".
+    #
+    # Best-effort: a resolution failure must not abort the bridge. If the load
+    # genuinely fails it leaves no fully-initialised RNS resident, so the first
+    # real command's `_get_full_rns()` recovers it (still single-threaded,
+    # before any thread) via the clean-slate path.
     try:
-        import RNS.Channel  # noqa: F401
-        import RNS.Buffer  # noqa: F401
+        _get_full_rns()
     except Exception:
         pass
 

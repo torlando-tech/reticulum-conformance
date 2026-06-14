@@ -34,11 +34,28 @@ _REPO_ROOT = os.path.dirname(_BRIDGE_DIR)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from _rns_paths import resolve_rns_path
+from _rns_paths import resolve_rns_path, resolve_package_path
 
 rns_path = resolve_rns_path()
 sys.path.insert(0, os.path.join(rns_path, 'RNS', 'Cryptography'))
 sys.path.insert(0, rns_path)
+
+# Wire the LXMF source path onto sys.path the same way as RNS. The
+# discovery-stamp commands delegate to the REAL LXMF.LXStamper (RNS interface
+# discovery's proof-of-work oracle — Discovery.py:172,235-237), so the bridge
+# needs LXMF importable. In CI LXMF is a checkout reached via PYTHON_LXMF_PATH
+# (NOT pip-installed), and nothing else added it to sys.path — so every
+# discovery-stamp test failed DETERMINISTICALLY with "No module named 'LXMF'"
+# (it only passed locally because LXMF happened to be pip-installed). With the
+# path wired here at module load, the main() pre-warm of LXMF.LXStamper resolves
+# and the lazy `from LXMF import LXStamper` is race-free. resolve_package_path
+# falls back to the importable install when PYTHON_LXMF_PATH is unset.
+try:
+    _lxmf_path = resolve_package_path("LXMF", "PYTHON_LXMF_PATH")
+    if _lxmf_path not in sys.path:
+        sys.path.insert(0, _lxmf_path)
+except Exception:
+    pass  # LXMF is only needed by the discovery-stamp commands — never abort startup
 
 import hashlib
 

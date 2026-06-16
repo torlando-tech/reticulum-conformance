@@ -1363,6 +1363,13 @@ def cmd_wire_listen(params):
                         rec["data"] = payload
                     if isinstance(meta, (bytes, bytearray)):
                         rec["metadata"] = bytes(meta)
+                    # Mark the rec finalized ONLY after data/metadata are
+                    # captured. wire_resource_receiver_status waits on this flag
+                    # for a COMPLETE resource so it can't race ahead of the
+                    # capture (RNS sets status=COMPLETE at Resource.py:711 but
+                    # only hands the reassembled payload + unpacked metadata to
+                    # this conclusion callback at Resource.py:738).
+                    rec["concluded"] = True
                     break
 
     def on_resource_started(resource):
@@ -1377,6 +1384,7 @@ def cmd_wire_listen(params):
             "hashmap_updates_received": 0,
             "data": None,
             "metadata": None,
+            "concluded": False,
         }
         try:
             resource.max_decompressed_size = _WIRE_RX_MAX_DECOMPRESSED
@@ -1968,6 +1976,7 @@ def cmd_wire_resource_receiver_status(params):
     timeout_ms for an inbound Resource to appear / reach a terminal status
     (COMPLETE/FAILED/CORRUPT).
     """
+    RNS = _get_rns()
     handle = params["handle"]
     destination_hash = bytes.fromhex(params["destination_hash"])
     timeout_ms = int(params.get("timeout_ms", 0))
@@ -1982,14 +1991,26 @@ def cmd_wire_resource_receiver_status(params):
             f"No listener registered for destination_hash={destination_hash.hex()}"
         )
 
-    terminal = {0x06, 0x07, 0x08}  # COMPLETE / FAILED / CORRUPT
+    terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
     deadline = time.time() + timeout_ms / 1000.0
     while True:
         with listener["recv_lock"]:
             recs = list(listener.get("incoming_resources", []))
         if recs:
-            status = getattr(recs[-1]["resource"], "status", None)
-            if status in terminal or time.time() >= deadline:
+            last = recs[-1]
+            status = getattr(last["resource"], "status", None)
+            # For COMPLETE, the reassembled payload + unpacked metadata are only
+            # captured into the rec by on_resource_concluded (rec["concluded"]),
+            # which RNS fires *after* it sets status=COMPLETE (Resource.py:711 vs
+            # :738). Breaking on status alone races ahead of that capture and
+            # surfaces data/metadata=None. So wait for the conclusion callback on
+            # a COMPLETE; FAILED/CORRUPT carry no payload and break immediately.
+            ready = (
+                last.get("concluded", False)
+                if status == RNS.Resource.COMPLETE
+                else status in terminal
+            )
+            if ready or time.time() >= deadline:
                 break
         elif time.time() >= deadline:
             break

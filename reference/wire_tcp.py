@@ -1976,6 +1976,7 @@ def cmd_wire_resource_receiver_status(params):
     timeout_ms for an inbound Resource to appear / reach a terminal status
     (COMPLETE/FAILED/CORRUPT).
     """
+    RNS = _get_rns()
     handle = params["handle"]
     destination_hash = bytes.fromhex(params["destination_hash"])
     timeout_ms = int(params.get("timeout_ms", 0))
@@ -1990,7 +1991,7 @@ def cmd_wire_resource_receiver_status(params):
             f"No listener registered for destination_hash={destination_hash.hex()}"
         )
 
-    terminal = {0x06, 0x07, 0x08}  # COMPLETE / FAILED / CORRUPT
+    terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
     deadline = time.time() + timeout_ms / 1000.0
     while True:
         with listener["recv_lock"]:
@@ -2006,7 +2007,7 @@ def cmd_wire_resource_receiver_status(params):
             # a COMPLETE; FAILED/CORRUPT carry no payload and break immediately.
             ready = (
                 last.get("concluded", False)
-                if status == 0x06
+                if status == RNS.Resource.COMPLETE
                 else status in terminal
             )
             if ready or time.time() >= deadline:

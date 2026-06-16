@@ -11,6 +11,7 @@
 #include "../bridge.h"
 
 #include "Bytes.h"
+#include "Type.h"
 #include "Cryptography/Hashes.h"
 
 #include <stdexcept>
@@ -208,5 +209,58 @@ REGISTER_COMMAND(packet_hash, {
         {"hash", bridge::to_hex(full)},
         {"truncated_hash", bridge::to_hex(truncated)},
         {"hashable_part", bridge::to_hex(hashable)},
+    };
+})
+
+// packet_constants / packet_context_constants return the fork's live wire-size
+// and context-byte constants so a test can pin each against its spec literal
+// (not against another read of the same value). Every field is read straight
+// off microReticulum's RNS::Type::{Reticulum,Packet,Link,Identity} — no
+// arithmetic is reconstructed here.
+REGISTER_COMMAND(packet_constants, {
+    using namespace RNS::Type;
+    return bridge::json{
+        {"mtu",                  (int)Reticulum::MTU},
+        {"header_minsize",       (int)Reticulum::HEADER_MINSIZE},
+        {"header_maxsize",       (int)Reticulum::HEADER_MAXSIZE},
+        {"mdu",                  (int)Reticulum::MDU},
+        {"ifac_min_size",        (int)Reticulum::IFAC_MIN_SIZE},
+        {"packet_mdu",           (int)Packet::MDU},
+        {"packet_plain_mdu",     (int)Packet::PLAIN_MDU},
+        {"packet_encrypted_mdu", (int)Packet::ENCRYPTED_MDU},
+        {"link_mdu",             (int)Link::MDU},
+        {"hashlength",           (int)Identity::HASHLENGTH},
+        {"siglength",            (int)Identity::SIGLENGTH},
+        {"truncated_hashlength", (int)Identity::TRUNCATED_HASHLENGTH},
+        {"keysize",              (int)Identity::KEYSIZE},
+        {"name_hash_length",     (int)Identity::NAME_HASH_LENGTH},
+        {"token_overhead",       (int)Identity::TOKEN_OVERHEAD},
+        {"aes128_blocksize",     (int)Identity::AES128_BLOCKSIZE},
+    };
+})
+
+REGISTER_COMMAND(packet_context_constants, {
+    namespace P = RNS::Type::Packet;
+    return bridge::json{
+        {"NONE",           (int)P::CONTEXT_NONE},
+        {"RESOURCE",       (int)P::RESOURCE},
+        {"RESOURCE_ADV",   (int)P::RESOURCE_ADV},
+        {"RESOURCE_REQ",   (int)P::RESOURCE_REQ},
+        {"RESOURCE_HMU",   (int)P::RESOURCE_HMU},
+        {"RESOURCE_PRF",   (int)P::RESOURCE_PRF},
+        {"RESOURCE_ICL",   (int)P::RESOURCE_ICL},
+        {"RESOURCE_RCL",   (int)P::RESOURCE_RCL},
+        {"CACHE_REQUEST",  (int)P::CACHE_REQUEST},
+        {"RESPONSE",       (int)P::RESPONSE},
+        {"PATH_RESPONSE",  (int)P::PATH_RESPONSE},
+        {"COMMAND",        (int)P::COMMAND},
+        {"COMMAND_STATUS", (int)P::COMMAND_STATUS},
+        {"CHANNEL",        (int)P::CHANNEL},
+        {"KEEPALIVE",      (int)P::KEEPALIVE},
+        {"LINKIDENTIFY",   (int)P::LINKIDENTIFY},
+        {"LINKCLOSE",      (int)P::LINKCLOSE},
+        {"LINKPROOF",      (int)P::LINKPROOF},
+        {"LRRTT",          (int)P::LRRTT},
+        {"LRPROOF",        (int)P::LRPROOF},
     };
 })

@@ -73,7 +73,7 @@ bool bool_param(const json& p, const char* key);
 // Spec-correct PKCS7 padding. (microReticulum's PKCS7::pad has a bug — see
 // crypto.cpp pkcs7_pad WORKAROUND. Use this helper for any chained ops.)
 Bytes pkcs7_pad(const Bytes& data, size_t block_size = 16);
-Bytes pkcs7_unpad(const Bytes& data);
+Bytes pkcs7_unpad(const Bytes& data, size_t block_size = 16);
 
 // Spec-correct HMAC-SHA256. (microReticulum's RNS::Cryptography::digest()
 // double-feeds the message — see crypto.cpp hmac_sha256 WORKAROUND.)
@@ -85,5 +85,23 @@ Bytes hmac_sha256(const Bytes& key, const Bytes& msg);
 // byte — equivalent to Python's hmac.compare_digest().
 // Returns true iff a[0..n] == b[0..n].
 bool consttime_memequal(const uint8_t* a, const uint8_t* b, size_t n);
+
+// Cryptographically-seeded random bytes (std::random_device). Used to
+// generate IVs / ephemeral scalars when the caller doesn't pin them.
+Bytes random_bytes(size_t n);
+
+// Reticulum Token (modified Fernet) seal/open. The Token key is either
+// 32 bytes (AES-128: signing(16) || encryption(16)) or 64 bytes (AES-256:
+// signing(32) || encryption(32)); the mode is chosen from the key length, as
+// RNS Token does. The token is laid out as:
+//   iv(16) || AES-CBC(pkcs7(plaintext), encryption_key, iv)
+//          || HMAC-SHA256(signing_key, iv || ciphertext)
+// These delegate AES to microReticulum's RNS::Cryptography (same primitive
+// the conformance suite proves byte-equivalent via test_token) and use the
+// spec-correct bridge pkcs7/hmac helpers. token_open authenticates BEFORE
+// decrypting and throws on a too-short token, HMAC mismatch, or an
+// undecryptable (non-block-multiple) body.
+Bytes token_seal(const Bytes& key, const Bytes& plaintext, const Bytes& iv);
+Bytes token_open(const Bytes& key, const Bytes& token);
 
 }  // namespace bridge

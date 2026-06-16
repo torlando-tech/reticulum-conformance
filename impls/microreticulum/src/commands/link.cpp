@@ -125,3 +125,23 @@ REGISTER_COMMAND(link_derive_key, {
     }
     return j;
 })
+
+// link_encrypt / link_decrypt: Token (modified Fernet) over the link's
+// 64-byte derived key. Identical wire format to the destination Token used
+// elsewhere; the link layer just supplies the key directly rather than via
+// an ephemeral ECDH. Delegates to the shared bridge Token helpers.
+REGISTER_COMMAND(link_encrypt, {
+    auto derived_key = bridge::hex_param(p, "derived_key");
+    auto plaintext = bridge::hex_param(p, "plaintext");
+    bridge::Bytes iv = bridge::hex_param_or_empty(p, "iv");
+    if (iv.empty()) iv = bridge::random_bytes(16);
+    auto token = bridge::token_seal(derived_key, plaintext, iv);
+    return bridge::json{{"ciphertext", bridge::to_hex(token)}};
+})
+
+REGISTER_COMMAND(link_decrypt, {
+    auto derived_key = bridge::hex_param(p, "derived_key");
+    auto ciphertext = bridge::hex_param(p, "ciphertext");
+    auto pt = bridge::token_open(derived_key, ciphertext);
+    return bridge::json{{"plaintext", bridge::to_hex(pt)}};
+})

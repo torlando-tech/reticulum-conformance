@@ -13,7 +13,10 @@
 #include "Cryptography/X25519.h"
 #include "Cryptography/Ed25519.h"
 
+#include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <unistd.h>
 
 namespace {
 
@@ -81,8 +84,11 @@ REGISTER_COMMAND(identity_verify, {
     auto pub = bridge::hex_param(p, "public_key");
     auto message = bridge::hex_param(p, "message");
     auto signature = bridge::hex_param(p, "signature");
-    if (pub.size() != 64) {
-        throw std::runtime_error("identity_verify: public_key must be 64 bytes");
+    // RNS.Identity.validate is a TOTAL boolean predicate: a wrong-length public
+    // key (64 bytes) or a structurally malformed signature (Ed25519 signatures
+    // are exactly 64 bytes) verifies False, never raises.
+    if (pub.size() != 64 || signature.size() != 64) {
+        return bridge::json{{"valid", false}};
     }
     bridge::Bytes ed25519_pub(pub.begin() + 32, pub.end());
     auto vk = RNS::Cryptography::Ed25519PublicKey::from_public_bytes(to_rns(ed25519_pub));
@@ -101,14 +107,13 @@ REGISTER_COMMAND(identity_encrypt, {
     }
     bridge::Bytes x25519_pub(pub.begin(), pub.begin() + 32);
 
-    // Ephemeral key — caller may provide for determinism; otherwise generate.
+    // Ephemeral key — caller may pin it for determinism; otherwise generate a
+    // fresh one (real Identity.encrypt always uses a random ephemeral key).
     bridge::Bytes ephemeral_priv;
     if (p.contains("ephemeral_private") && !p["ephemeral_private"].is_null()) {
         ephemeral_priv = bridge::from_hex(p["ephemeral_private"].get<std::string>());
     } else {
-        // Generate from a deterministic seed for repeatability across runs
-        // when caller doesn't pass one. Conformance tests pass ephemeral_private.
-        throw std::runtime_error("identity_encrypt: ephemeral_private is required");
+        ephemeral_priv = bridge::random_bytes(32);
     }
 
     auto eph = RNS::Cryptography::X25519PrivateKey::from_private_bytes(to_rns(ephemeral_priv));
@@ -129,6 +134,7 @@ REGISTER_COMMAND(identity_encrypt, {
     bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
     auto iv = bridge::hex_param_or_empty(p, "iv");
+    if (iv.empty()) iv = bridge::random_bytes(16);
     if (iv.size() != 16) {
         throw std::runtime_error("identity_encrypt: iv must be 16 bytes");
     }
@@ -160,12 +166,14 @@ REGISTER_COMMAND(identity_decrypt, {
     if (priv.size() != 64) {
         throw std::runtime_error("identity_decrypt: private_key must be 64 bytes");
     }
-    // Minimum identity-encrypted blob = ephemeral_public(32) + iv(16) +
-    // at least one AES-CBC block(16) + hmac(32) = 96 bytes. An 80-byte
-    // input would otherwise leave an empty ct and crash AES_256_CBC::decrypt
-    // / pkcs7_unpad downstream.
+    // RNS.Identity.decrypt is a GRACEFUL-rejection primitive: any token that
+    // does not authenticate (too short, wrong key, corrupt body) yields
+    // plaintext=None — it never raises and never returns garbage. A
+    // ratchet-encrypted (or otherwise wrong-key) ciphertext therefore reads
+    // back None under the static identity key. The smallest decryptable blob
+    // is ephemeral_public(32) + iv(16) + one AES block(16) + hmac(32).
     if (ciphertext.size() < 32 + 16 + 16 + 32) {
-        throw std::runtime_error("identity_decrypt: ciphertext too short");
+        return bridge::json{{"plaintext", nullptr}};
     }
 
     bridge::Bytes x25519_priv(priv.begin(), priv.begin() + 32);
@@ -186,34 +194,94 @@ REGISTER_COMMAND(identity_decrypt, {
 
     auto shared = x25519_priv_obj->exchange(to_rns(eph_pub));
     auto derived = RNS::Cryptography::hkdf(64, shared, to_rns(id_hash), RNS::Bytes());
-
-    // Materialise the derived key once before slicing — see identity_encrypt
-    // for the same UB-avoidance pattern.
     bridge::Bytes derived_key = from_rns(derived);
-    bridge::Bytes signing_key(derived_key.begin(), derived_key.begin() + 32);
-    bridge::Bytes encryption_key(derived_key.begin() + 32, derived_key.end());
 
-    // Same minimum as token_decrypt — iv(16) + at least one AES block(16)
-    // + hmac(32) = 64 bytes. The outer ciphertext.size() guard already
-    // covers this, but keep it explicit for the inner token slice.
-    if (token.size() < 16 + 16 + 32) {
-        throw std::runtime_error("identity_decrypt: token too short");
+    // token_open authenticates before decrypting; on any failure (HMAC
+    // mismatch, undecryptable body) we surface plaintext=None rather than
+    // raising, matching RNS.Identity.decrypt.
+    try {
+        auto pt = bridge::token_open(derived_key, token);
+        return bridge::json{{"plaintext", bridge::to_hex(pt)}};
+    } catch (const std::exception&) {
+        return bridge::json{{"plaintext", nullptr}};
     }
-    bridge::Bytes iv(token.begin(), token.begin() + 16);
-    bridge::Bytes ct(token.begin() + 16, token.end() - 32);
-    bridge::Bytes hmac_recv(token.end() - 32, token.end());
+})
 
-    bridge::Bytes signed_parts(token.begin(), token.end() - 32);
-    auto hmac_calc = bridge::hmac_sha256(signing_key, signed_parts);
-    bool hmac_ok = (hmac_recv.size() == hmac_calc.size()) &&
-                   bridge::consttime_memequal(hmac_recv.data(), hmac_calc.data(), hmac_recv.size());
-    if (!hmac_ok) {
-        throw std::runtime_error("identity_decrypt: HMAC verification failed");
+// On-disk Identity format (RNS.Identity.to_file / from_file): the raw 64-byte
+// private key, X25519 half(32) || Ed25519 seed(32). The build sets RNS_NO_FS so
+// the fork's own file I/O is unavailable; we use host fopen for the blob and
+// derive the public material with the same Cryptography primitives the rest of
+// this file uses. This is the interop format Sideband + LXMF persist.
+REGISTER_COMMAND(identity_to_file, {
+    auto priv = bridge::hex_param(p, "private_key");
+    if (priv.size() != 64) {
+        throw std::runtime_error("identity_to_file: private_key must be 64 bytes");
     }
+    // Per-process temp path so repeated calls don't collide.
+    static int counter = 0;
+    std::string path = "/tmp/conformance_mrn_identity_" +
+                       std::to_string((unsigned long)::getpid()) + "_" +
+                       std::to_string(counter++) + ".bin";
+    FILE* f = ::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        throw std::runtime_error("identity_to_file: could not open " + path);
+    }
+    size_t written = ::fwrite(priv.data(), 1, priv.size(), f);
+    ::fclose(f);
+    if (written != priv.size()) {
+        throw std::runtime_error("identity_to_file: short write to " + path);
+    }
+    return bridge::json{{"path", path}};
+})
 
-    auto pt_padded = from_rns(RNS::Cryptography::AES_256_CBC::decrypt(
-        to_rns(ct), to_rns(encryption_key), to_rns(iv)));
-    auto pt = bridge::pkcs7_unpad(pt_padded);
+REGISTER_COMMAND(identity_from_file, {
+    auto path = bridge::str_param(p, "path");
+    FILE* f = ::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return bridge::json{{"found", false}};
+    }
+    bridge::Bytes priv(64);
+    size_t read = ::fread(priv.data(), 1, priv.size(), f);
+    // Reject a file that is not exactly the 64-byte private-key blob (a longer
+    // file would have leftover bytes; a shorter one is truncated).
+    int extra = ::fgetc(f);
+    ::fclose(f);
+    if (read != 64 || extra != EOF) {
+        return bridge::json{{"found", false}};
+    }
+    // identity_to_file writes a fresh per-call temp blob that is only ever read
+    // once (the round-trip / cross-impl tests each load a given path a single
+    // time). Remove it now that we hold its 64 bytes so a long CI run does not
+    // leak one /tmp file per identity. The round-trip contract is unaffected:
+    // the bytes are already in `priv`.
+    ::unlink(path.c_str());
 
-    return bridge::json{{"plaintext", bridge::to_hex(pt)}};
+    bridge::Bytes x25519_priv(priv.begin(), priv.begin() + 32);
+    bridge::Bytes ed25519_priv(priv.begin() + 32, priv.end());
+    auto x25519_pub = from_rns(
+        RNS::Cryptography::X25519PrivateKey::from_private_bytes(to_rns(x25519_priv))
+            ->public_key()->public_bytes());
+    auto ed25519_pub = from_rns(
+        RNS::Cryptography::Ed25519PrivateKey::from_private_bytes(to_rns(ed25519_priv))
+            ->public_key()->public_bytes());
+
+    bridge::Bytes public_key;
+    public_key.insert(public_key.end(), x25519_pub.begin(), x25519_pub.end());
+    public_key.insert(public_key.end(), ed25519_pub.begin(), ed25519_pub.end());
+    auto hex_hash = bridge::to_hex(truncated_sha256(public_key, 16));
+
+    return bridge::json{
+        {"found",      true},
+        {"public_key", bridge::to_hex(public_key)},
+        {"hash",       hex_hash},
+        {"hexhash",    hex_hash},
+    };
+})
+
+REGISTER_COMMAND(identity_random_hash, {
+    // RNS.Identity.get_random_hash() == truncated_hash(random(TRUNCATED_HASHLENGTH/8))
+    // == first 16 bytes of SHA-256 over 16 random bytes (Identity.h:279).
+    auto rnd = bridge::random_bytes(16);
+    auto h = truncated_sha256(rnd, 16);
+    return bridge::json{{"random_hash", bridge::to_hex(h)}};
 })

@@ -1100,69 +1100,95 @@ def cmd_announce_build(params):
         if existing.hash == expected_hash:
             destination = existing
             break
+    # Track whether THIS call registers the destination. announce_build only
+    # needs a Destination object transiently to call announce(send=False) — it
+    # must NOT leave the announcer registered as a LOCAL destination on the
+    # shared Transport. When the bridge process also hosts a live behavioral
+    # Transport (the singleton is process-wide), a leaked local registration
+    # makes a subsequently-INJECTED announce for that same hash look local
+    # (Transport.inbound: `local_destination == None` gate, Transport.py:1712),
+    # so its path-table learning + rebroadcast are silently skipped — the
+    # announcer is meant to be a REMOTE peer. We therefore deregister exactly
+    # what we created below (a destination a test legitimately pre-registered is
+    # left untouched).
+    created_here = destination is None
     if destination is None:
         destination = RNS.Destination(
             identity, RNS.Destination.IN, RNS.Destination.SINGLE, app_name, *aspects
         )
-    if enable_ratchets:
-        # RNS controls the ratchet lifecycle via Destination.enable_ratchets
-        # against a state file; on enable() + the first rotate_ratchets()
-        # inside announce() it generates a fresh ratchet and writes it. We
-        # use a fresh path (no file yet — _reload_ratchets initialises a new
-        # one) to honour that contract; the bridge does not inject a
-        # specific ratchet, tests must read what RNS produced.
-        import tempfile
-        ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
-        destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
+    # Guard EVERY path after creation with the deregister `finally` below — if
+    # enable_ratchets() (or anything after it) raises, a destination THIS call
+    # registered must not leak onto the shared Transport for the rest of the
+    # session. So `try:` opens immediately after construction, not just around
+    # announce().
+    try:
+        if enable_ratchets:
+            # RNS controls the ratchet lifecycle via Destination.enable_ratchets
+            # against a state file; on enable() + the first rotate_ratchets()
+            # inside announce() it generates a fresh ratchet and writes it. We
+            # use a fresh path (no file yet — _reload_ratchets initialises a new
+            # one) to honour that contract; the bridge does not inject a
+            # specific ratchet, tests must read what RNS produced.
+            import tempfile
+            ratchet_dir = tempfile.mkdtemp(prefix='rns_announce_ratchets_')
+            destination.enable_ratchets(os.path.join(ratchet_dir, 'ratchets.bin'))
 
-    # An optional `emission_ts` lets a caller pin the announce's wall-clock
-    # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
-    # random_hash and stamps `now = time.time()` on the path response. The
-    # behavioral path-replacement tests rely on this to compare fresh and
-    # stale announces. Rather than synthesise the embed by hand we patch
-    # `time.time` for the duration of one announce() call, so RNS still does
-    # all the real work — it just sees the wall-clock value we pin.
-    import time as _time
-    if emission_ts is not None:
-        _orig_time = _time.time
-        _time.time = lambda: float(emission_ts)
-        try:
+        # An optional `emission_ts` lets a caller pin the announce's wall-clock
+        # time — RNS embeds `int(time.time()).to_bytes(5, "big")` in the
+        # random_hash and stamps `now = time.time()` on the path response. The
+        # behavioral path-replacement tests rely on this to compare fresh and
+        # stale announces. Rather than synthesise the embed by hand we patch
+        # `time.time` for the duration of one announce() call, so RNS still does
+        # all the real work — it just sees the wall-clock value we pin.
+        import time as _time
+        if emission_ts is not None:
+            _orig_time = _time.time
+            _time.time = lambda: float(emission_ts)
+            try:
+                packet = destination.announce(app_data=app_data, send=False)
+            finally:
+                _time.time = _orig_time
+        else:
             packet = destination.announce(app_data=app_data, send=False)
-        finally:
-            _time.time = _orig_time
-    else:
-        packet = destination.announce(app_data=app_data, send=False)
-    packet.pack()
-    raw = packet.raw
+        packet.pack()
+        raw = packet.raw
 
-    # Parse what RNS just produced — the field layout RNS itself wrote.
-    keysize = RNS.Identity.KEYSIZE // 8
-    name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
-    ratchet_size = RNS.Identity.RATCHETSIZE // 8
-    sig_len = RNS.Identity.SIGLENGTH // 8
-    has_ratchet = packet.context_flag == RNS.Packet.FLAG_SET
-    data = packet.data
-    pubkey = data[:keysize]
-    name_hash = data[keysize:keysize + name_hash_len]
-    # The random_hash slice is 10 bytes — Destination.announce produces it as
-    # 5 bytes of random + 5 bytes big-endian timestamp; the slice length is
-    # the part of the wire format that is not yet a named RNS constant.
-    random_hash_len = 10
-    random_hash_off = keysize + name_hash_len
-    random_hash = data[random_hash_off:random_hash_off + random_hash_len]
-    cursor = random_hash_off + random_hash_len
-    if has_ratchet:
-        ratchet = data[cursor:cursor + ratchet_size]
-        cursor += ratchet_size
-    else:
-        ratchet = b""
-    signature = data[cursor:cursor + sig_len]
-    cursor += sig_len
-    app_data_out = data[cursor:]
+        # Parse what RNS just produced — the field layout RNS itself wrote.
+        keysize = RNS.Identity.KEYSIZE // 8
+        name_hash_len = RNS.Identity.NAME_HASH_LENGTH // 8
+        ratchet_size = RNS.Identity.RATCHETSIZE // 8
+        sig_len = RNS.Identity.SIGLENGTH // 8
+        has_ratchet = packet.context_flag == RNS.Packet.FLAG_SET
+        data = packet.data
+        pubkey = data[:keysize]
+        name_hash = data[keysize:keysize + name_hash_len]
+        # The random_hash slice is 10 bytes — Destination.announce produces it
+        # as 5 bytes of random + 5 bytes big-endian timestamp; the slice length
+        # is the part of the wire format that is not yet a named RNS constant.
+        random_hash_len = 10
+        random_hash_off = keysize + name_hash_len
+        random_hash = data[random_hash_off:random_hash_off + random_hash_len]
+        cursor = random_hash_off + random_hash_len
+        if has_ratchet:
+            ratchet = data[cursor:cursor + ratchet_size]
+            cursor += ratchet_size
+        else:
+            ratchet = b""
+        signature = data[cursor:cursor + sig_len]
+        cursor += sig_len
+        app_data_out = data[cursor:]
+
+        dest_hash = destination.hash
+    finally:
+        # Deregister the destination THIS call registered so it never lingers as
+        # a local destination on the shared Transport (see created_here note
+        # above). Leave a pre-existing (test-registered) destination in place.
+        if created_here:
+            RNS.Transport.deregister_destination(destination)
 
     return {
         'raw': bytes_to_hex(raw),
-        'destination_hash': bytes_to_hex(destination.hash),
+        'destination_hash': bytes_to_hex(dest_hash),
         'announce_data': bytes_to_hex(data),
         'public_key': bytes_to_hex(pubkey),
         'name_hash': bytes_to_hex(name_hash),
@@ -1761,16 +1787,35 @@ def _ensure_minimal_rns():
     that registers a destination — RNS.Destination(__init__) calls
     Transport.register_destination, which crashes without a Reticulum owner.
 
-    Reuses the live _rns_instance set by cmd_rns_start when present (RNS
-    Reticulum is a process-wide singleton, so a second `Reticulum(...)` call
-    returns the existing one regardless of the configdir passed). For the
-    static announce_* commands that need a destination but no network, a
-    minimal instance with `enable_transport = no` and no interfaces is
-    enough — and is much faster to start than the full cmd_rns_start path.
+    Reuses the live _rns_instance set by cmd_rns_start when present. RNS
+    Reticulum is a process-wide singleton, but a second `Reticulum(...)` call
+    does NOT return the existing one — its __init__ RAISES "Attempt to
+    reinitialise Reticulum" when one is already running. So when this
+    identity's _rns_instance is None yet a singleton already exists (e.g.
+    started under another module identity), we ADOPT the running instance via
+    RNS.Reticulum.get_instance() instead of re-initialising. Only when no
+    instance exists at all do we construct a minimal one with
+    `enable_transport = no` and no interfaces — enough for the static
+    announce_* commands that need a destination but no network, and much
+    faster to start than the full cmd_rns_start path.
     """
     global _rns_instance
     RNS = _get_full_rns()
     if _rns_instance is None:
+        # RNS.Reticulum is a process-wide singleton whose __init__ RAISES
+        # ("Attempt to reinitialise Reticulum, when it was already running",
+        # Reticulum.py:223) if one is already up. This file runs under TWO
+        # module identities (__main__ and bridge_server) — and a sibling module
+        # (behavioral_transport) may already have started the singleton through
+        # its OWN tracker (_shared_rns_instance) — so this identity's
+        # _rns_instance can be None while a live Reticulum already exists.
+        # Adopt the running singleton rather than re-init it. This also means a
+        # transport-ENABLED behavioral instance, once started, is reused here
+        # instead of being shadowed by a minimal no-transport one.
+        _existing = RNS.Reticulum.get_instance()
+        if _existing is not None:
+            _rns_instance = _existing
+            return RNS
         import tempfile
         cfg = tempfile.mkdtemp(prefix='rns_minimal_')
         cfg_file = os.path.join(cfg, "config")

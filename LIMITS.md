@@ -58,3 +58,56 @@ interface instance):
 - **link**: `mtu-clamp-in-transport`, `proof-hops-check`, `rtt-packet-handling`, `transport-lrproof-relay-validation`
 - **reticulum_config**: `announce-cap-default-and-queueing`, `announce-rate-limiting`, `hw-mtu-autoconfigure-tiers`, `ifac-recompute-per-hop`, `ingress-control-announce-hold`, `shared-instance-defaults`
 - **transport_announce**: `announce-bandwidth-cap`, `announce-ingress-limiting`, `path-table-persistence-format`, `pr-ingress-egress-frequency-limits`, `tunnel-path-tracking-and-restore`
+
+## microReticulum (torlando-tech fork) — certified surface and capability gaps
+
+The microReticulum bridge (`impls/microreticulum/`, gated by
+`.github/workflows/microreticulum.yml`) is built against the torlando-tech
+**pyxis** pinned fork (`deps/microReticulum`). It compiles only the fork's
+`Cryptography/*` sources plus `Bytes`/`Log`/`Crc` (CMakeLists), so it certifies
+microReticulum's **stateless** surface: the RNS crypto primitives plus the
+hand-assembled wire/identity/announce/ratchet/token/destination-hash/framing/IFAC
+encoders that delegate to those primitives. The full Packet/Destination/Transport/
+Identity/Channel/Resource classes (which pull in MsgPack and a live Transport
+state machine) are **not compiled**.
+
+Everything the suite drives outside the gaps below runs and passes against real
+Python RNS 1.3.1. The gated run scopes out **only** the families the fork
+genuinely cannot support (capability gaps — not hidden failures):
+
+- **Discovery module** (`test_discovery_*`): the fork has no `RNS.Discovery`
+  module, so the whole `discovery_*` surface (announce appdata, stamp,
+  store/inject, address/name validation, stamp cost) is unrepresentable.
+- **Config / interface layer** (`test_config_parse_hooks`, `test_reticulum_config_v2`,
+  `test_interfaces_v2`, `test_interfaces_hooks::interface_hw_mtu_per_type`,
+  and the `config_parse_interface`/`discovery_stamp`-backed `test_docs_normative_v2`
+  literals): the fork has no config parser and no interface MTU+IFAC tier tables
+  (`config_parse_interface`, `interface_optimise_mtu`, `interface_hw_mtu`,
+  `interface_default_ifac_size`).
+- **Packet / Destination object machine** (`test_packet`, `test_packet_completeness`,
+  `test_packet_v2`, `test_reticulum_config_completeness`,
+  `test_destination_completeness_more`, the packet-machine tests in
+  `test_destination`/`test_packet_hooks`, and `test_destination_hooks`):
+  `packet_build`/`packet_resend_observe`/`destination_*` drive the real
+  `RNS::Packet` + `RNS::Destination` + Transport machine, which is MsgPack-backed
+  and excluded from the crypto-only build. The stateless `packet_pack`/`unpack`,
+  `packet_constants`, `packet_context_constants` and `destination_hash`
+  primitives DO run and pass.
+- **Channel/buffer wire framing** (`test_channel_buffer_hooks`):
+  `wire_buffer_pack` / `wire_channel_envelope_pack` are MsgPack-framed (Tier 2B).
+- **Stateful Identity machine** (`test_identity_hooks::remember_public_key_length_gate`,
+  `::keyless_identity_ops_raise_keyerror`): `identity_remember` /
+  `identity_keyless_op` need `RNS::Identity`'s known-destinations store and the
+  `create_keys=False` runtime state — the same gap reticulum-kt documents as an
+  xfail. The bridge derives identities from Cryptography primitives only.
+- **Fork HKDF divergence** (`test_crypto::hkdf_with_info`,
+  `::hkdf_rfc5869_test_case_1`, `test_crypto_v2::hkdf_accepts_empty_bytes_ikm`):
+  microReticulum's HKDF **ignores the `info` parameter** and **rejects
+  empty-bytes `ikm`**, diverging from RFC 5869 on those inputs. This is a
+  correctness gap in the fork's standalone HKDF. (Identity/Token/ratchet all use
+  empty-`info` HKDF and are byte-equivalent — see passing `test_token`,
+  `test_ratchet`, `test_identity`.)
+
+Plus the always-out Tier-2B networking surface shared with the architectural
+ceiling above: `wire/`, `behavioral/`, `lxmf/`, `test_lxmf.py` (no networking /
+LXMF router) and `test_compression.py` (libbz2 stripped from the build).

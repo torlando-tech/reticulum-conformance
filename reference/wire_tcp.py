@@ -3527,22 +3527,39 @@ def cmd_wire_send_packet(params):
 
 
 def cmd_wire_send_undecryptable(params):
-    """Adversarial: send a SINGLE DATA packet whose ciphertext is DAMAGED so the
-    receiver cannot decrypt it, to verify the receiver delivers nothing and emits
-    no proof (Transport.py:2157 gates prove() on a truthy Destination.receive()).
+    """Adversarial: send a SINGLE DATA packet the receiver CANNOT decrypt, to
+    verify the receiver delivers nothing and emits no proof (Transport.py:2157
+    gates prove() on a truthy Destination.receive()).
 
     Built exactly like wire_send_packet — a real RNS.Packet to the recalled OUT
     SINGLE destination, with a tracked PacketReceipt — and packed by real RNS, so
     it routes normally and reaches the receiver's Transport.inbound. The ONLY
-    difference is one damaged ciphertext byte (after pack(), so the corruption
-    survives onto the wire): the receiver's Token HMAC verification then fails and
-    Identity.decrypt returns None, so Destination.receive returns False — which
-    short-circuits before BOTH the packet callback AND the PROVE_ALL auto-proof.
-    No protocol is assembled here; a genuine RNS-encrypted packet is merely
-    damaged, so the receiver's real decrypt/reject path is what's under test.
+    difference is the ciphertext, damaged AFTER pack() so the corruption survives
+    onto the wire. No protocol is assembled here; a genuine RNS-encrypted packet
+    is merely damaged, so the receiver's real decrypt/reject path is what's under
+    test.
 
-    Returns {sent, receipt_id} (poll via wire_packet_receipt_status — it must
-    NEVER reach DELIVERED, since no proof comes back).
+    Params:
+      handle, destination_hash, app_name, aspects, data — as wire_send_packet.
+      corruption (str, default "ciphertext"): how to render the packet
+        undecryptable.
+          "ciphertext" — bump the trailing ciphertext byte (the Token HMAC
+            tail), so HMAC verification fails and Identity.decrypt returns None;
+            Destination.receive returns False, short-circuiting BOTH the packet
+            callback AND the PROVE_ALL auto-proof (the canonical undecryptable
+            case, dropped at Destination.receive).
+          "truncate"   — strip the ciphertext entirely, leaving a header-only
+            frame that is rejected at the interface deframe/parse layer before
+            Transport.inbound is reached. A coarser malformed-input drop; the
+            no-proof / no-callback invariant must still hold.
+      timeout_ms (int, default 0): when > 0, wait inline (same proof-observation
+        pattern as wire_send_opportunistic) for the receipt to resolve and report
+        delivered/status; when 0, return immediately and let the caller poll the
+        receipt via wire_packet_receipt_status.
+
+    Returns {sent, receipt_id, delivered, status}. A conformant receiver yields
+    delivered=False (the receipt NEVER reaches DELIVERED, since no proof comes
+    back); receipt_id lets a caller re-confirm via wire_packet_receipt_status.
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -3550,6 +3567,8 @@ def cmd_wire_send_undecryptable(params):
     app_name = params["app_name"]
     aspects = params.get("aspects", [])
     payload = bytes.fromhex(params.get("data", ""))
+    corruption = (params.get("corruption") or "ciphertext").lower()
+    timeout_ms = int(params.get("timeout_ms", 0))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -3568,21 +3587,86 @@ def cmd_wire_send_undecryptable(params):
 
     packet = RNS.Packet(out_destination, payload, create_receipt=True)
     packet.pack()  # real RNS encryption; packed=True so send() won't re-pack
-    # Damage the final ciphertext byte (the Token HMAC tail) so the receiver's
-    # HMAC verification fails and decrypt returns None.
     raw = bytearray(packet.raw)
-    raw[-1] = (raw[-1] + 1) % 256
+    if corruption == "ciphertext":
+        # Bump the final ciphertext byte (the Token HMAC tail) so the receiver's
+        # HMAC verification fails and decrypt returns None.
+        raw[-1] = (raw[-1] + 1) % 256
+    elif corruption == "truncate":
+        # Strip the ciphertext, leaving a header-only frame that is rejected
+        # before the decrypt step.
+        #
+        # PRECONDITION (why 19 is correct here): packet.raw at this point is the
+        # pack()-level frame for a *direct* OUT SINGLE DATA packet — a HEADER_1
+        # frame with no transport_id. RNS.Packet.pack lays that out as
+        #   flags(1) + hops(1) + dest_hash(16) + context(1) = 19 bytes
+        # of header, then the ciphertext, so byte 19 is the ciphertext boundary.
+        # Two things would move that boundary, neither of which applies here:
+        #   * HEADER_2 (transport-relayed) prepends a 16-byte transport_id,
+        #     pushing the boundary to 35 — but this command always builds a
+        #     direct packet, which is HEADER_1.
+        #   * IFAC inserts an access-code field after the flags/hops bytes, but
+        #     that is an interface-layer wrapping applied AFTER pack() and
+        #     stripped again before the receiver parses; it never lands in this
+        #     pack-level raw (and these test interfaces run no-IFAC regardless).
+        # If either precondition were ever broken, offset 19 would cut into the
+        # header and silently mis-corrupt instead of cleanly stripping ciphertext.
+        _CIPHERTEXT_OFFSET = 19
+        if len(raw) <= _CIPHERTEXT_OFFSET:
+            raise RuntimeError(
+                f"packed packet too short to truncate ({len(raw)} bytes); "
+                f"expected a ciphertext region past offset {_CIPHERTEXT_OFFSET}"
+            )
+        raw = raw[:_CIPHERTEXT_OFFSET]
+    else:
+        raise ValueError(
+            f"Unsupported corruption={corruption!r}; expected 'ciphertext' or "
+            f"'truncate'"
+        )
     packet.raw = bytes(raw)
 
     receipt = packet.send()
     if receipt is False:
-        return {"sent": False, "receipt_id": None}
+        return {
+            "sent": False, "receipt_id": None,
+            "delivered": False, "status": "send_failed",
+        }
     receipt_id = None
     if receipt is not None:
         receipt_id = secrets.token_hex(8)
         inst.setdefault("receipts", {})[receipt_id] = receipt
     inst["destinations"].append((identity, out_destination))
-    return {"sent": True, "receipt_id": receipt_id}
+
+    delivered_flag = False
+    status = "pending"
+    if timeout_ms > 0 and receipt is not None:
+        # Same proof-observation pattern as wire_send_opportunistic: a
+        # conformant receiver drops the packet and never proves it, so the
+        # delivery event never fires and we report status="timeout".
+        delivered = threading.Event()
+
+        def _on_delivered(_receipt):
+            delivered.set()
+
+        def _on_timeout(_receipt):
+            # Don't set the event — the main thread also checks receipt.status,
+            # so a CULLED receipt (no proof within RNS's internal timeout) is
+            # observed there without conflating "no proof" with "delivered".
+            pass
+
+        receipt.set_delivery_callback(_on_delivered)
+        receipt.set_timeout_callback(_on_timeout)
+        fired = delivered.wait(timeout=timeout_ms / 1000.0)
+        if fired or receipt.status == RNS.PacketReceipt.DELIVERED:
+            delivered_flag = True
+            status = "delivered"
+        else:
+            status = "timeout"
+
+    return {
+        "sent": True, "receipt_id": receipt_id,
+        "delivered": delivered_flag, "status": status,
+    }
 
 
 _PACKET_RECEIPT_STATUS_NAMES = {0x00: "FAILED", 0x01: "SENT", 0x02: "DELIVERED", 0xFF: "CULLED"}

@@ -2480,17 +2480,34 @@ class _WirePeer:
         )
 
     def send_undecryptable(self, destination_hash: bytes, data: bytes,
-                           app_name: str, aspects: list) -> dict:
-        """Adversarial: send a SINGLE DATA packet whose ciphertext is damaged so
-        the receiver cannot decrypt it, returning {sent, receipt_id}. Poll the
-        receipt with packet_receipt_status — it must NEVER reach DELIVERED (the
-        receiver delivers nothing and emits no proof). See
-        wire_send_undecryptable."""
+                           app_name: str, aspects: list,
+                           corruption: str = "ciphertext",
+                           timeout_ms: int = 0) -> dict:
+        """Adversarial: send a SINGLE DATA packet the receiver cannot decrypt, to
+        prove it DROPS the packet (fires no callback, emits no proof).
+
+        The packet has a correct header + destination_hash (so it routes normally
+        and reaches the receiver's Transport), but its encrypted payload is
+        damaged so the receiver's decrypt fails — a conformant receiver therefore
+        never proves it and never dispatches it to its callback.
+
+        corruption: "ciphertext" (bump the Token HMAC tail byte; dropped at
+          Destination.receive) or "truncate" (strip the ciphertext; rejected at
+          the parse layer before Transport.inbound). Both render it undecryptable.
+
+        timeout_ms: when > 0, the bridge waits inline for the receipt and reports
+          delivered/status (used by the opportunistic drop test); when 0 (the
+          default), it returns immediately and the caller polls the returned
+          receipt_id via packet_receipt_status.
+
+        Returns {sent, receipt_id, delivered, status}. The receipt must NEVER
+        reach DELIVERED. See wire_send_undecryptable."""
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_send_undecryptable",
             handle=self.handle, destination_hash=destination_hash.hex(),
             data=data.hex(), app_name=app_name, aspects=list(aspects),
+            corruption=corruption, timeout_ms=timeout_ms,
         )
 
     def inject_crafted_proof(self, receipt_id: str, variant: str) -> dict:

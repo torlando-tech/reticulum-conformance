@@ -60,6 +60,7 @@ def pytest_generate_tests(metafunc):
 
     _parametrize_wire_trio(metafunc)
     _parametrize_wire_hub(metafunc)
+    _parametrize_wire_3peer_middle(metafunc)
     _parametrize_wire_shared_trio(metafunc)
 
 
@@ -521,6 +522,34 @@ class _WirePeer:
         if trim_to is not None:
             kwargs["trim_to"] = int(trim_to)
         return self.bridge.execute("wire_inject_raw_frame", **kwargs)
+
+    def build_data_packet(
+        self,
+        destination_hash: bytes,
+        app_name: str,
+        aspects: list,
+        data: bytes,
+    ) -> dict:
+        """Build (but do NOT send) a genuine HEADER_1 (transport_id null)
+        DATA packet on this peer, addressed to `destination_hash`, via
+        wire_build_data_packet. The destination must be one this peer
+        learned from an announce (its identity is recalled).
+
+        Returns {dest_hash, frame_len, raw (hex str)}. The packed frame
+        is HEADER_1: pack() never consults the path table or inserts a
+        transport id (the HEADER_2 upgrade happens at send()/outbound,
+        not pack()), so the frame is a direct, non-relayed one that the
+        live inbound path accepts.
+        """
+        assert self.handle, "start_* must be called first"
+        return self.bridge.execute(
+            "wire_build_data_packet",
+            handle=self.handle,
+            destination_hash=destination_hash.hex(),
+            app_name=app_name,
+            aspects=list(aspects),
+            data=data.hex(),
+        )
 
     def register_request_handler(
         self,
@@ -3222,6 +3251,25 @@ def _parametrize_wire_hub(metafunc):
     metafunc.parametrize("wire_hub_impl", peers, ids=ids, scope="function")
 
 
+def _parametrize_wire_3peer_middle(metafunc):
+    """Parametrize 3-peer tests over the MIDDLE peer's impl only.
+
+    Mirrors `_parametrize_wire_hub` for the `wire_3peer_middle` fixture:
+    the relay/transport behavior under test is a property of the middle
+    node alone, so the two leaves are pinned to the reference and each
+    test runs once per middle impl (e.g. "reference-middle",
+    "kotlin-middle").
+    """
+    if "wire_3peer_middle" not in metafunc.fixturenames:
+        return
+    impls = get_impl_list(metafunc.config) or []
+    peers = sorted(set(impls) | {"reference"})
+    ids = [f"{impl}-middle" for impl in peers]
+    metafunc.parametrize(
+        "wire_3peer_middle_impl", peers, ids=ids, scope="function"
+    )
+
+
 @pytest.fixture
 def wire_hub_impl(request):
     """Impl under test for the middle hub in the 4-peer fixture."""
@@ -3270,6 +3318,62 @@ def wire_hub_isolation(wire_hub_impl):
         yield sender, transport, receiver, witness
     finally:
         for peer in (sender, transport, receiver, witness):
+            try:
+                peer.stop()
+            except Exception:
+                pass
+        for b in bridges:
+            try:
+                b.close()
+            except Exception:
+                pass
+
+
+@pytest.fixture
+def wire_3peer_middle_impl(request):
+    """Impl under test for the middle node in the 3-peer fixture."""
+    return request.param
+
+
+@pytest.fixture
+def wire_3peer_middle(wire_3peer_middle_impl):
+    """Three freshly-spawned bridges arranged as sender -> middle ->
+    receiver, with the MIDDLE node's impl under test and both leaves
+    pinned to the reference.
+
+    Topology::
+
+              sender (TCPClient, reference)
+                        \\
+                         v
+                middle (TCPServer, wire_3peer_middle_impl)
+                        ^
+                        |
+              receiver (TCPClient, reference)
+
+    The middle is the only peer that listens; the leaves connect
+    outbound to it, so the middle holds one spawned (child) interface
+    per leaf plus the parent server interface. The caller decides the
+    middle's `enable_transport` at `start_tcp_server` time; tests that
+    probe the transport gate start it with `enable_transport=False`.
+
+    Yields (sender, middle, receiver) as `_WirePeer` objects.
+    """
+    middle_impl = wire_3peer_middle_impl
+    sender_impl = receiver_impl = "reference"
+    bridges = [
+        BridgeClient(resolve_command(sender_impl), env=_env_for(sender_impl)),
+        BridgeClient(resolve_command(middle_impl), env=_env_for(middle_impl)),
+        BridgeClient(resolve_command(receiver_impl), env=_env_for(receiver_impl)),
+    ]
+    sender = _WirePeer(bridges[0], role_label=f"sender({sender_impl})")
+    middle = _WirePeer(bridges[1], role_label=f"middle({middle_impl})")
+    receiver = _WirePeer(bridges[2], role_label=f"receiver({receiver_impl})")
+
+    try:
+        yield sender, middle, receiver
+    finally:
+        for peer in (sender, middle, receiver):
             try:
                 peer.stop()
             except Exception:

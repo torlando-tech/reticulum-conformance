@@ -10284,6 +10284,68 @@ def cmd_wire_inject_raw_frame(params):
     return result
 
 
+def cmd_wire_build_data_packet(params):
+    """Build (but do NOT send) a genuine HEADER_1 DATA packet to a
+    destination hash, returning the packed raw frame.
+
+    Mirrors the SUT `wire_build_data_packet` (WireTcp.kt). Used by the
+    F1.2 unconditional-relay repro: the middle node (transport DISABLED)
+    builds a HEADER_1 (transport_id None) DATA packet addressed to a peer
+    it has a 1-hop path to, and a test injects the raw frame onto one of
+    its own interfaces via `wire_inject_raw_frame variant=inject_external`
+    to probe whether the impl relays a foreign data packet between its
+    interfaces with transport off.
+
+    The packet is addressed by `destination_hash` (a 16-byte SINGLE
+    destination the handle learned from a peer's announce): we recall the
+    destination's identity, construct a matching OUT SINGLE destination
+    (the destination hash is direction-independent: it is
+    Identity.hash(name) over the identity + app_name + aspects, so the
+    OUT destination hashes to the SAME 16 bytes as the peer's IN
+    destination), and pack a real RNS DATA packet. `header_type=HEADER_1`
+    and `transport_id=None` produce a direct, non-relayed frame; pack()
+    never consults the path table or inserts a transport id (the HEADER_2
+    upgrade happens at send()/outbound, not pack()), so the returned raw
+    is a genuine HEADER_1 frame the live inbound path will accept.
+
+    Returns {dest_hash, frame_len, raw}. No protocol bytes are assembled
+    by the bridge: announce/encrypt/pack are all RNS's own.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params.get("app_name", "relay")
+    aspects = list(params.get("aspects", ["f12"]))
+    payload = bytes.fromhex(params["data"]) if params.get("data") else b"relay-probe"
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(dest_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {dest_hash.hex()}; the handle must have "
+            f"received an announce for this destination first."
+        )
+    out_dest = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects
+    )
+    packet = RNS.Packet(
+        out_dest, payload, create_receipt=False,
+        header_type=RNS.Packet.HEADER_1, transport_id=None,
+    )
+    packet.pack()
+    raw = bytes(packet.raw)
+    inst["destinations"].append((identity, out_dest))
+    return {
+        "dest_hash": dest_hash.hex(),
+        "frame_len": len(raw),
+        "raw": raw.hex(),
+    }
+
+
 def cmd_wire_send_opportunistic(params):
     """Send an opportunistic SINGLE-destination DATA packet and wait for
     delivery proof.
@@ -10633,5 +10695,6 @@ WIRE_COMMANDS = {
     "wire_rpc_authkey": cmd_wire_rpc_authkey,
     "wire_first_hop_timeout": cmd_wire_first_hop_timeout,
     "wire_inject_raw_frame": cmd_wire_inject_raw_frame,
+    "wire_build_data_packet": cmd_wire_build_data_packet,
     "wire_stop": cmd_wire_stop,
 }

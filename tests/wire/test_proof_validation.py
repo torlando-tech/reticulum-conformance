@@ -153,3 +153,60 @@ def test_link_data_tamper_silently_dropped(wire_link_setup):
             f"a {corruption} tamper tore the link down instead of silently "
             f"dropping the packet: {res!r}"
         )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path",
+        "link_open", "inject_tampered_link_data",
+    ],
+    verifies=(
+        "Link DATA replay is gated on the packet's destination type: a "
+        "wire-captured, correctly encrypted link DATA packet that is re-flagged "
+        "from a LINK packet to a PLAIN hops-0 packet (link_id still in the "
+        "destination position) must NOT be re-delivered to the application, "
+        "because Transport.data() only routes to the local active-link table "
+        "when packet.destination_type == LINK (Transport.py:2155) - the "
+        "destination hashlist skip from the flag flip is NOT a delivery path. "
+        "The same packet UNMODIFIED (LINK-flagged) through the live inbound "
+        "path IS delivered (positive control, same path), so a delivered=True "
+        "on the re-flagged packet means the port matched the active link by "
+        "link_id without checking destination_type and re-delivered the "
+        "replayed authenticated payload (link-data replay)"
+    ),
+)
+def test_link_data_replay_reflag_dropped(wire_link_setup):
+    # The server holds the inbound link and its packet handler, so the
+    # injector runs on the SERVER peer.
+    server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Positive control on the SAME live-inbound path: the unmodified
+    # (LINK-flagged) packet is delivered. Proves the inbound path, active-link
+    # dispatch, decrypt, and handler delivery all work, so a False on the
+    # replay is the destination_type gate and not a broken path.
+    ok = server.inject_tampered_link_data(
+        link_id, b"genuine-link-data", corruption="pristine_link_inbound",
+    )
+    assert ok["unpacked"] is True, f"pristine packet failed to unpack: {ok!r}"
+    assert ok["delivered"] is True, (
+        "an unmodified LINK-flagged DATA packet was not delivered through the "
+        f"live inbound path (positive control): {ok!r}"
+    )
+    assert ok["link_active"] is True, f"link not ACTIVE after a valid packet: {ok!r}"
+
+    # The replay: the identical packet, re-flagged LINK -> PLAIN + hops 0.
+    # A conforming impl does not deliver it to the application.
+    res = server.inject_tampered_link_data(
+        link_id, b"genuine-link-data", corruption="replay_reflag",
+    )
+    assert res["unpacked"] is True, f"re-flagged packet failed to unpack: {res!r}"
+    assert res["delivered"] is False, (
+        "a wire-captured link DATA packet re-flagged as PLAIN/hops-0 was "
+        "RE-DELIVERED to the application - the data dispatch matched the "
+        "active link by link_id without checking destination_type == LINK, so "
+        "the replayed authenticated payload bypassed the link hashlist and the "
+        f"destination-type gate: {res!r}"
+    )
+    assert res["link_active"] is True, (
+        f"the replay tore the link down instead of dropping the packet: {res!r}"
+    )

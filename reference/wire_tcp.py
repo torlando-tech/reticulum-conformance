@@ -6504,8 +6504,18 @@ def cmd_wire_inject_tampered_link_data(params):
       hmac       — flip the trailing HMAC byte -> mismatch -> drop.
       truncate   — drop the last byte -> malformed token -> drop.
       foreign_interface — a PRISTINE packet, but presented on an interface that
-                 is NOT link.attached_interface -> Link.receive's interface-bind
-                 check (Link.py:975) rejects it before decrypt -> not delivered.
+      is NOT link.attached_interface -> Link.receive's interface-bind check
+      (Link.py:975) rejects it before decrypt -> not delivered.
+      replay_reflag - a PRISTINE packet whose flag byte is re-flagged from a
+      LINK packet to a PLAIN, hops-0 packet (link_id still in the destination
+      position), then pushed through the LIVE Transport.inbound path. The
+      payload/token are intact so link.decrypt still works; the ONLY defense is
+      Transport.data()'s destination_type == LINK gate on the local-link branch.
+      Python: NOT delivered (the gate drops it before link receive). A port
+      that matches active links by link_id WITHOUT checking destination_type
+      re-delivers the replayed authenticated payload to the app (link-data
+      replay) -> delivered True. (Transport.py:2155 vs. the ungated Kotlin
+      processData link match.)
 
     Run this on the RECEIVER peer (it owns the inbound link + its packet
     handler). Returns {corruption, unpacked, delivered, link_active,
@@ -6560,10 +6570,63 @@ def cmd_wire_inject_tampered_link_data(params):
         raw[-1] = (raw[-1] + 1) % 256
     elif corruption == "truncate":
         raw = raw[:-1]
-    elif corruption in ("none", "foreign_interface"):
-        pass  # packet stays pristine; foreign_interface only changes rx iface
+    elif corruption in ("none", "foreign_interface", "pristine_link_inbound", "replay_reflag"):
+        pass  # packet stays pristine; foreign_interface/replay change routing, not bytes
     else:
         raise ValueError(f"unknown corruption: {corruption!r}")
+
+    # The replay_reflag vector must traverse the LIVE Transport.inbound path -
+    # the place where Transport.data()'s local-link branch (Python
+    # Transport.py:2155) gates delivery on packet.destination_type == LINK -
+    # NOT link.receive(), which would skip that gate entirely and deliver
+    # regardless. So it uses its own delivery path below.
+    if corruption in ("pristine_link_inbound", "replay_reflag"):
+        # pristine_link_inbound: push an UNTOUCHED (LINK-flagged, hops from the
+        # normal build) link DATA packet through the live Transport.inbound path.
+        # This is the POSITIVE CONTROL for replay_reflag: it proves the inbound
+        # path + active-link dispatch + link.decrypt + handler delivery all work,
+        # so a delivered=False on replay_reflag is the destination_type gate, not
+        # a broken path. MUST deliver on a correct implementation.
+        #
+        # replay_reflag: re-flag a PRISTINE (correctly encrypted, correctly
+        # signed) link DATA packet as a PLAIN, hops-0 packet, keeping the
+        # link_id as the destination hash. This is the wire capture an attacker
+        # makes of a normal link packet.
+        #
+        # The re-flag changes the destination-type nibble (bits 2-3 of the flag
+        # byte) LINK(3) -> PLAIN(2) and zeroes the hop count. The payload and
+        # token are untouched, so link.decrypt still succeeds - the only thing
+        # that can stop it being re-delivered to the app is the
+        # destination_type == LINK gate in Transport.data().
+        #
+        #   flag byte: header(6:7) | context(5) | transport(4) | dest_type(2:3) | packet(0:1)
+        #   LINK  = 0b0000_11_11 ; PLAIN = 0b0000_10_11
+        #
+        # Python: packet_filter returns hops<=1 for PLAIN *before* the hashlist
+        # check (no dedup), then Transport.data() only routes to active_links
+        # when destination_type == LINK, so the re-flagged packet is NOT
+        # delivered (it has no matching destination) -> delivered False.
+        # A port whose data dispatch matches active links by link_id WITHOUT
+        # checking destination_type will decrypt and hand the replayed payload
+        # to the link's packet handler -> delivered True.
+        inj = bytearray(raw)
+        if corruption == "replay_reflag":
+            inj[0] = (inj[0] & 0b11111001) | (0b00000010 << 2)   # dest-type nibble -> PLAIN
+            inj[1] = 0                                          # hops -> 0
+        rx2 = RNS.Packet(None, bytes(inj))
+        ok2 = rx2.unpack()
+        rx_iface = link.attached_interface
+        if ok2:
+            RNS.Transport.inbound(bytes(inj), rx_iface)
+        time.sleep(0.05)
+        after2 = len(listener["recv_buffer"])
+        return {
+            "corruption": corruption,
+            "unpacked": bool(ok2),
+            "delivered": after2 > before,
+            "link_active": getattr(link, "status", None) == RNS.Link.ACTIVE,
+            "status_name": _LINK_STATUS_NAMES.get(getattr(link, "status", None)),
+        }
 
     rx = RNS.Packet(None, bytes(raw))
     unpacked = rx.unpack()
@@ -9723,6 +9786,12 @@ def cmd_wire_inject_crafted_link_proof(params):
       valid_explicit   — receipt.hash || link.sign(receipt.hash) (96B): MUST
                          validate (DELIVERED) — the positive 96-byte-explicit
                          acceptance.
+      forged_explicit  - receipt.hash || Identity().sign(receipt.hash) (96B,
+                         CORRECT hash, WRONG-key signature): MUST be rejected -
+                         link.validate verifies against the link's peer_sig_pub,
+                         so a wrong-key signature fails even though the length and
+                         hash are both correct (the unauthenticated delivery-proof
+                         vector; Link.validate must actually check the result).
       implicit_valid_sig — link.sign(receipt.hash) alone (64B, VALID signature):
                          MUST be rejected (links are explicit-only), proving the
                          FORM is enforced, not merely the signature.
@@ -9762,6 +9831,15 @@ def cmd_wire_inject_crafted_link_proof(params):
 
     if variant == "valid_explicit":
         proof = receipt.hash + link.sign(receipt.hash)
+    elif variant == "forged_explicit":
+        # 96B EXPLICIT with the CORRECT proof-hash but a signature under a
+        # THROWAWAY (wrong) identity key. link.validate verifies against the
+        # link's peer_sig_pub, so a wrong-key signature MUST be rejected even
+        # though the length and the leading hash are both correct. This is the
+        # unauthenticated-delivery-proof vector: an impl whose Link.validate
+        # ignores the verification result accepts any 64 bytes as a DELIVERED
+        # confirmation. (Link.validate, Link.py)
+        proof = receipt.hash + RNS.Identity().sign(receipt.hash)
     elif variant == "implicit_valid_sig":
         proof = link.sign(receipt.hash)               # 64B, valid signature
     elif variant == "implicit_random":

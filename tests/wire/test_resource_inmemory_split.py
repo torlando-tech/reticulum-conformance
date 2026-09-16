@@ -16,20 +16,27 @@ whole dispatch in ``jobsLock.withLock``). A peer reaches this by simply
 completing one ordinary, valid in-memory transfer larger than the bound - no
 malformed packets, no flood.
 
-This is the DoS framing of a gap the suite already documents as a kotlin
+This is the DoS framing of a gap the suite once documented as a kotlin
 *feature* xfail (test_resource_segmentation.py / test_resource_completeness.py:
 "prepareNextSegment needs an inputFile byte-array sends never set"). Those
-xfails treat multi-segment as an unimplemented feature; this test makes the
+xfails treated multi-segment as an unimplemented feature; this test makes the
 stronger claim that the reference's proof validator SPINS FOREVER (holding the
 node-global jobs lock) rather than cleanly failing - a remote DoS reachable by
 completing one valid transfer - and asserts it as a hard failure.
 
 The stall is in the SENDER's proof path. In this harness the client is the link
-initiator / resource sender, so the kotlin client is the DoS trigger: the test
-fails on the kotlin-client pairs (the sender times out, the completion callback
-never fires) and passes on the reference-client pairs. A 16 KiB single-segment
-transfer first is the positive control, proving the Link moves resources at all
-(so a timed-out split transfer is the input-file gap, not a broken link).
+initiator / resource sender, so the client's proof path is under test. The
+reference client spills to a temp file and completes; a port missing the
+in-memory input file spins forever in validate_proof (the sender times out, the
+completion callback never fires). A 16 KiB single-segment transfer first is the
+positive control, proving the Link moves resources at all (so a timed-out split
+transfer is the input-file gap, not a broken link).
+
+Regression status: the kotlin client's in-memory input-file gap was fixed on
+main (reticulum-kt PR #86: temp-file spill for in-memory split sends, per
+segment), so both the reference-client and kotlin-client pairs now complete and
+this test guards that fix - a timed-out split send on either peer is a hard
+failure.
 
 The sender-side completion is the discriminating observable. Receiver-side
 byte reassembly of a split transfer is NOT asserted here: the kotlin receiver

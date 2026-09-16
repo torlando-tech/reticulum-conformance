@@ -6484,6 +6484,16 @@ def cmd_wire_inject_crafted_proof(params):
     }
 
 
+# Per-instance cache: the pristine raw frame built for `pristine_link_inbound`
+# per link_id. `replay_reflag` re-flags the SAME bytes (the wire capture an
+# attacker makes of a normal link packet) rather than building a fresh packet,
+# so a delivered=True on the replay means the destination_type gate is absent,
+# not that a different packet happened to route. Keyed by (handle, link_id.hex)
+# to keep instances isolated; bounded by the listener teardown (entries are
+# small: one DATA packet per link, ~60-100 bytes).
+_REPLAY_RAW_CACHE = {}
+
+
 def cmd_wire_inject_tampered_link_data(params):
     """Adversarial tampered-token injector for an ACTIVE link.
 
@@ -6611,8 +6621,25 @@ def cmd_wire_inject_tampered_link_data(params):
         # to the link's packet handler -> delivered True.
         inj = bytearray(raw)
         if corruption == "replay_reflag":
+            # Re-flag the SAME bytes captured by the positive control
+            # (pristine_link_inbound). If the cache has no entry for this
+            # link (e.g. the caller skipped the positive control), fall
+            # back to re-flagging the freshly-built packet, but report
+            # `reused_raw: false` so the test can flag the gap.
+            cache_key = (handle, link_id.hex())
+            cached = _REPLAY_RAW_CACHE.get(cache_key)
+            reused = cached is not None
+            if reused:
+                inj = bytearray(cached)
             inj[0] = (inj[0] & 0b11111001) | (0b00000010 << 2)   # dest-type nibble -> PLAIN
             inj[1] = 0                                          # hops -> 0
+        else:
+            # pristine_link_inbound: cache the pristine raw for the subsequent
+            # replay_reflag call. The test passes the positive-control raw back
+            # in via `replay_reflag` only as a cross-check; the bridge-side
+            # cache is the authoritative source.
+            _REPLAY_RAW_CACHE[(handle, link_id.hex())] = bytes(raw)
+            reused = False
         rx2 = RNS.Packet(None, bytes(inj))
         ok2 = rx2.unpack()
         rx_iface = link.attached_interface
@@ -6620,12 +6647,18 @@ def cmd_wire_inject_tampered_link_data(params):
             RNS.Transport.inbound(bytes(inj), rx_iface)
         time.sleep(0.05)
         after2 = len(listener["recv_buffer"])
+        if corruption == "replay_reflag":
+            # Bounded: drop the cache entry once the replay has been
+            # injected (the cache only exists to bridge the two calls).
+            _REPLAY_RAW_CACHE.pop((handle, link_id.hex()), None)
         return {
             "corruption": corruption,
             "unpacked": bool(ok2),
             "delivered": after2 > before,
             "link_active": getattr(link, "status", None) == RNS.Link.ACTIVE,
             "status_name": _LINK_STATUS_NAMES.get(getattr(link, "status", None)),
+            "reused_raw": reused,
+            "raw_hex": inj.hex(),
         }
 
     rx = RNS.Packet(None, bytes(raw))

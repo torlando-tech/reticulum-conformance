@@ -160,6 +160,61 @@ def test_link_packet_proofs_explicit_only(wire_pair_started):
 
 
 @conformance_case(
+    commands=["start_tcp_server", "start_tcp_client", "inject_crafted_link_proof"],
+    verifies=(
+        "A link DATA packet's delivery proof is AUTHENTICATED: a 96-byte EXPLICIT "
+        "proof whose leading 32-byte proof-hash matches the receipt but whose "
+        "signature is forged under a WRONG (throwaway) key MUST be rejected by "
+        "link.validate, which verifies the signature against the link's "
+        "peer_sig_pub (Link.py) — even though the proof length and hash are both "
+        "correct. A Link.validate that discards the Ed25519 verification result "
+        "(returns a hardcoded true) accepts ANY 64 bytes as a DELIVERED "
+        "confirmation, letting a wire observer forge delivery of a captured link "
+        "packet. A genuinely valid explicit proof (signed by the link's own key) "
+        "is the positive control and MUST be accepted. Driven on BOTH peers so "
+        "the assertion holds whichever leg is the implementation under test"
+    ),
+)
+def test_link_delivery_proof_requires_valid_signature(wire_pair_started):
+    server, client = wire_pair_started
+
+    # Positive control on BOTH peers: a genuine 96-byte EXPLICIT proof (signed by
+    # the link's own key, which is its peer_sig_pub) validates and delivers.
+    for peer in (server, client):
+        ok = peer.inject_crafted_link_proof("valid_explicit")
+        assert ok["proof_len"] == _EXPL_LENGTH, f"explicit proof must be 96B: {ok!r}"
+        assert ok["validated"] is True, (
+            f"{peer.role_label}: a valid 96-byte EXPLICIT link proof was not "
+            f"accepted (positive control): {ok!r}"
+        )
+        assert ok["status_name"] == "DELIVERED", (
+            f"{peer.role_label}: explicit link proof must drive the receipt to "
+            f"DELIVERED: {ok!r}"
+        )
+
+    # The forged proof: correct hash, WRONG-key signature. Both peers'
+    # link.validate must reject it (verified against peer_sig_pub) and leave the
+    # receipt SENT / not proved. An impl whose Link.validate ignores the verify
+    # result would accept it -> receipt DELIVERED.
+    for peer in (server, client):
+        forged = peer.inject_crafted_link_proof("forged_explicit")
+        assert forged["proof_len"] == _EXPL_LENGTH, (
+            f"{peer.role_label}: forged proof must be 96B (correct length, so "
+            f"only the signature can reject it): {forged!r}"
+        )
+        assert forged["validated"] is False, (
+            f"{peer.role_label}: a forged 96-byte EXPLICIT link proof (correct "
+            f"hash, WRONG-key signature) was ACCEPTED - Link.validate is not "
+            f"checking the Ed25519 result (unauthenticated delivery proof): "
+            f"{forged!r}"
+        )
+        assert forged["status_name"] == "SENT", (
+            f"{peer.role_label}: receipt must stay SENT after a forged proof: "
+            f"{forged!r}"
+        )
+
+
+@conformance_case(
     commands=["start_tcp_server", "start_tcp_client", "inject_single_proof_format"],
     verifies=(
         "RNS.PacketReceipt.validate_proof ACCEPTS a spec-conformant single-packet "

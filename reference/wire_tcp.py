@@ -6484,6 +6484,16 @@ def cmd_wire_inject_crafted_proof(params):
     }
 
 
+# Per-instance cache: the pristine raw frame built for `pristine_link_inbound`
+# per link_id. `replay_reflag` re-flags the SAME bytes (the wire capture an
+# attacker makes of a normal link packet) rather than building a fresh packet,
+# so a delivered=True on the replay means the destination_type gate is absent,
+# not that a different packet happened to route. Keyed by (handle, link_id.hex)
+# to keep instances isolated; bounded by the listener teardown (entries are
+# small: one DATA packet per link, ~60-100 bytes).
+_REPLAY_RAW_CACHE = {}
+
+
 def cmd_wire_inject_tampered_link_data(params):
     """Adversarial tampered-token injector for an ACTIVE link.
 
@@ -6504,8 +6514,18 @@ def cmd_wire_inject_tampered_link_data(params):
       hmac       — flip the trailing HMAC byte -> mismatch -> drop.
       truncate   — drop the last byte -> malformed token -> drop.
       foreign_interface — a PRISTINE packet, but presented on an interface that
-                 is NOT link.attached_interface -> Link.receive's interface-bind
-                 check (Link.py:975) rejects it before decrypt -> not delivered.
+      is NOT link.attached_interface -> Link.receive's interface-bind check
+      (Link.py:975) rejects it before decrypt -> not delivered.
+      replay_reflag - a PRISTINE packet whose flag byte is re-flagged from a
+      LINK packet to a PLAIN, hops-0 packet (link_id still in the destination
+      position), then pushed through the LIVE Transport.inbound path. The
+      payload/token are intact so link.decrypt still works; the ONLY defense is
+      Transport.data()'s destination_type == LINK gate on the local-link branch.
+      Python: NOT delivered (the gate drops it before link receive). A port
+      that matches active links by link_id WITHOUT checking destination_type
+      re-delivers the replayed authenticated payload to the app (link-data
+      replay) -> delivered True. (Transport.py:2155 vs. the ungated Kotlin
+      processData link match.)
 
     Run this on the RECEIVER peer (it owns the inbound link + its packet
     handler). Returns {corruption, unpacked, delivered, link_active,
@@ -6560,10 +6580,86 @@ def cmd_wire_inject_tampered_link_data(params):
         raw[-1] = (raw[-1] + 1) % 256
     elif corruption == "truncate":
         raw = raw[:-1]
-    elif corruption in ("none", "foreign_interface"):
-        pass  # packet stays pristine; foreign_interface only changes rx iface
+    elif corruption in ("none", "foreign_interface", "pristine_link_inbound", "replay_reflag"):
+        pass  # packet stays pristine; foreign_interface/replay change routing, not bytes
     else:
         raise ValueError(f"unknown corruption: {corruption!r}")
+
+    # The replay_reflag vector must traverse the LIVE Transport.inbound path -
+    # the place where Transport.data()'s local-link branch (Python
+    # Transport.py:2155) gates delivery on packet.destination_type == LINK -
+    # NOT link.receive(), which would skip that gate entirely and deliver
+    # regardless. So it uses its own delivery path below.
+    if corruption in ("pristine_link_inbound", "replay_reflag"):
+        # pristine_link_inbound: push an UNTOUCHED (LINK-flagged, hops from the
+        # normal build) link DATA packet through the live Transport.inbound path.
+        # This is the POSITIVE CONTROL for replay_reflag: it proves the inbound
+        # path + active-link dispatch + link.decrypt + handler delivery all work,
+        # so a delivered=False on replay_reflag is the destination_type gate, not
+        # a broken path. MUST deliver on a correct implementation.
+        #
+        # replay_reflag: re-flag a PRISTINE (correctly encrypted, correctly
+        # signed) link DATA packet as a PLAIN, hops-0 packet, keeping the
+        # link_id as the destination hash. This is the wire capture an attacker
+        # makes of a normal link packet.
+        #
+        # The re-flag changes the destination-type nibble (bits 2-3 of the flag
+        # byte) LINK(3) -> PLAIN(2) and zeroes the hop count. The payload and
+        # token are untouched, so link.decrypt still succeeds - the only thing
+        # that can stop it being re-delivered to the app is the
+        # destination_type == LINK gate in Transport.data().
+        #
+        #   flag byte: header(6:7) | context(5) | transport(4) | dest_type(2:3) | packet(0:1)
+        #   LINK  = 0b0000_11_11 ; PLAIN = 0b0000_10_11
+        #
+        # Python: packet_filter returns hops<=1 for PLAIN *before* the hashlist
+        # check (no dedup), then Transport.data() only routes to active_links
+        # when destination_type == LINK, so the re-flagged packet is NOT
+        # delivered (it has no matching destination) -> delivered False.
+        # A port whose data dispatch matches active links by link_id WITHOUT
+        # checking destination_type will decrypt and hand the replayed payload
+        # to the link's packet handler -> delivered True.
+        inj = bytearray(raw)
+        if corruption == "replay_reflag":
+            # Re-flag the SAME bytes captured by the positive control
+            # (pristine_link_inbound). If the cache has no entry for this
+            # link (e.g. the caller skipped the positive control), fall
+            # back to re-flagging the freshly-built packet, but report
+            # `reused_raw: false` so the test can flag the gap.
+            cache_key = (handle, link_id.hex())
+            cached = _REPLAY_RAW_CACHE.get(cache_key)
+            reused = cached is not None
+            if reused:
+                inj = bytearray(cached)
+            inj[0] = (inj[0] & 0b11111001) | (0b00000010 << 2)   # dest-type nibble -> PLAIN
+            inj[1] = 0                                          # hops -> 0
+        else:
+            # pristine_link_inbound: cache the pristine raw for the subsequent
+            # replay_reflag call. The test passes the positive-control raw back
+            # in via `replay_reflag` only as a cross-check; the bridge-side
+            # cache is the authoritative source.
+            _REPLAY_RAW_CACHE[(handle, link_id.hex())] = bytes(raw)
+            reused = False
+        rx2 = RNS.Packet(None, bytes(inj))
+        ok2 = rx2.unpack()
+        rx_iface = link.attached_interface
+        if ok2:
+            RNS.Transport.inbound(bytes(inj), rx_iface)
+        time.sleep(0.05)
+        after2 = len(listener["recv_buffer"])
+        if corruption == "replay_reflag":
+            # Bounded: drop the cache entry once the replay has been
+            # injected (the cache only exists to bridge the two calls).
+            _REPLAY_RAW_CACHE.pop((handle, link_id.hex()), None)
+        return {
+            "corruption": corruption,
+            "unpacked": bool(ok2),
+            "delivered": after2 > before,
+            "link_active": getattr(link, "status", None) == RNS.Link.ACTIVE,
+            "status_name": _LINK_STATUS_NAMES.get(getattr(link, "status", None)),
+            "reused_raw": reused,
+            "raw_hex": inj.hex(),
+        }
 
     rx = RNS.Packet(None, bytes(raw))
     unpacked = rx.unpack()
@@ -9723,6 +9819,12 @@ def cmd_wire_inject_crafted_link_proof(params):
       valid_explicit   — receipt.hash || link.sign(receipt.hash) (96B): MUST
                          validate (DELIVERED) — the positive 96-byte-explicit
                          acceptance.
+      forged_explicit  - receipt.hash || Identity().sign(receipt.hash) (96B,
+                         CORRECT hash, WRONG-key signature): MUST be rejected -
+                         link.validate verifies against the link's peer_sig_pub,
+                         so a wrong-key signature fails even though the length and
+                         hash are both correct (the unauthenticated delivery-proof
+                         vector; Link.validate must actually check the result).
       implicit_valid_sig — link.sign(receipt.hash) alone (64B, VALID signature):
                          MUST be rejected (links are explicit-only), proving the
                          FORM is enforced, not merely the signature.
@@ -9762,6 +9864,15 @@ def cmd_wire_inject_crafted_link_proof(params):
 
     if variant == "valid_explicit":
         proof = receipt.hash + link.sign(receipt.hash)
+    elif variant == "forged_explicit":
+        # 96B EXPLICIT with the CORRECT proof-hash but a signature under a
+        # THROWAWAY (wrong) identity key. link.validate verifies against the
+        # link's peer_sig_pub, so a wrong-key signature MUST be rejected even
+        # though the length and the leading hash are both correct. This is the
+        # unauthenticated-delivery-proof vector: an impl whose Link.validate
+        # ignores the verification result accepts any 64 bytes as a DELIVERED
+        # confirmation. (Link.validate, Link.py)
+        proof = receipt.hash + RNS.Identity().sign(receipt.hash)
     elif variant == "implicit_valid_sig":
         proof = link.sign(receipt.hash)               # 64B, valid signature
     elif variant == "implicit_random":
@@ -10206,6 +10317,68 @@ def cmd_wire_inject_raw_frame(params):
     return result
 
 
+def cmd_wire_build_data_packet(params):
+    """Build (but do NOT send) a genuine HEADER_1 DATA packet to a
+    destination hash, returning the packed raw frame.
+
+    Mirrors the SUT `wire_build_data_packet` (WireTcp.kt). Used by the
+    F1.2 unconditional-relay repro: the middle node (transport DISABLED)
+    builds a HEADER_1 (transport_id None) DATA packet addressed to a peer
+    it has a 1-hop path to, and a test injects the raw frame onto one of
+    its own interfaces via `wire_inject_raw_frame variant=inject_external`
+    to probe whether the impl relays a foreign data packet between its
+    interfaces with transport off.
+
+    The packet is addressed by `destination_hash` (a 16-byte SINGLE
+    destination the handle learned from a peer's announce): we recall the
+    destination's identity, construct a matching OUT SINGLE destination
+    (the destination hash is direction-independent: it is
+    Identity.hash(name) over the identity + app_name + aspects, so the
+    OUT destination hashes to the SAME 16 bytes as the peer's IN
+    destination), and pack a real RNS DATA packet. `header_type=HEADER_1`
+    and `transport_id=None` produce a direct, non-relayed frame; pack()
+    never consults the path table or inserts a transport id (the HEADER_2
+    upgrade happens at send()/outbound, not pack()), so the returned raw
+    is a genuine HEADER_1 frame the live inbound path will accept.
+
+    Returns {dest_hash, frame_len, raw}. No protocol bytes are assembled
+    by the bridge: announce/encrypt/pack are all RNS's own.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    dest_hash = bytes.fromhex(params["destination_hash"])
+    app_name = params.get("app_name", "relay")
+    aspects = list(params.get("aspects", ["f12"]))
+    payload = bytes.fromhex(params["data"]) if params.get("data") else b"relay-probe"
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    identity = RNS.Identity.recall(dest_hash)
+    if identity is None:
+        raise RuntimeError(
+            f"No identity known for {dest_hash.hex()}; the handle must have "
+            f"received an announce for this destination first."
+        )
+    out_dest = RNS.Destination(
+        identity, RNS.Destination.OUT, RNS.Destination.SINGLE, app_name, *aspects
+    )
+    packet = RNS.Packet(
+        out_dest, payload, create_receipt=False,
+        header_type=RNS.Packet.HEADER_1, transport_id=None,
+    )
+    packet.pack()
+    raw = bytes(packet.raw)
+    inst["destinations"].append((identity, out_dest))
+    return {
+        "dest_hash": dest_hash.hex(),
+        "frame_len": len(raw),
+        "raw": raw.hex(),
+    }
+
+
 def cmd_wire_send_opportunistic(params):
     """Send an opportunistic SINGLE-destination DATA packet and wait for
     delivery proof.
@@ -10555,5 +10728,6 @@ WIRE_COMMANDS = {
     "wire_rpc_authkey": cmd_wire_rpc_authkey,
     "wire_first_hop_timeout": cmd_wire_first_hop_timeout,
     "wire_inject_raw_frame": cmd_wire_inject_raw_frame,
+    "wire_build_data_packet": cmd_wire_build_data_packet,
     "wire_stop": cmd_wire_stop,
 }

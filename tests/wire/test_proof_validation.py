@@ -153,3 +153,86 @@ def test_link_data_tamper_silently_dropped(wire_link_setup):
             f"a {corruption} tamper tore the link down instead of silently "
             f"dropping the packet: {res!r}"
         )
+
+
+@conformance_case(
+    commands=[
+        "start_tcp_server", "start_tcp_client", "listen", "announce", "poll_path",
+        "link_open", "inject_tampered_link_data",
+    ],
+    verifies=(
+        "Link DATA replay is gated on the packet's destination type: a "
+        "wire-captured, correctly encrypted link DATA packet that is re-flagged "
+        "from a LINK packet to a PLAIN hops-0 packet (link_id still in the "
+        "destination position) must NOT be re-delivered to the application, "
+        "because Transport.data() only routes to the local active-link table "
+        "when packet.destination_type == LINK (Transport.py:2155) - the "
+        "destination hashlist skip from the flag flip is NOT a delivery path. "
+        "The same packet UNMODIFIED (LINK-flagged) through the live inbound "
+        "path IS delivered (positive control, same path), so a delivered=True "
+        "on the re-flagged packet means the port matched the active link by "
+        "link_id without checking destination_type and re-delivered the "
+        "replayed authenticated payload (link-data replay)"
+    ),
+)
+def test_link_data_replay_reflag_dropped(wire_link_setup):
+    # The server holds the inbound link and its packet handler, so the
+    # injector runs on the SERVER peer.
+    server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
+
+    # Positive control on the SAME live-inbound path: the unmodified
+    # (LINK-flagged) packet is delivered. Proves the inbound path, active-link
+    # dispatch, decrypt, and handler delivery all work, so a False on the
+    # replay is the destination_type gate and not a broken path.
+    ok = server.inject_tampered_link_data(
+        link_id, b"genuine-link-data", corruption="pristine_link_inbound",
+    )
+    assert ok["unpacked"] is True, f"pristine packet failed to unpack: {ok!r}"
+    assert ok["delivered"] is True, (
+        "an unmodified LINK-flagged DATA packet was not delivered through the "
+        f"live inbound path (positive control): {ok!r}"
+    )
+    assert ok["link_active"] is True, f"link not ACTIVE after a valid packet: {ok!r}"
+
+    # The replay: the SAME wire frame as the positive control, re-flagged
+    # LINK -> PLAIN + hops 0 (link_id still in the destination position). The
+    # bridge caches the pristine raw from the pristine_link_inbound call and
+    # re-flags those exact bytes for replay_reflag, so a delivered=True below
+    # means the destination_type gate is absent (a true replay of a captured
+    # packet), not that a different packet happened to route. A conforming
+    # impl does not deliver it to the application.
+    res = server.inject_tampered_link_data(
+        link_id, b"genuine-link-data", corruption="replay_reflag",
+    )
+    assert res["unpacked"] is True, f"re-flagged packet failed to unpack: {res!r}"
+    # The replay must be the SAME captured frame, not a freshly-built packet:
+    # the bridge re-flags the positive-control raw with only the flag byte
+    # (dest-type nibble LINK -> PLAIN) and the hops byte changed.
+    assert res.get("reused_raw") is True, (
+        f"the replay_reflag did not reuse the positive-control frame "
+        f"(reused_raw != True) - it re-flagged a fresh packet, which "
+        f"demonstrates destination-type confusion but NOT replay of a "
+        f"captured packet: {res!r}"
+    )
+    pristine = bytes.fromhex(ok["raw_hex"])
+    replay = bytes.fromhex(res["raw_hex"])
+    assert len(pristine) == len(replay), "re-flagged frame length changed"
+    assert replay[2:] == pristine[2:], "re-flagged frame differs beyond flag/hops bytes"
+    # dest-type nibble flipped LINK (3) -> PLAIN (2); header/context/packet
+    # bits and hops byte (-> 0) are the only other changes.
+    assert (replay[0] & 0b11111001) == (pristine[0] & 0b11111001), (
+        "re-flag changed a bit other than the dest-type nibble"
+    )
+    assert ((pristine[0] >> 2) & 0b11) == 0b11, "positive control is not LINK-flagged"
+    assert ((replay[0] >> 2) & 0b11) == 0b10, "replay is not PLAIN-flagged"
+    assert replay[1] == 0, "replay hops not zeroed"
+    assert res["delivered"] is False, (
+        "a wire-captured link DATA packet re-flagged as PLAIN/hops-0 was "
+        "RE-DELIVERED to the application - the data dispatch matched the "
+        "active link by link_id without checking destination_type == LINK, so "
+        "the replayed authenticated payload bypassed the link hashlist and the "
+        f"destination-type gate: {res!r}"
+    )
+    assert res["link_active"] is True, (
+        f"the replay tore the link down instead of dropping the packet: {res!r}"
+    )

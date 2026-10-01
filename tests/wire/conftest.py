@@ -18,6 +18,7 @@ import os
 import secrets
 import shutil
 import tempfile
+import threading
 import time
 
 import pytest
@@ -3113,13 +3114,29 @@ class _WirePeer:
         )
         return [bytes.fromhex(p) for p in resp.get("resources", [])]
 
-    def stop(self):
+    def stop(self, timeout=5.0):
         if self.handle is None:
             return
-        try:
-            self.bridge.execute("wire_stop", handle=self.handle)
-        except Exception:
-            pass
+        # wire_stop is a best-effort graceful signal. But BridgeClient.execute
+        # blocks on an unbounded readline, so a bridge whose main loop is wedged
+        # (e.g. a sender spun on the node-global jobs lock) would hang teardown
+        # forever here, before close() ever reaches its bounded kill. Run the
+        # call on a daemon thread with a watchdog: if the bridge can't answer
+        # within `timeout`, SIGKILL its whole process group. The kill closes
+        # the bridge's stdout, which unblocks the dangling readline, so the
+        # worker thread exits too - no thread or process leak.
+        def _do_stop():
+            try:
+                self.bridge.execute("wire_stop", handle=self.handle)
+            except Exception:
+                pass
+        t = threading.Thread(target=_do_stop, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            # The bridge could not answer wire_stop in time: kill it outright
+            # (whole process group, bounded wait). See BridgeClient.kill.
+            self.bridge.kill()
         self.handle = None
 
 

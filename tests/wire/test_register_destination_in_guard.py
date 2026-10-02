@@ -62,18 +62,12 @@ _ASPECTS = ["register-destination-guard"]
 )
 def test_register_destination_in_direction_guard(sut, sut_impl_name):
     # Known divergence: reticulum-kt #85. The IN-direction guard fix is not on
-    # reticulum-kt main yet (it lands via the #85 PR). Assert the reference arm
-    # FIRST (so the waiver never weakens reference pinning), then xfail the
-    # kotlin arm. Remove this xfail once the IN-guard fix is merged to main.
-    if sut_impl_name == "kotlin":
-        pytest.xfail(
-            "reticulum-kt#85: Transport.registerDestination is missing "
-            "Python's IN-direction guard (Transport.py:2898), so an explicit "
-            "register of an OUT destination wrongly makes it 'local' and its "
-            "announces are skipped. Refs Transport.kt:1000 vs "
-            "Transport.py:2898."
-        )
-
+    # reticulum-kt main yet (it lands via the #85 PR). Both direction checks
+    # MUST run on every arm (including kotlin) so the kotlin bridge command is
+    # actually exercised and the IN positive control proves the local-table
+    # mechanism works there; only the OUT assertion is waived, and only while
+    # the divergence is actually present (see below), so the kotlin arm flips
+    # to a clean pass once the IN-guard fix merges.
     resp = sut.execute(
         "wire_start_tcp_server",
         network_name="", passphrase="",
@@ -98,17 +92,32 @@ def test_register_destination_in_direction_guard(sut, sut_impl_name):
 
     # The divergence: an OUT destination must NOT be local. Python filters
     # direction == IN in register_destination; the unguarded kotlin port
-    # (Transport.kt:1000) appends every direction, so this assertion fails
-    # against unmodified kotlin and passes once the IN-guard fix lands.
+    # (Transport.kt:1000) appends every direction, so an OUT destination lands
+    # in the local table and its announces are skipped. Both directions have
+    # already run on every arm above; waive ONLY this assertion, and ONLY for
+    # kotlin while the divergence is actually present (is_local True). Once
+    # the #85 IN-guard fix lands, is_local is False and this arm passes clean.
     out_resp = sut.execute(
         "wire_register_destination",
         handle=handle, direction="OUT",
         app_name=_APP, aspects=list(_ASPECTS),
     )
     assert out_resp["direction"] == "OUT"
-    assert out_resp["is_local"] is False, (
+    out_is_local = out_resp["is_local"]
+    if sut_impl_name == "kotlin" and out_is_local is True:
+        # The divergence is present (unguarded kotlin registered the OUT
+        # destination as local). Waive rather than fail so this PR stays green
+        # before the #85 fix merges; remove once it lands on main.
+        pytest.xfail(
+            "reticulum-kt#85: Transport.registerDestination is missing "
+            "Python's IN-direction guard (Transport.py:2898), so an explicit "
+            "register of an OUT destination wrongly makes it 'local' and its "
+            "announces are skipped. Refs Transport.kt:1000 vs "
+            "Transport.py:2898."
+        )
+    assert out_is_local is False, (
         f"OUT destination must NOT be local (Python Transport.py:2898 "
-        f"filters direction == IN), but is_local is {out_resp['is_local']!r}. "
+        f"filters direction == IN), but is_local is {out_is_local!r}. "
         f"This is reticulum-kt #85: Transport.registerDestination is missing "
         f"the IN-direction guard, so a registered OUT destination pollutes "
         f"the local table and its announces are skipped."

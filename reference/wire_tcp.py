@@ -1197,6 +1197,8 @@ def cmd_wire_register_destination(params):
     if inst is None:
         raise ValueError(f"Unknown handle: {handle}")
 
+    if direction not in ("IN", "OUT"):
+        raise ValueError(f"direction must be IN or OUT, got: {direction}")
     rns_direction = RNS.Destination.IN if direction == "IN" else RNS.Destination.OUT
     identity = RNS.Identity()
     destination = RNS.Destination(
@@ -1213,6 +1215,13 @@ def cmd_wire_register_destination(params):
 
     with RNS.Transport.destinations_map_lock:
         is_local = destination.hash in RNS.Transport.destinations_map
+
+    # Tear down the probe: this command's job was to observe the register
+    # behavior in isolation, so the destination must not linger in the shared
+    # Transport table (a long-lived bridge accumulates one per call, and other
+    # commands read that same table). is_local was already captured above, so
+    # removing it now is safe. The strong ref below keeps the object alive.
+    RNS.Transport.deregister_destination(destination)
 
     # Keep a reference so the destination/identity aren't GC'd.
     inst["destinations"].append((identity, destination))

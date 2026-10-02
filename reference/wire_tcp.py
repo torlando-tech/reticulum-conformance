@@ -1152,6 +1152,88 @@ def cmd_wire_poll_path(params):
     return {"found": False, "hops": None}
 
 
+def cmd_wire_register_destination(params):
+    """Probe the explicit destination-registration guard, in isolation.
+
+    Constructs a destination of the requested direction, clears it from the
+    local-destination table (so construction-time auto-registration does not
+    contaminate the result), performs ONE explicit register call - the exact
+    unit of code that diverges between the implementations - and reports
+    whether the destination's hash then lands in the local-destination table.
+
+    The local-destination table membership is the observable that drives the
+    announce-skip gate on both implementations:
+      * Python:  ``packet.destination_hash in Transport.destinations_map``
+                 (Transport.py:1710)
+      * Kotlin:  ``destinations.any { it.hash == destHash }``
+                 (Transport.kt:3648)
+    A destination that is "local" gets its announces skipped ("Skipping
+    announce for local destination"). Only IN destinations should ever be
+    local; registering an OUT destination (the production send-path trigger,
+    Reticulum.kt registerDestination -> Transport.registerDestination) must
+    NOT make the peer "local".
+
+    reticulum-kt issue #85: Transport.registerDestination is missing Python's
+    IN-direction guard, so it appends destinations of every direction. The
+    reference implementation filters ``direction == IN`` in
+    Transport.register_destination (Transport.py:2898). After an explicit
+    register of an OUT destination:
+      * reference: is_local == False  (guard drops it)
+      * unmodified kotlin: is_local == True  (bug: no guard, announce skipped)
+    The IN case is the positive control proving the local-table mechanism
+    works, so a False on OUT is a real guard, not a vacuous mechanism.
+
+    Params: handle, direction ("IN"|"OUT"), app_name, aspects (optional list).
+    Returns: {destination_hash, identity_hash, direction, is_local}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    direction = params["direction"].upper()
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    if direction not in ("IN", "OUT"):
+        raise ValueError(f"direction must be IN or OUT, got: {direction}")
+    rns_direction = RNS.Destination.IN if direction == "IN" else RNS.Destination.OUT
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, rns_direction, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+
+    # Clear any construction-time registration so the explicit register below
+    # is the single unit under test (python auto-registers IN on __init__).
+    RNS.Transport.deregister_destination(destination)
+
+    # The explicit register - the production send-path trigger. Python filters
+    # direction == IN here; the unguarded kotlin port appends all directions.
+    RNS.Transport.register_destination(destination)
+
+    with RNS.Transport.destinations_map_lock:
+        is_local = destination.hash in RNS.Transport.destinations_map
+
+    # Tear down the probe: this command's job was to observe the register
+    # behavior in isolation, so the destination must not linger in the shared
+    # Transport table (a long-lived bridge accumulates one per call, and other
+    # commands read that same table). is_local was already captured above, so
+    # removing it now is safe. The strong ref below keeps the object alive.
+    RNS.Transport.deregister_destination(destination)
+
+    # Keep a reference so the destination/identity aren't GC'd.
+    inst["destinations"].append((identity, destination))
+
+    return {
+        "destination_hash": destination.hash.hex(),
+        "identity_hash": identity.hash.hex(),
+        "direction": direction,
+        "is_local": bool(is_local),
+    }
+
+
 def cmd_wire_identity_recall(params):
     """Recall an Identity by destination hash from this instance's
     received-announces table.
@@ -10399,6 +10481,7 @@ WIRE_COMMANDS = {
     "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
+    "wire_register_destination": cmd_wire_register_destination,
     "wire_request_path": cmd_wire_request_path,
     "wire_read_path_entry": cmd_wire_read_path_entry,
     "wire_has_discovery_path_request": cmd_wire_has_discovery_path_request,

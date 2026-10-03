@@ -7861,12 +7861,18 @@ def cmd_wire_resource_proof_cache_lookup(params):
     # success) because in the synthetic bridge the link-bound proof's send()
     # routing is an infra detail unrelated to the cache - the property under
     # test - and both impls build the payload when they reach prove().
-    captured = {"payload": None}
+    captured = {"payload": None, "link_ref": False}
     orig_send = RNS.Packet.send
 
     def _capturing_send(self):
         if getattr(self, "context", None) == RNS.Packet.RESOURCE_PRF:
             captured["payload"] = bytes(self.data)
+            # Observation: does the proof packet carry the link as its
+            # destination at send time? RNS.Packet(link, ...) always sets
+            # self.destination = link, and the Transport's LINK-packet routing
+            # (interface filter + in-process loopback) reads that reference.
+            # This is the python equivalent of the kotlin packet.link field.
+            captured["link_ref"] = getattr(self, "destination", None) is not None
         return orig_send(self)
 
     def _recovery_lookup(payload: bytes):
@@ -7933,6 +7939,10 @@ def cmd_wire_resource_proof_cache_lookup(params):
         "proof_sent": captured["payload"] is not None,
         "proof_in_cache": recovered is not None,
         "proof_recovered": recovered is not None,
+        # The proof packet carried the link as its destination at send time
+        # (RNS.Packet(link, ...) always does). The Transport's LINK-packet
+        # routing (interface filter + in-process loopback) reads this reference.
+        "proof_link_ref": captured["link_ref"],
     }
     try:
         receiver.cancel()

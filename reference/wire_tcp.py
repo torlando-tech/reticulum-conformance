@@ -7795,6 +7795,140 @@ def cmd_wire_resource_receiver_proof_count(params):
     return out
 
 
+def cmd_wire_resource_proof_cache_lookup(params):
+    """Proof caching (receiver side, Resource.prove, Resource.py:752-759).
+
+    When a Resource receiver completes a transfer it proves it by sending a
+    single RESOURCE_PRF (Resource.prove, Resource.py:755-757) AND force-caching
+    that proof packet in the transport packet cache
+    (Resource.py:759: `RNS.Transport.cache(proof_packet, force_cache=True)`).
+    The cache entry is what the SENDER's AWAITING_PROOF recovery retrieves:
+    Resource.py:653-656 rebuilds the same proof packet and calls
+    `Transport.cache_request(expected_proof_packet.packet_hash, ...)` to
+    re-fetch a proof that was lost in transit. An impl that sends the proof
+    but does not cache it leaves the sender's recovery as a no-op — the proof
+    is "lost" even though it was generated (reticulum-kt#65 / PR #97).
+
+    Self-contained: builds a real sender + receiver (via Resource.accept), feeds
+    every GENUINE part in order so the full payload assembles to the advertised
+    hash (Resource.assemble -> Resource.prove), then checks whether the proof
+    packet landed in the transport packet cache.
+
+    The proof packet is not encrypted (Packet.py:196-198), so its raw bytes end
+    with the deterministic payload `hash + expected_proof` (Resource.py:755-756,
+    64 bytes). The check is therefore "does any cached packet's raw end with
+    this receiver's proof payload?" — the same content the recovery path
+    searches for, and robust to any header re-packing `send()`/`outbound()` may
+    apply (which changes the packet hash but not the trailing payload).
+
+    Returns {total_parts, status_name, complete, proof_in_cache,
+    matching_cached}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=1200, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    total = len(receiver.parts)
+    if total < 2:
+        raise ValueError(f"need a multi-part transfer, got {total}")
+
+    def _proof_in_cache(payload: bytes) -> int:
+        """Count cached packets whose raw ends with the proof payload."""
+        import umsgpack
+        cache_dir = getattr(RNS.Reticulum, "cachepath", "")
+        if not cache_dir or not os.path.isdir(cache_dir):
+            return 0
+        n = 0
+        for name in os.listdir(cache_dir):
+            path = os.path.join(cache_dir, name)
+            if not os.path.isfile(path):  # skip the announces/ subdir
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    cached = umsgpack.unpackb(fh.read())
+                raw = cached[0]
+            except Exception:
+                continue
+            if raw.endswith(payload):
+                n += 1
+        return n
+
+    # Wrap Packet.send to capture the EXACT RESOURCE_PRF payload prove() emits
+    # (the real send still runs) — the same capture pattern
+    # cmd_wire_resource_request_next_content uses for RESOURCE_REQ. This avoids
+    # any assumption about how the receiver's `data`/`expected_proof` relate to
+    # the emitted proof: we read RNS's own bytes.
+    captured_proofs = []
+    orig_send = RNS.Packet.send
+
+    def _capturing_send(self):
+        if getattr(self, "context", None) == RNS.Packet.RESOURCE_PRF:
+            captured_proofs.append(bytes(self.data))
+        return orig_send(self)
+
+    RNS.Packet.send = _capturing_send
+    status = None
+    matching = 0
+    try:
+        # Feed every part in order; the last drives received_count to total and
+        # runs assemble in a daemon thread (Resource.py:894-896), which concludes
+        # COMPLETE and calls prove() (Resource.py:713/752-759), which sends the
+        # RESOURCE_PRF (captured above) and force-caches it (Resource.py:759).
+        for i in range(total):
+            rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+            receiver.receive_part(rx)
+
+        terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
+        deadline = time.time() + 3.0
+        while getattr(receiver, "status", None) not in terminal and time.time() < deadline:
+            time.sleep(0.02)
+        status = getattr(receiver, "status", None)
+
+        # prove() runs in the assemble thread right after status flips to COMPLETE
+        # (Resource.py:711-713); its send() (captured) and cache() write are
+        # synchronous. Poll a short bounded settle window so a conforming impl's
+        # cache write commits before we read; a non-conforming impl never caches,
+        # so the window simply elapses and the answer stays False.
+        matching = 0
+        if status == RNS.Resource.COMPLETE and captured_proofs:
+            settle_deadline = time.time() + 1.5
+            while time.time() < settle_deadline:
+                matching = sum(
+                    _proof_in_cache(p) for p in set(captured_proofs)
+                )
+                if matching:
+                    break
+                time.sleep(0.02)
+    finally:
+        RNS.Packet.send = orig_send
+
+    out = {
+        "total_parts": total,
+        "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        "complete": status == RNS.Resource.COMPLETE,
+        "proof_sent": len(captured_proofs) > 0,
+        "proof_in_cache": matching > 0,
+        "matching_cached": matching,
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
 def cmd_wire_resource_request_next_content(params):
     """Receiver-side RESOURCE_REQ CONTENT (Resource.request_next, Resource.py:
     931-980).
@@ -10620,6 +10754,7 @@ WIRE_COMMANDS = {
     "wire_resource_receiver_request_state": cmd_wire_resource_receiver_request_state,
     "wire_inject_hashmap_update": cmd_wire_inject_hashmap_update,
     "wire_resource_receiver_proof_count": cmd_wire_resource_receiver_proof_count,
+    "wire_resource_proof_cache_lookup": cmd_wire_resource_proof_cache_lookup,
     "wire_resource_request_next_content": cmd_wire_resource_request_next_content,
     "wire_resource_late_after_cancel": cmd_wire_resource_late_after_cancel,
     "wire_resource_part_count_derivation": cmd_wire_resource_part_count_derivation,

@@ -7861,18 +7861,23 @@ def cmd_wire_resource_proof_cache_lookup(params):
     # success) because in the synthetic bridge the link-bound proof's send()
     # routing is an infra detail unrelated to the cache - the property under
     # test - and both impls build the payload when they reach prove().
-    captured = {"payload": None, "link_ref": False}
+    captured = {"payload": None, "destination_link_id": None}
     orig_send = RNS.Packet.send
 
     def _capturing_send(self):
         if getattr(self, "context", None) == RNS.Packet.RESOURCE_PRF:
             captured["payload"] = bytes(self.data)
-            # Observation: does the proof packet carry the link as its
-            # destination at send time? RNS.Packet(link, ...) always sets
-            # self.destination = link, and the Transport's LINK-packet routing
-            # (interface filter + in-process loopback) reads that reference.
-            # This is the python equivalent of the kotlin packet.link field.
-            captured["link_ref"] = getattr(self, "destination", None) is not None
+            # Observation: which link_id does the proof's destination carry at
+            # send time? RNS.Packet(link, ...) sets self.destination = link, and
+            # the Transport's LINK-packet routing (interface filter + in-process
+            # loopback) routes the proof to that link's own interface via that
+            # reference. Recording the destination's link_id (not a boolean) lets
+            # the command verify the proof is bound to THIS transfer's link, not
+            # merely to some link. None if the packet has no destination.
+            dest = getattr(self, "destination", None)
+            captured["destination_link_id"] = (
+                bytes(dest.link_id) if getattr(dest, "link_id", None) is not None else None
+            )
         return orig_send(self)
 
     def _recovery_lookup(payload: bytes):
@@ -7932,6 +7937,12 @@ def cmd_wire_resource_proof_cache_lookup(params):
     finally:
         RNS.Packet.send = orig_send
 
+    # Is the proof bound to THIS transfer's link (not to some other link, and
+    # not to none)? The Transport's LINK-packet routing (interface filter +
+    # in-process loopback) routes the proof to that link's own interface via the
+    # destination reference.
+    dest_link_id = captured["destination_link_id"]
+    proof_link_ref = dest_link_id is not None and bytes(dest_link_id) == bytes(link.link_id)
     out = {
         "total_parts": total,
         "status_name": _RESOURCE_STATUS_NAMES.get(status),
@@ -7939,10 +7950,7 @@ def cmd_wire_resource_proof_cache_lookup(params):
         "proof_sent": captured["payload"] is not None,
         "proof_in_cache": recovered is not None,
         "proof_recovered": recovered is not None,
-        # The proof packet carried the link as its destination at send time
-        # (RNS.Packet(link, ...) always does). The Transport's LINK-packet
-        # routing (interface filter + in-process loopback) reads this reference.
-        "proof_link_ref": captured["link_ref"],
+        "proof_link_ref": proof_link_ref,
     }
     try:
         receiver.cancel()

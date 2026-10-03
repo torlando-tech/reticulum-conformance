@@ -11,18 +11,20 @@ sends the proof but does not cache it leaves the sender's recovery as a no-op �
 the proof is "lost" even though it was generated (reticulum-kt#65, fixed by PR
 #97).
 
-The observable is the transport packet cache. The RESOURCE_PRF proof packet is
-not encrypted (Packet.py:196-198 / Packet.kt:188), so its raw bytes end with the
-deterministic unencrypted payload `hash + proof`. After a completed transfer the
-bridge reports whether any cached packet's raw ends with the proof payload the
-receiver emitted (`proof_in_cache`). A conforming impl caches the proof
-(`proof_in_cache` True); an impl that omits the cache call does not
-(`proof_in_cache` False). This is the same content the recovery path searches
-for, and it is robust to any header re-packing `send()`/`outbound()` apply
-(which changes the packet hash but not the trailing payload).
+The observable is the transport packet cache, read the SAME way the sender's
+recovery reads it. The sender's AWAITING_PROOF recovery (Resource.py:653-656)
+rebuilds the proof packet from the payload prove() emitted and calls
+`Transport.cache_request(packet.packet_hash, ...)` -> `get_cached_packet(hash)`.
+That lookup only works because the proof packet's `packet_hash` is reproducible:
+the proof is HEADER_1 and unencrypted (Packet.py:196-198), and `send()`/
+`outbound()` do not mutate `packet.raw`. So the bridge captures the payload
+prove() actually emitted, rebuilds the identical packet, and asks
+`get_cached_packet` for that exact `packet_hash` - the very key recovery uses.
+A conforming impl returns the cached packet (proof_in_cache True); an impl that
+sends the proof but omits the cache call returns None (proof_in_cache False).
 
 Reference-vs-reference: the python reference always caches (Resource.py:759), so
-every arm with a python receiver PASSES — including the `--reference-only`
+every arm with a python receiver PASSES - including the `--reference-only`
 baseline, which proves the test really asserts the divergence. Against
 UNMODIFIED kotlin the receiver-side arm must FAIL (the divergence), and pass
 clean once PR #97's `Transport.cache(..., forceCache = true)` call lands on main.
@@ -63,14 +65,14 @@ def _is_unknown_command_error(e: BridgeError) -> bool:
         "proof in the transport packet cache (python Resource.prove, "
         "Resource.py:759: cache(proof_packet, force_cache=True)), so the "
         "sender's AWAITING_PROOF recovery (Resource.py:653-656 cache_request) "
-        "can re-fetch a lost proof. The proof packet is unencrypted, so its raw "
-        "ends with the deterministic payload `hash + proof`; after a completed "
-        "transfer the bridge reports whether any cached packet carries that "
-        "payload (proof_in_cache). A conforming impl caches it (True); an impl "
-        "that sends the proof without caching it leaves the sender's recovery as "
-        "a no-op and reports proof_in_cache False. reticulum-kt #65: the "
-        "unmodified kotlin prove() sends the proof but omits the cache call, so "
-        "the receiver-side arm fails here until PR #97's cache call lands."
+        "can re-fetch a lost proof. The bridge reads the cache the same way "
+        "recovery does: it rebuilds the proof packet prove() emitted and asks "
+        "get_cached_packet for its exact packet_hash (proof_in_cache). A "
+        "conforming impl returns the cached packet (True); an impl that sends "
+        "the proof without caching it leaves the sender's recovery as a no-op "
+        "and reports proof_in_cache False. reticulum-kt #65: the unmodified "
+        "kotlin prove() sends the proof but omits the cache call, so the "
+        "receiver-side arm fails here until PR #97's cache call lands."
     ),
 )
 def test_resource_proof_cached_for_sender_recovery(wire_link_setup, wire_pair):
@@ -115,7 +117,10 @@ def test_resource_proof_cached_for_sender_recovery(wire_link_setup, wire_pair):
         f"captured: {res!r}"
     )
 
-    # The divergence: the proof must be in the transport packet cache.
+    # The divergence: the proof must be recoverable from the cache by the exact
+    # key the sender's recovery uses (get_cached_packet on the proof's
+    # packet_hash). If it is not, the sender's AWAITING_PROOF recovery has
+    # nothing to re-fetch and the proof is lost in transit (reticulum-kt#65).
     if client_impl == "kotlin" and res["proof_in_cache"] is False:
         # The divergence is present (unmodified kotlin prove() sends the proof
         # but omits the cache call). Waive rather than fail so this PR stays
@@ -128,10 +133,10 @@ def test_resource_proof_cached_for_sender_recovery(wire_link_setup, wire_pair):
             "nothing to re-fetch. Fixed by PR #97."
         )
     assert res["proof_in_cache"] is True, (
-        f"the proof was sent but is NOT in the transport packet cache "
-        f"(matching_cached={res['matching_cached']!r}): the sender's "
+        f"the proof was sent but is NOT recoverable from the transport packet "
+        f"cache via the exact key the sender's recovery uses: "
+        f"get_cached_packet(proof.packet_hash) returned None. The sender's "
         f"AWAITING_PROOF recovery (python Resource.py:653-656) would have "
         f"nothing to re-fetch, so the proof is lost in transit. This is "
-        f"reticulum-kt #65 — prove() must cache the proof "
-        f"(Resource.py:759)."
+        f"reticulum-kt #65 - prove() must cache the proof (Resource.py:759)."
     )

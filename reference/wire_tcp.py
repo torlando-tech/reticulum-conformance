@@ -7814,15 +7814,22 @@ def cmd_wire_resource_proof_cache_lookup(params):
     hash (Resource.assemble -> Resource.prove), then checks whether the proof
     packet landed in the transport packet cache.
 
-    The proof packet is not encrypted (Packet.py:196-198), so its raw bytes end
-    with the deterministic payload `hash + expected_proof` (Resource.py:755-756,
-    64 bytes). The check is therefore "does any cached packet's raw end with
-    this receiver's proof payload?" — the same content the recovery path
-    searches for, and robust to any header re-packing `send()`/`outbound()` may
-    apply (which changes the packet hash but not the trailing payload).
+    The observable is the EXACT cache lookup the sender's recovery performs.
+    Recovery (Resource.py:653-656) rebuilds the proof packet from the payload
+    `hash + expected_proof` (64 bytes, the same payload prove() emits,
+    Resource.py:755-756) and calls `Transport.cache_request(packet.packet_hash,
+    ...)` -> `get_cached_packet(packet_hash)`. That lookup only succeeds because
+    the proof packet's `packet_hash` is reproducible: the proof is HEADER_1 and
+    unencrypted (Packet.py:196-198), and neither `send()` nor `outbound()`
+    mutates `packet.raw` (outbound builds a separate `new_raw` copy for the
+    wire). So we capture the payload prove() actually emitted, rebuild the
+    identical proof packet, and ask `get_cached_packet` for that exact
+    `packet_hash` - the very key recovery uses. A conforming impl returns the
+    cached packet (proof_in_cache True); one that omits the cache call returns
+    None (proof_in_cache False).
 
-    Returns {total_parts, status_name, complete, proof_in_cache,
-    matching_cached}.
+    Returns {total_parts, status_name, complete, proof_sent, proof_in_cache,
+    proof_recovered}.
     """
     RNS = _get_rns()
     handle = params["handle"]
@@ -7844,43 +7851,39 @@ def cmd_wire_resource_proof_cache_lookup(params):
     if total < 2:
         raise ValueError(f"need a multi-part transfer, got {total}")
 
-    def _proof_in_cache(payload: bytes) -> int:
-        """Count cached packets whose raw ends with the proof payload."""
-        import umsgpack
-        cache_dir = getattr(RNS.Reticulum, "cachepath", "")
-        if not cache_dir or not os.path.isdir(cache_dir):
-            return 0
-        n = 0
-        for name in os.listdir(cache_dir):
-            path = os.path.join(cache_dir, name)
-            if not os.path.isfile(path):  # skip the announces/ subdir
-                continue
-            try:
-                with open(path, "rb") as fh:
-                    cached = umsgpack.unpackb(fh.read())
-                raw = cached[0]
-            except Exception:
-                continue
-            if raw.endswith(payload):
-                n += 1
-        return n
-
     # Wrap Packet.send to capture the EXACT RESOURCE_PRF payload prove() emits
-    # (the real send still runs) — the same capture pattern
-    # cmd_wire_resource_request_next_content uses for RESOURCE_REQ. This avoids
-    # any assumption about how the receiver's `data`/`expected_proof` relate to
-    # the emitted proof: we read RNS's own bytes.
-    captured_proofs = []
+    # (the real send still runs) - the same capture pattern
+    # cmd_wire_resource_request_next_content uses for RESOURCE_REQ. We read RNS's
+    # own bytes. Capturing the payload is the positive control that prove()
+    # reached the point of building the proof - the precondition that makes a
+    # proof_in_cache False below mean "missing cache call" rather than "the
+    # transfer never proved." We key proof_sent on the payload (not on send()
+    # success) because in the synthetic bridge the link-bound proof's send()
+    # routing is an infra detail unrelated to the cache - the property under
+    # test - and both impls build the payload when they reach prove().
+    captured = {"payload": None}
     orig_send = RNS.Packet.send
 
     def _capturing_send(self):
         if getattr(self, "context", None) == RNS.Packet.RESOURCE_PRF:
-            captured_proofs.append(bytes(self.data))
+            captured["payload"] = bytes(self.data)
         return orig_send(self)
+
+    def _recovery_lookup(payload: bytes):
+        """Mirror the sender's AWAITING_PROOF recovery exactly (Resource.py:653-656):
+        rebuild the identical proof packet and return get_cached_packet on its
+        packet_hash - the very key recovery queries the cache with.
+        """
+        rebuilt = RNS.Packet(
+            link, payload,
+            packet_type=RNS.Packet.PROOF, context=RNS.Packet.RESOURCE_PRF,
+        )
+        rebuilt.pack()
+        return RNS.Transport.get_cached_packet(rebuilt.packet_hash)
 
     RNS.Packet.send = _capturing_send
     status = None
-    matching = 0
+    recovered = None
     try:
         # Feed every part in order; the last drives received_count to total and
         # runs assemble in a daemon thread (Resource.py:894-896), which concludes
@@ -7890,27 +7893,36 @@ def cmd_wire_resource_proof_cache_lookup(params):
             rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
             receiver.receive_part(rx)
 
+        # Wait until the proof is actually recoverable via the recovery lookup.
+        # assemble() (in the receive thread) sets status=COMPLETE and THEN calls
+        # prove() (Resource.py:711-713); prove() sends the RESOURCE_PRF and only
+        # then force-caches it (Resource.py:758-759). So polling for COMPLETE
+        # alone can return before the proof is sent AND cached - which would make
+        # the assertions below race. Polling the recovery lookup itself is the
+        # correct barrier: it returns the cached packet only once prove()'s
+        # cache() write has committed. A non-conforming impl never caches, so the
+        # window simply elapses and the answer stays False/None.
         terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
-        deadline = time.time() + 3.0
-        while getattr(receiver, "status", None) not in terminal and time.time() < deadline:
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            st = getattr(receiver, "status", None)
+            if st == RNS.Resource.COMPLETE and captured["payload"] is not None:
+                recovered = _recovery_lookup(captured["payload"])
+                if recovered is not None:
+                    break  # proof is recoverable: done
+            elif st in terminal:
+                # Concluded FAILED/CORRUPT, or COMPLETE without ever capturing a
+                # proof. Give a short tail in case a proof is still in flight,
+                # then stop (it will not become recoverable).
+                if time.time() > deadline - 0.5:
+                    break
             time.sleep(0.02)
         status = getattr(receiver, "status", None)
-
-        # prove() runs in the assemble thread right after status flips to COMPLETE
-        # (Resource.py:711-713); its send() (captured) and cache() write are
-        # synchronous. Poll a short bounded settle window so a conforming impl's
-        # cache write commits before we read; a non-conforming impl never caches,
-        # so the window simply elapses and the answer stays False.
-        matching = 0
-        if status == RNS.Resource.COMPLETE and captured_proofs:
-            settle_deadline = time.time() + 1.5
-            while time.time() < settle_deadline:
-                matching = sum(
-                    _proof_in_cache(p) for p in set(captured_proofs)
-                )
-                if matching:
-                    break
-                time.sleep(0.02)
+        # If we concluded with a captured proof but the lookup never returned a
+        # hit during the window (should not happen for a conforming impl), record
+        # the final answer from one last lookup.
+        if recovered is None and status == RNS.Resource.COMPLETE and captured["payload"] is not None:
+            recovered = _recovery_lookup(captured["payload"])
     finally:
         RNS.Packet.send = orig_send
 
@@ -7918,9 +7930,9 @@ def cmd_wire_resource_proof_cache_lookup(params):
         "total_parts": total,
         "status_name": _RESOURCE_STATUS_NAMES.get(status),
         "complete": status == RNS.Resource.COMPLETE,
-        "proof_sent": len(captured_proofs) > 0,
-        "proof_in_cache": matching > 0,
-        "matching_cached": matching,
+        "proof_sent": captured["payload"] is not None,
+        "proof_in_cache": recovered is not None,
+        "proof_recovered": recovered is not None,
     }
     try:
         receiver.cancel()

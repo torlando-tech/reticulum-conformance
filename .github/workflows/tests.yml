@@ -43,8 +43,11 @@ jobs:
   conformance-kotlin:
     name: Conformance (kotlin SUT)
     runs-on: ubuntu-latest
-    # ~45 min serial kotlin pass + ~3-5 min setup/bridge build.
-    timeout-minutes: 60
+    # ~45 min serial kotlin pass + ~5 min setup/bridge build = ~50 min expected.
+    # 75 min leaves comfortable margin for a slow runner or a flaky long tail
+    # without the job hanging indefinitely (the pre-split job had no explicit
+    # limit).
+    timeout-minutes: 75
 
     steps:
       - uses: actions/checkout@v4

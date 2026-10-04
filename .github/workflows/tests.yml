@@ -5,8 +5,27 @@ name: Conformance Tests
 # reticulum-swift). This mirrors reticulum-kt's conformance job so PR
 # authors here see the same signal CI will emit after merge.
 #
+# The suite has TWO independent passes, run as PARALLEL jobs (no
+# `needs:` between them) so they overlap on separate runners instead of
+# running back-to-back:
+#
+#   * conformance-kotlin     --impl=kotlin        (~45 min; the bottleneck)
+#   * conformance-reference  --reference-only     (~12 min)
+#
+# Wall time is therefore the SLOWER pass (~45 min), not the sum (~57 min).
+# The passes are independent: the kotlin pass uses a Kotlin JVM bridge for the
+# kotlin peer, the reference pass uses the Python RNS reference for both peers;
+# neither consumes the other's output.
+#
+# WITHIN each pass the tests still run SERIALLY (no pytest-xdist -n): a pool of
+# real-time-assertion tests (keepalive RTT clamp, link watchdog, channel
+# window-rate, bz2 timing) flakes under parallel CPU contention on the 2-vCPU
+# ubuntu-latest runners - the JVM bridges get starved and their timers drift.
+# Parallelizing ACROSS the two passes is safe because it does not add contention
+# inside a pass.
+#
 # Per-impl bridge env vars (CONFORMANCE_KOTLIN_BRIDGE_CMD etc.) are
-# required — the legacy CONFORMANCE_BRIDGE_CMD global override silently
+# required - the legacy CONFORMANCE_BRIDGE_CMD global override silently
 # forces every peer to the same bridge, masking any xfail keyed off
 # transport_impl / sender_impl / receiver_impl.
 
@@ -17,17 +36,15 @@ on:
     branches: [main]
 
 jobs:
-  conformance:
+  # Pass 1: Kotlin under test. Cross-impl (kotlin-to-reference, kotlin-to-kotlin,
+  # reference-to-kotlin) plus the reference-to-reference legs, with a Kotlin JVM
+  # bridge as the SUT. Needs the reticulum-kt checkout + JDK + Gradle to build
+  # the conformance-bridge JAR. This is the slow pass (~45 min).
+  conformance-kotlin:
+    name: Conformance (kotlin SUT)
     runs-on: ubuntu-latest
-    # The job runs TWO full-suite passes (--impl=kotlin then --reference-only),
-    # each ~hundreds of wire/link/resource tests that legitimately WAIT on
-    # protocol timers (announce throttle windows, link watchdog/keepalive).
-    # Run SERIALLY (no pytest-xdist): a pool of real-time-assertion tests
-    # (keepalive RTT clamp, link watchdog, channel window-rate, bz2 timing)
-    # flakes under parallel CPU contention on slow runners — the JVM bridges get
-    # CPU-starved and their timers drift. Serial removes the contention entirely
-    # (no reruns, no masking), at the cost of a slower ~60-80 min wall time.
-    timeout-minutes: 90
+    # ~45 min serial kotlin pass + ~3-5 min setup/bridge build.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +93,8 @@ jobs:
         run: pip install pytest pytest-xdist cryptography msgpack u-msgpack-python
 
       - name: Assert RNS/LXMF versions match audited ground truth (1.3.1 / 0.9.9)
-        # Reads __version__ from the pinned checkouts' _version.py — the
-        # definitive source of RNS.__version__/LXMF.__version__ — without a
+        # Reads __version__ from the pinned checkouts' _version.py - the
+        # definitive source of RNS.__version__/LXMF.__version__ - without a
         # full `import RNS` (which would need cryptography/pyserial that this
         # job does not pip-install). A mismatch means the ref: pins above
         # drifted from the audited ground truth, so fail loudly (N-M16).
@@ -125,27 +142,93 @@ jobs:
           # Per-impl bridge commands. Kotlin peers use the JAR built
           # above; reference peers use the default Python bridge
           # configured in conftest.py BRIDGE_COMMANDS. DO NOT set the
-          # legacy CONFORMANCE_BRIDGE_CMD — it applies globally and
+          # legacy CONFORMANCE_BRIDGE_CMD - it applies globally and
           # silently breaks cross-impl parametrization.
           CONFORMANCE_KOTLIN_BRIDGE_CMD: java -jar ${{ github.workspace }}/reticulum-kt/conformance-bridge/build/libs/ConformanceBridge.jar
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        # The legacy `--ignore=tests/lxmf` was a no-op — tests/lxmf/ no longer
-        # exists in this repo — so it has been dropped (L18).
+        # The legacy `--ignore=tests/lxmf` was a no-op - tests/lxmf/ no longer
+        # exists in this repo - so it has been dropped (L18).
         # SERIAL (no -n): a pool of real-time-assertion tests (keepalive RTT
         # clamp, link watchdog, bz2 timing, channel window-rate) flakes under
-        # xdist CPU contention on slow runners — the JVM bridges get starved and
+        # xdist CPU contention on slow runners - the JVM bridges get starved and
         # their timers drift. They pass serially. Serial removes the contention
         # with no reruns and no masking, at the cost of a slower run.
         run: python3 -m pytest tests/ --impl=kotlin -v --tb=short
 
+  # Pass 2: Python reference under test. The reference should always pass every
+  # test on its own, with no xfails - a red here means either a test is broken
+  # or something drifted in Python RNS, either way a signal worth catching
+  # before shipping. Uses ONLY the Python bridge, so it does not need the
+  # reticulum-kt checkout, JDK, Gradle, or the conformance-bridge build. Serial
+  # like the kotlin pass. This is the fast pass (~12 min).
+  conformance-reference:
+    name: Conformance (reference SUT)
+    runs-on: ubuntu-latest
+    # ~12 min serial reference pass + ~1-2 min setup (no bridge build).
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-conformance
+
+      # Pin RNS/LXMF to the audited release tags (RNS 1.3.1 / LXMF 0.9.9).
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          ref: "1.3.1"
+          path: Reticulum
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          ref: "0.9.9"
+          path: LXMF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        # cryptography is a hard RNS runtime dependency and is required by the
+        # pyca-provider equivalence tests; see the kotlin job for the rationale.
+        run: pip install pytest cryptography msgpack u-msgpack-python
+
+      - name: Assert RNS/LXMF versions match audited ground truth (1.3.1 / 0.9.9)
+        # Same ground-truth guard as the kotlin job; run in this job too so a
+        # pin drift is caught regardless of which job is inspected first.
+        working-directory: reticulum-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          import _rns_paths as p
+
+          def version_of(pkg, env_var):
+              base = p.resolve_package_path(pkg, env_var)
+              vfile = os.path.join(base, pkg, "_version.py")
+              ns = {}
+              exec(compile(open(vfile).read(), vfile, "exec"), ns)
+              return ns["__version__"]
+
+          rns_v = version_of("RNS", "PYTHON_RNS_PATH")
+          lxmf_v = version_of("LXMF", "PYTHON_LXMF_PATH")
+          errs = []
+          if rns_v != "1.3.1":
+              errs.append(f"RNS {rns_v} != 1.3.1")
+          if lxmf_v != "0.9.9":
+              errs.append(f"LXMF {lxmf_v} != 0.9.9")
+          if errs:
+              print("::error::CI not pinned to audited ground truth: " + "; ".join(errs))
+              sys.exit(1)
+          print("OK: RNS 1.3.1 / LXMF 0.9.9 (audited ground truth)")
+          PY
+
       - name: Run reference-only baseline
-        # Sanity check: the Python reference should always pass every
-        # test on its own, with no xfails. A red here means either a
-        # test is broken or something drifted in Python RNS — either
-        # way a signal worth catching before shipping. Serial, like the
-        # kotlin pass.
-        #
         # The behavioral [reference] leg + two announce-cap reference tests
         # were previously scoped out here: this baseline had never run in CI
         # (a failing kotlin step always skipped it), hiding pre-existing
@@ -153,7 +236,7 @@ jobs:
         # double-init + a no-transport minimal instance for forwarding tests).
         # That is now FIXED in reference/bridge_server.py (adopt the running
         # Reticulum singleton; build a transport-enabled instance where
-        # forwarding is needed), so the full baseline runs again — no scope-out.
+        # forwarding is needed), so the full baseline runs again - no scope-out.
         working-directory: reticulum-conformance
         env:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum

@@ -508,9 +508,32 @@ def _ensure_wire_rns_started(config_dir: str):
 
     Second calls with the same config are no-ops; second calls with a
     different config raise (RNS.Reticulum is a process-wide singleton).
+
+    If a Reticulum singleton is already running (started by another module
+    path in the same bridge process, e.g. behavioral_transport), adopt it
+    rather than re-initialising. RNS.Reticulum.__init__ raises "Attempt to
+    reinitialise Reticulum" on a second constructor call, so this is
+    required in --reference-only mode where the bridge is session-scoped
+    (one process for all tests) and a prior test's singleton may still be
+    running. Same pattern as _ensure_minimal_rns in bridge_server.py.
     """
     global _shared_wire_rns, _shared_wire_config_dir
     RNS = _get_rns()
+
+    if _shared_wire_rns is None:
+        # Adopt an existing Reticulum singleton if one is already running
+        # (started by another module path in this bridge process). In
+        # --reference-only mode the bridge is session-scoped, so a prior
+        # behavioral or wire test's Reticulum may still be running when a
+        # subsequent test calls wire_start_tcp_server. The Reticulum
+        # constructor raises on a second call, so we adopt rather than
+        # re-init.
+        _existing = RNS.Reticulum.get_instance()
+        if _existing is not None:
+            _shared_wire_rns = _existing
+            _shared_wire_config_dir = config_dir
+            _install_inbound_tap()
+            return _shared_wire_rns
 
     if _shared_wire_rns is not None:
         if _shared_wire_config_dir != config_dir:

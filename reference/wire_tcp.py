@@ -507,18 +507,28 @@ def _synthesize_config_interfaces(inst, config_dir: str):
     """Bring up the interfaces named in a config file on an already-running
     Reticulum instance `inst`.
 
-    Mirrors RNS.Reticulum.__init__'s own interface-loading loop
-    (Reticulum.py:673-677): parse the config with the SAME vendored
-    ConfigObj the constructor uses (RNS.vendor.configobj.ConfigObj,
-    Reticulum.py:321), then call inst._synthesize_interface for every
-    entry under [interfaces]. Used by the adopt path in
-    _ensure_wire_rns_started, which cannot re-run the constructor (it
-    raises "Attempt to reinitialise Reticulum") and so must attach the
-    interfaces itself. Without this the adopted instance would have no
-    TCPServerInterface and wire_start_tcp_server would return a port
-    that is not listening.
+    Mirrors RNS.Reticulum.__init__'s own setup for the parts the adopt path
+    needs (it cannot re-run the constructor - that raises "Attempt to
+    reinitialise Reticulum"):
+      * transport posture: Reticulum.py:497-499 sets
+        Reticulum.__transport_enabled = True when the config has
+        `enable_transport = Yes`. Without this an adopted minimal instance
+        (created by another command with transport off) would accept a TCP
+        connect on the wire port but RNS would not route packets through it
+        (every inbound/outbound path is gated on transport_enabled, e.g.
+        Transport.py:524/:1536), so a peer could connect but never establish
+        a link. We set the same class attribute RNS uses, only on an explicit
+        Yes, exactly as the constructor does.
+      * interfaces: Reticulum.py:673-677 calls self._synthesize_interface per
+        entry in self.config["interfaces"]. We parse the same config with the
+        same vendored ConfigObj (RNS.vendor.configobj.ConfigObj,
+        Reticulum.py:321) and run the same loop, so the adopted instance
+        provides the requested wire setup (a genuinely-listening
+        TCPServerInterface with the right network_name / passphrase / IFAC /
+        fixed_mtu).
     """
     from RNS.vendor.configobj import ConfigObj
+    RNS = _get_rns()
     config_file = os.path.join(config_dir, "config")
     if not os.path.isfile(config_file):
         return
@@ -526,6 +536,11 @@ def _synthesize_config_interfaces(inst, config_dir: str):
         cfg = ConfigObj(config_file)
     except Exception:
         return
+    # Apply the transport posture the constructor would have (Reticulum.py:497-499).
+    reticulum = cfg.get("reticulum")
+    if reticulum is not None and "enable_transport" in reticulum:
+        if reticulum.as_bool("enable_transport"):
+            RNS.Reticulum._Reticulum__transport_enabled = True
     ifaces = cfg.get("interfaces")
     if not ifaces:
         return

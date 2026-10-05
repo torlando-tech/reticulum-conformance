@@ -39,6 +39,7 @@ Both Link peers are reference instances under ``--reference-only``.
 
 import math
 import os
+import time
 
 from conformance import conformance_case
 
@@ -247,11 +248,11 @@ def test_decompression_bomb_exact_bound(wire_link_setup):
         link_id, b"", bomb=True, bomb_decompressed_len=_MAX_CHUNK_LEN + 1,
         timeout_ms=_SEND_TIMEOUT_MS,
     )
-    aborted = False
-    for _ in range(40):
-        if server.buffer_received(dest_hash, timeout_ms=500)["aborted"]:
-            aborted = True
-            break
+    aborted = _poll_until(
+        lambda r: r["aborted"],
+        lambda: server.buffer_received(dest_hash, timeout_ms=500),
+        timeout_s=30.0,
+    )["aborted"]
     assert aborted, (
         f"a chunk inflating to {_MAX_CHUNK_LEN + 1} (one over the bound) must "
         f"abort the receiver's unpack with IOError"
@@ -263,13 +264,43 @@ def test_decompression_bomb_exact_bound(wire_link_setup):
     )
 
 
+def _poll_until(pred, poll, timeout_s):
+    """Poll ``poll()`` until ``pred(value)`` is true or ``timeout_s`` elapses
+    (wall-clock). Returns the last observed value.
+
+    The receiver-side flags these tests wait on (eof / aborted) are set on the
+    receiving peer's own thread, so the wait is async. A fixed iteration budget
+    (e.g. 40 x 500ms) is fragile: each ``poll`` call is a ceiling, not a floor,
+    and the loop can exhaust before a load-starved receive thread (30+ minutes
+    into a serial CI suite) surfaces the flag - the flake this removes. A
+    wall-clock deadline guarantees the full budget (it runs the whole
+    ``timeout_s`` regardless of how fast each poll returns) while still
+    returning as soon as the flag appears, so it adds no latency in the common
+    case. ``timeout_s`` is a generous floor, not a target: it must exceed the
+    suite's worst-case receiver delay, and 30s does so with headroom (the test
+    normally concludes in well under a second).
+    """
+    last = None
+    deadline = time.monotonic() + timeout_s
+    while True:
+        last = poll()
+        if pred(last):
+            return last
+        if time.monotonic() >= deadline:
+            return last
+        # Small sleep between polls keeps CPU load down without materially
+        # shortening the effective wait; the deadline, not the sleep, bounds it.
+        time.sleep(0.05)
+
+
 def client_wait_accepted(server, dest_hash):
     """Poll the receiver until the accepted bomb concludes (eof)."""
     last = {"data": b"", "eof": False, "aborted": False, "error": None}
-    for _ in range(40):
-        last = server.buffer_received(dest_hash, timeout_ms=500)
-        if last["eof"] or last["aborted"] or last["data"]:
-            break
+    last = _poll_until(
+        lambda r: r["eof"] or r["aborted"] or r["data"],
+        lambda: server.buffer_received(dest_hash, timeout_ms=500),
+        timeout_s=30.0,
+    )
     return last
 
 

@@ -503,14 +503,98 @@ def _write_ifac_ini(
         )
 
 
+def _synthesize_config_interfaces(inst, config_dir: str):
+    """Bring up the interfaces named in a config file on an already-running
+    Reticulum instance `inst`.
+
+    Mirrors RNS.Reticulum.__init__'s own setup for the parts the adopt path
+    needs (it cannot re-run the constructor - that raises "Attempt to
+    reinitialise Reticulum"):
+      * transport posture: Reticulum.py:497-499 sets
+        Reticulum.__transport_enabled = True when the config has
+        `enable_transport = Yes`. Without this an adopted minimal instance
+        (created by another command with transport off) would accept a TCP
+        connect on the wire port but RNS would not route packets through it
+        (every inbound/outbound path is gated on transport_enabled, e.g.
+        Transport.py:524/:1536), so a peer could connect but never establish
+        a link. We set the same class attribute RNS uses, only on an explicit
+        Yes, exactly as the constructor does.
+      * interfaces: Reticulum.py:673-677 calls self._synthesize_interface per
+        entry in self.config["interfaces"]. We parse the same config with the
+        same vendored ConfigObj (RNS.vendor.configobj.ConfigObj,
+        Reticulum.py:321) and run the same loop, so the adopted instance
+        provides the requested wire setup (a genuinely-listening
+        TCPServerInterface with the right network_name / passphrase / IFAC /
+        fixed_mtu).
+    """
+    from RNS.vendor.configobj import ConfigObj
+    RNS = _get_rns()
+    config_file = os.path.join(config_dir, "config")
+    if not os.path.isfile(config_file):
+        return
+    try:
+        cfg = ConfigObj(config_file)
+    except Exception:
+        return
+    # Apply the transport posture the constructor would have (Reticulum.py:497-499).
+    reticulum = cfg.get("reticulum")
+    if reticulum is not None and "enable_transport" in reticulum:
+        if reticulum.as_bool("enable_transport"):
+            RNS.Reticulum._Reticulum__transport_enabled = True
+    ifaces = cfg.get("interfaces")
+    if not ifaces:
+        return
+    for name in ifaces:
+        c = ifaces[name]
+        inst._synthesize_interface(c, name, instance_init=True)
+
+
 def _ensure_wire_rns_started(config_dir: str):
     """Start the wire-mode Reticulum singleton once per bridge process.
 
     Second calls with the same config are no-ops; second calls with a
     different config raise (RNS.Reticulum is a process-wide singleton).
+
+    If a Reticulum singleton is already running (started by another module
+    path in the same bridge process, e.g. behavioral_transport), adopt it
+    rather than re-initialising. RNS.Reticulum.__init__ raises "Attempt to
+    reinitialise Reticulum" on a second constructor call, so this is
+    required in --reference-only mode where the bridge is session-scoped
+    (one process for all tests) and a prior test's singleton may still be
+    running. Same pattern as _ensure_minimal_rns in bridge_server.py.
+
+    Adopting is NOT just reusing the bare instance: the RNS.Reticulum
+    constructor is what loads + starts the interfaces from the config file
+    (Reticulum.py:673-677, self._synthesize_interface per entry in
+    self.config["interfaces"]). A bare adopted instance has none of those
+    interfaces, so wire_start_tcp_server would return a port that is not
+    actually listening - a later caller would get a server handle that
+    cannot accept a connection. To keep the adopted path contract-identical
+    to the construct path, we re-parse the config the constructor would have
+    read (the same RNS.vendor.configobj.ConfigObj it uses, Reticulum.py:321)
+    and run the same _synthesize_interface loop, so the adopted instance
+    provides the requested wire setup (a genuinely-listening TCPServerInterface
+    with the right network_name / passphrase / IFAC / fixed_mtu).
     """
     global _shared_wire_rns, _shared_wire_config_dir
     RNS = _get_rns()
+
+    if _shared_wire_rns is None:
+        # Adopt an existing Reticulum singleton if one is already running
+        # (started by another module path in this bridge process). In
+        # --reference-only mode the bridge is session-scoped, so a prior
+        # behavioral or wire test's Reticulum may still be running when a
+        # subsequent test calls wire_start_tcp_server. The Reticulum
+        # constructor raises on a second call, so we adopt rather than
+        # re-init. Then bring up this config's interfaces on the adopted
+        # instance (see docstring) so the returned port really listens.
+        _existing = RNS.Reticulum.get_instance()
+        if _existing is not None:
+            _shared_wire_rns = _existing
+            _shared_wire_config_dir = config_dir
+            _synthesize_config_interfaces(_shared_wire_rns, config_dir)
+            _install_inbound_tap()
+            return _shared_wire_rns
 
     if _shared_wire_rns is not None:
         if _shared_wire_config_dir != config_dir:
@@ -1150,6 +1234,88 @@ def cmd_wire_poll_path(params):
         time.sleep(0.05)
 
     return {"found": False, "hops": None}
+
+
+def cmd_wire_register_destination(params):
+    """Probe the explicit destination-registration guard, in isolation.
+
+    Constructs a destination of the requested direction, clears it from the
+    local-destination table (so construction-time auto-registration does not
+    contaminate the result), performs ONE explicit register call - the exact
+    unit of code that diverges between the implementations - and reports
+    whether the destination's hash then lands in the local-destination table.
+
+    The local-destination table membership is the observable that drives the
+    announce-skip gate on both implementations:
+      * Python:  ``packet.destination_hash in Transport.destinations_map``
+                 (Transport.py:1710)
+      * Kotlin:  ``destinations.any { it.hash == destHash }``
+                 (Transport.kt:3648)
+    A destination that is "local" gets its announces skipped ("Skipping
+    announce for local destination"). Only IN destinations should ever be
+    local; registering an OUT destination (the production send-path trigger,
+    Reticulum.kt registerDestination -> Transport.registerDestination) must
+    NOT make the peer "local".
+
+    reticulum-kt issue #85: Transport.registerDestination is missing Python's
+    IN-direction guard, so it appends destinations of every direction. The
+    reference implementation filters ``direction == IN`` in
+    Transport.register_destination (Transport.py:2898). After an explicit
+    register of an OUT destination:
+      * reference: is_local == False  (guard drops it)
+      * unmodified kotlin: is_local == True  (bug: no guard, announce skipped)
+    The IN case is the positive control proving the local-table mechanism
+    works, so a False on OUT is a real guard, not a vacuous mechanism.
+
+    Params: handle, direction ("IN"|"OUT"), app_name, aspects (optional list).
+    Returns: {destination_hash, identity_hash, direction, is_local}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    direction = params["direction"].upper()
+    app_name = params["app_name"]
+    aspects = params.get("aspects", [])
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    if direction not in ("IN", "OUT"):
+        raise ValueError(f"direction must be IN or OUT, got: {direction}")
+    rns_direction = RNS.Destination.IN if direction == "IN" else RNS.Destination.OUT
+    identity = RNS.Identity()
+    destination = RNS.Destination(
+        identity, rns_direction, RNS.Destination.SINGLE, app_name, *aspects,
+    )
+
+    # Clear any construction-time registration so the explicit register below
+    # is the single unit under test (python auto-registers IN on __init__).
+    RNS.Transport.deregister_destination(destination)
+
+    # The explicit register - the production send-path trigger. Python filters
+    # direction == IN here; the unguarded kotlin port appends all directions.
+    RNS.Transport.register_destination(destination)
+
+    with RNS.Transport.destinations_map_lock:
+        is_local = destination.hash in RNS.Transport.destinations_map
+
+    # Tear down the probe: this command's job was to observe the register
+    # behavior in isolation, so the destination must not linger in the shared
+    # Transport table (a long-lived bridge accumulates one per call, and other
+    # commands read that same table). is_local was already captured above, so
+    # removing it now is safe. The strong ref below keeps the object alive.
+    RNS.Transport.deregister_destination(destination)
+
+    # Keep a reference so the destination/identity aren't GC'd.
+    inst["destinations"].append((identity, destination))
+
+    return {
+        "destination_hash": destination.hash.hex(),
+        "identity_hash": identity.hash.hex(),
+        "direction": direction,
+        "is_local": bool(is_local),
+    }
 
 
 def cmd_wire_identity_recall(params):
@@ -7809,6 +7975,170 @@ def cmd_wire_resource_receiver_proof_count(params):
     return out
 
 
+def cmd_wire_resource_proof_cache_lookup(params):
+    """Proof caching (receiver side, Resource.prove, Resource.py:752-759).
+
+    When a Resource receiver completes a transfer it proves it by sending a
+    single RESOURCE_PRF (Resource.prove, Resource.py:755-757) AND force-caching
+    that proof packet in the transport packet cache
+    (Resource.py:759: `RNS.Transport.cache(proof_packet, force_cache=True)`).
+    The cache entry is what the SENDER's AWAITING_PROOF recovery retrieves:
+    Resource.py:653-656 rebuilds the same proof packet and calls
+    `Transport.cache_request(expected_proof_packet.packet_hash, ...)` to
+    re-fetch a proof that was lost in transit. An impl that sends the proof
+    but does not cache it leaves the sender's recovery as a no-op — the proof
+    is "lost" even though it was generated (reticulum-kt#65 / PR #97).
+
+    Self-contained: builds a real sender + receiver (via Resource.accept), feeds
+    every GENUINE part in order so the full payload assembles to the advertised
+    hash (Resource.assemble -> Resource.prove), then checks whether the proof
+    packet landed in the transport packet cache.
+
+    The observable is the EXACT cache lookup the sender's recovery performs.
+    Recovery (Resource.py:653-656) rebuilds the proof packet from the payload
+    `hash + expected_proof` (64 bytes, the same payload prove() emits,
+    Resource.py:755-756) and calls `Transport.cache_request(packet.packet_hash,
+    ...)` -> `get_cached_packet(packet_hash)`. That lookup only succeeds because
+    the proof packet's `packet_hash` is reproducible: the proof is HEADER_1 and
+    unencrypted (Packet.py:196-198), and neither `send()` nor `outbound()`
+    mutates `packet.raw` (outbound builds a separate `new_raw` copy for the
+    wire). So we capture the payload prove() actually emitted, rebuild the
+    identical proof packet, and ask `get_cached_packet` for that exact
+    `packet_hash` - the very key recovery uses. A conforming impl returns the
+    cached packet (proof_in_cache True); one that omits the cache call returns
+    None (proof_in_cache False).
+
+    Returns {total_parts, status_name, complete, proof_sent, proof_in_cache,
+    proof_recovered}.
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    link_id = bytes.fromhex(params["link_id"])
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+    link = inst.get("out_links", {}).get(link_id)
+    if link is None:
+        raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    sender, receiver, _adv = _build_resource_receiver(
+        RNS, link, payload_len=1200, force_sdu=200
+    )
+    if receiver is None:
+        raise ValueError("Resource.accept did not produce a receiver")
+    total = len(receiver.parts)
+    if total < 2:
+        raise ValueError(f"need a multi-part transfer, got {total}")
+
+    # Wrap Packet.send to capture the EXACT RESOURCE_PRF payload prove() emits
+    # (the real send still runs) - the same capture pattern
+    # cmd_wire_resource_request_next_content uses for RESOURCE_REQ. We read RNS's
+    # own bytes. Capturing the payload is the positive control that prove()
+    # reached the point of building the proof - the precondition that makes a
+    # proof_in_cache False below mean "missing cache call" rather than "the
+    # transfer never proved." We key proof_sent on the payload (not on send()
+    # success) because in the synthetic bridge the link-bound proof's send()
+    # routing is an infra detail unrelated to the cache - the property under
+    # test - and both impls build the payload when they reach prove().
+    captured = {"payload": None, "destination_link_id": None}
+    orig_send = RNS.Packet.send
+
+    def _capturing_send(self):
+        if getattr(self, "context", None) == RNS.Packet.RESOURCE_PRF:
+            captured["payload"] = bytes(self.data)
+            # Observation: which link_id does the proof's destination carry at
+            # send time? RNS.Packet(link, ...) sets self.destination = link, and
+            # the Transport's LINK-packet routing (interface filter + in-process
+            # loopback) routes the proof to that link's own interface via that
+            # reference. Recording the destination's link_id (not a boolean) lets
+            # the command verify the proof is bound to THIS transfer's link, not
+            # merely to some link. None if the packet has no destination.
+            dest = getattr(self, "destination", None)
+            captured["destination_link_id"] = (
+                bytes(dest.link_id) if getattr(dest, "link_id", None) is not None else None
+            )
+        return orig_send(self)
+
+    def _recovery_lookup(payload: bytes):
+        """Mirror the sender's AWAITING_PROOF recovery exactly (Resource.py:653-656):
+        rebuild the identical proof packet and return get_cached_packet on its
+        packet_hash - the very key recovery queries the cache with.
+        """
+        rebuilt = RNS.Packet(
+            link, payload,
+            packet_type=RNS.Packet.PROOF, context=RNS.Packet.RESOURCE_PRF,
+        )
+        rebuilt.pack()
+        return RNS.Transport.get_cached_packet(rebuilt.packet_hash)
+
+    RNS.Packet.send = _capturing_send
+    status = None
+    recovered = None
+    try:
+        # Feed every part in order; the last drives received_count to total and
+        # runs assemble in a daemon thread (Resource.py:894-896), which concludes
+        # COMPLETE and calls prove() (Resource.py:713/752-759), which sends the
+        # RESOURCE_PRF (captured above) and force-caches it (Resource.py:759).
+        for i in range(total):
+            rx = _link_rx_packet(RNS, link, sender.parts[i].data, RNS.Packet.RESOURCE)
+            receiver.receive_part(rx)
+
+        # Wait until the proof is actually recoverable via the recovery lookup.
+        # assemble() (in the receive thread) sets status=COMPLETE and THEN calls
+        # prove() (Resource.py:711-713); prove() sends the RESOURCE_PRF and only
+        # then force-caches it (Resource.py:758-759). So polling for COMPLETE
+        # alone can return before the proof is sent AND cached - which would make
+        # the assertions below race. Polling the recovery lookup itself is the
+        # correct barrier: it returns the cached packet only once prove()'s
+        # cache() write has committed. A non-conforming impl never caches, so the
+        # window simply elapses and the answer stays False/None.
+        terminal = {RNS.Resource.COMPLETE, RNS.Resource.FAILED, RNS.Resource.CORRUPT}
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            st = getattr(receiver, "status", None)
+            if st == RNS.Resource.COMPLETE and captured["payload"] is not None:
+                recovered = _recovery_lookup(captured["payload"])
+                if recovered is not None:
+                    break  # proof is recoverable: done
+            elif st in terminal:
+                # Concluded FAILED/CORRUPT, or COMPLETE without ever capturing a
+                # proof. Give a short tail in case a proof is still in flight,
+                # then stop (it will not become recoverable).
+                if time.time() > deadline - 0.5:
+                    break
+            time.sleep(0.02)
+        status = getattr(receiver, "status", None)
+        # If we concluded with a captured proof but the lookup never returned a
+        # hit during the window (should not happen for a conforming impl), record
+        # the final answer from one last lookup.
+        if recovered is None and status == RNS.Resource.COMPLETE and captured["payload"] is not None:
+            recovered = _recovery_lookup(captured["payload"])
+    finally:
+        RNS.Packet.send = orig_send
+
+    # Is the proof bound to THIS transfer's link (not to some other link, and
+    # not to none)? The Transport's LINK-packet routing (interface filter +
+    # in-process loopback) routes the proof to that link's own interface via the
+    # destination reference.
+    dest_link_id = captured["destination_link_id"]
+    proof_link_ref = dest_link_id is not None and bytes(dest_link_id) == bytes(link.link_id)
+    out = {
+        "total_parts": total,
+        "status_name": _RESOURCE_STATUS_NAMES.get(status),
+        "complete": status == RNS.Resource.COMPLETE,
+        "proof_sent": captured["payload"] is not None,
+        "proof_in_cache": recovered is not None,
+        "proof_recovered": recovered is not None,
+        "proof_link_ref": proof_link_ref,
+    }
+    try:
+        receiver.cancel()
+    except Exception:
+        pass
+    return out
+
+
 def cmd_wire_resource_request_next_content(params):
     """Receiver-side RESOURCE_REQ CONTENT (Resource.request_next, Resource.py:
     931-980).
@@ -10572,6 +10902,7 @@ WIRE_COMMANDS = {
     "wire_set_interface_mode": cmd_wire_set_interface_mode,
     "wire_announce": cmd_wire_announce,
     "wire_poll_path": cmd_wire_poll_path,
+    "wire_register_destination": cmd_wire_register_destination,
     "wire_request_path": cmd_wire_request_path,
     "wire_read_path_entry": cmd_wire_read_path_entry,
     "wire_has_discovery_path_request": cmd_wire_has_discovery_path_request,
@@ -10710,6 +11041,7 @@ WIRE_COMMANDS = {
     "wire_resource_receiver_request_state": cmd_wire_resource_receiver_request_state,
     "wire_inject_hashmap_update": cmd_wire_inject_hashmap_update,
     "wire_resource_receiver_proof_count": cmd_wire_resource_receiver_proof_count,
+    "wire_resource_proof_cache_lookup": cmd_wire_resource_proof_cache_lookup,
     "wire_resource_request_next_content": cmd_wire_resource_request_next_content,
     "wire_resource_late_after_cancel": cmd_wire_resource_late_after_cancel,
     "wire_resource_part_count_derivation": cmd_wire_resource_part_count_derivation,

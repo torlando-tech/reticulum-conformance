@@ -503,14 +503,98 @@ def _write_ifac_ini(
         )
 
 
+def _synthesize_config_interfaces(inst, config_dir: str):
+    """Bring up the interfaces named in a config file on an already-running
+    Reticulum instance `inst`.
+
+    Mirrors RNS.Reticulum.__init__'s own setup for the parts the adopt path
+    needs (it cannot re-run the constructor - that raises "Attempt to
+    reinitialise Reticulum"):
+      * transport posture: Reticulum.py:497-499 sets
+        Reticulum.__transport_enabled = True when the config has
+        `enable_transport = Yes`. Without this an adopted minimal instance
+        (created by another command with transport off) would accept a TCP
+        connect on the wire port but RNS would not route packets through it
+        (every inbound/outbound path is gated on transport_enabled, e.g.
+        Transport.py:524/:1536), so a peer could connect but never establish
+        a link. We set the same class attribute RNS uses, only on an explicit
+        Yes, exactly as the constructor does.
+      * interfaces: Reticulum.py:673-677 calls self._synthesize_interface per
+        entry in self.config["interfaces"]. We parse the same config with the
+        same vendored ConfigObj (RNS.vendor.configobj.ConfigObj,
+        Reticulum.py:321) and run the same loop, so the adopted instance
+        provides the requested wire setup (a genuinely-listening
+        TCPServerInterface with the right network_name / passphrase / IFAC /
+        fixed_mtu).
+    """
+    from RNS.vendor.configobj import ConfigObj
+    RNS = _get_rns()
+    config_file = os.path.join(config_dir, "config")
+    if not os.path.isfile(config_file):
+        return
+    try:
+        cfg = ConfigObj(config_file)
+    except Exception:
+        return
+    # Apply the transport posture the constructor would have (Reticulum.py:497-499).
+    reticulum = cfg.get("reticulum")
+    if reticulum is not None and "enable_transport" in reticulum:
+        if reticulum.as_bool("enable_transport"):
+            RNS.Reticulum._Reticulum__transport_enabled = True
+    ifaces = cfg.get("interfaces")
+    if not ifaces:
+        return
+    for name in ifaces:
+        c = ifaces[name]
+        inst._synthesize_interface(c, name, instance_init=True)
+
+
 def _ensure_wire_rns_started(config_dir: str):
     """Start the wire-mode Reticulum singleton once per bridge process.
 
     Second calls with the same config are no-ops; second calls with a
     different config raise (RNS.Reticulum is a process-wide singleton).
+
+    If a Reticulum singleton is already running (started by another module
+    path in the same bridge process, e.g. behavioral_transport), adopt it
+    rather than re-initialising. RNS.Reticulum.__init__ raises "Attempt to
+    reinitialise Reticulum" on a second constructor call, so this is
+    required in --reference-only mode where the bridge is session-scoped
+    (one process for all tests) and a prior test's singleton may still be
+    running. Same pattern as _ensure_minimal_rns in bridge_server.py.
+
+    Adopting is NOT just reusing the bare instance: the RNS.Reticulum
+    constructor is what loads + starts the interfaces from the config file
+    (Reticulum.py:673-677, self._synthesize_interface per entry in
+    self.config["interfaces"]). A bare adopted instance has none of those
+    interfaces, so wire_start_tcp_server would return a port that is not
+    actually listening - a later caller would get a server handle that
+    cannot accept a connection. To keep the adopted path contract-identical
+    to the construct path, we re-parse the config the constructor would have
+    read (the same RNS.vendor.configobj.ConfigObj it uses, Reticulum.py:321)
+    and run the same _synthesize_interface loop, so the adopted instance
+    provides the requested wire setup (a genuinely-listening TCPServerInterface
+    with the right network_name / passphrase / IFAC / fixed_mtu).
     """
     global _shared_wire_rns, _shared_wire_config_dir
     RNS = _get_rns()
+
+    if _shared_wire_rns is None:
+        # Adopt an existing Reticulum singleton if one is already running
+        # (started by another module path in this bridge process). In
+        # --reference-only mode the bridge is session-scoped, so a prior
+        # behavioral or wire test's Reticulum may still be running when a
+        # subsequent test calls wire_start_tcp_server. The Reticulum
+        # constructor raises on a second call, so we adopt rather than
+        # re-init. Then bring up this config's interfaces on the adopted
+        # instance (see docstring) so the returned port really listens.
+        _existing = RNS.Reticulum.get_instance()
+        if _existing is not None:
+            _shared_wire_rns = _existing
+            _shared_wire_config_dir = config_dir
+            _synthesize_config_interfaces(_shared_wire_rns, config_dir)
+            _install_inbound_tap()
+            return _shared_wire_rns
 
     if _shared_wire_rns is not None:
         if _shared_wire_config_dir != config_dir:

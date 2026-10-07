@@ -170,22 +170,40 @@ def test_keepalive_ff_answered_with_fe_initiator_ignores_own_echo(wire_link_setu
         f"receiver never accepted the inbound link: {pre!r}"
     )
 
-    # Non-initiator (the listener's inbound link): a 0xFF keepalive is answered
-    # with 0xFE, last_inbound advances, last_data does not.
-    answer = server.send_keepalive_probe(link_id)
+    # Non-initiator (the listener's inbound link): 1.5.5 (commit e64d8150)
+    # rate-limits the 0xFE answer - it only fires when the link's outbound
+    # keepalive timer is due (Link.py:1132). A probe on a fresh link (timer not
+    # yet due) is therefore SUPPRESSED: no 0xFE, but last_inbound still advances
+    # (the receive body runs) and last_data does not (a keepalive is not payload).
+    suppressed = server.send_keepalive_probe(link_id)
+    assert suppressed["initiator"] is False, (
+        f"the listener's inbound link must be the NON-initiator: {suppressed!r}"
+    )
+    assert suppressed["last_inbound_advanced"] is True, (
+        f"receiving a keepalive must refresh last_inbound (Link.py:942): "
+        f"{suppressed!r}"
+    )
+    assert suppressed["last_data_advanced"] is False, (
+        f"a keepalive must NOT bump last_data - it is not payload "
+        f"(Link.py:943): {suppressed!r}"
+    )
+    # When the timer is not due, 1.5.5 suppresses the 0xFE answer (the 1.3.1
+    # behaviour of answering unconditionally is gone).
+    assert suppressed["answered"] is False and suppressed["response"] is None, (
+        f"with the outbound keepalive timer not due, 1.5.5 must SUPPRESS the 0xFE "
+        f"answer (e64d8150 rate-limit), got {suppressed!r}"
+    )
+
+    # With the timer forced due, the non-initiator DOES answer 0xFF with exactly
+    # 0xFE (Link.py:1131-1135) and the emitted byte is recorded as the last
+    # keepalive - pinning the answer byte value + the rate-limit gate together.
+    answer = server.send_keepalive_probe(link_id, force_keepalive_due=True)
     assert answer["initiator"] is False, (
         f"the listener's inbound link must be the NON-initiator: {answer!r}"
     )
     assert answer["answered"] is True and answer["response"] == "fe", (
         f"a non-initiator must answer a 0xFF keepalive with exactly 0xFE "
-        f"(Link.py:1151), got {answer!r}"
-    )
-    assert answer["last_inbound_advanced"] is True, (
-        f"receiving a keepalive must refresh last_inbound (Link.py:978): {answer!r}"
-    )
-    assert answer["last_data_advanced"] is False, (
-        f"a keepalive must NOT bump last_data — it is not payload data "
-        f"(Link.py:979-980): {answer!r}"
+        f"(Link.py:1133) once the timer is due, got {answer!r}"
     )
     assert server.last_keepalive(link_id)["payload"] == "fe", (
         f"the last keepalive byte the non-initiator emitted must be 0xFE: "

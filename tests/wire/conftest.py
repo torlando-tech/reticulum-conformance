@@ -1470,7 +1470,7 @@ class _WirePeer:
             data=data.hex(),
         )
 
-    def send_keepalive_probe(self, link_id: bytes) -> dict:
+    def send_keepalive_probe(self, link_id: bytes, force_keepalive_due: bool = False) -> dict:
         """Inject a decrypted 0xFF keepalive into a link's receive path.
 
         RNS keepalive is a single byte: the initiator emits 0xFF and a
@@ -1481,12 +1481,18 @@ class _WirePeer:
         last_data on my own 0xFF echo" branch. Returns {response} where
         `response` is the hex of the byte the link emitted in reply (e.g. "fe"
         for a non-initiator), plus whether last_inbound/last_data advanced.
+
+        RNS 1.5.5 (e64d8150) rate-limits the non-initiator's 0xFE answer to fire
+        only when the link's outbound keepalive timer is due; pass
+        `force_keepalive_due=True` to backdate the timer so the answer path is
+        observable deterministically.
         """
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_send_keepalive_probe",
             handle=self.handle,
             link_id=link_id.hex(),
+            force_keepalive_due=force_keepalive_due,
         )
 
     def last_keepalive(self, link_id: bytes) -> dict:
@@ -2663,14 +2669,21 @@ class _WirePeer:
             handle=self.handle, link_id=link_id.hex(), variant=variant,
         )
 
-    def inject_resource_adv_flags(self, link_id: bytes, variant: str) -> dict:
+    def inject_resource_adv_flags(self, link_id: bytes, variant: str,
+                                  register_request_handler: bool = False) -> dict:
         """Request/response advertisement accept logic: drive a request /
         response / plain advertisement through the real Link.receive dispatcher
-        under a given resource_strategy and report {variant, accepted, strategy}."""
+        under a given resource_strategy and report {variant, accepted, strategy}.
+
+        RNS 1.5.5 (3a36c367) gates the is_request branch on
+        `destination.request_handlers` being non-empty; pass
+        `register_request_handler=True` to register a minimal handler (and
+        restore it after) so the accepted path is observable."""
         assert self.handle, "start_* must be called first"
         return self.bridge.execute(
             "wire_inject_resource_adv_flags",
             handle=self.handle, link_id=link_id.hex(), variant=variant,
+            register_request_handler=register_request_handler,
         )
 
     def resource_receiver_request_state(self, link_id: bytes, n: int = 2) -> dict:

@@ -63,10 +63,10 @@ IC_BURST_HOLD = 15
 IC_BURST_PENALTY = 15
 IC_HELD_RELEASE_INTERVAL = 5
 
-DEFAULT_STAMP_VALUE = 14         # Discovery.py:34 InterfaceAnnouncer.DEFAULT_STAMP_VALUE
+DEFAULT_STAMP_VALUE = 16         # Discovery.py:34 InterfaceAnnouncer.DEFAULT_STAMP_VALUE
 
-MAX_QUEUED_ANNOUNCES = 16384     # Reticulum.MAX_QUEUED_ANNOUNCES
-QUEUED_ANNOUNCE_LIFE = 60 * 60 * 24  # Reticulum.QUEUED_ANNOUNCE_LIFE (24h)
+MAX_QUEUED_ANNOUNCES = 4096     # Reticulum.MAX_QUEUED_ANNOUNCES
+QUEUED_ANNOUNCE_LIFE = 10800    # Reticulum.QUEUED_ANNOUNCE_LIFE (3h)
 ANNOUNCE_CAP = 2                 # Reticulum.ANNOUNCE_CAP (percent)
 
 # The well-known interface-probe responder destination (Transport.py:397):
@@ -284,9 +284,9 @@ def test_discovery_stamp_default_cost_is_14(sut, reference):
     verifies=(
         "The per-interface announce egress-queue constants match their "
         "documented literals straight off RNS.Reticulum: MAX_QUEUED_ANNOUNCES == "
-        "16384 (the queue depth past which forwarded announces are dropped, "
-        "Transport.py:1262), QUEUED_ANNOUNCE_LIFE == 86400 == 24h (a queued "
-        "announce is purged as stale after a day, Interface.py:332), and the 2%% "
+        "4096 (the queue depth past which forwarded announces are dropped, "
+        "Transport.py:1262), QUEUED_ANNOUNCE_LIFE == 10800 == 3h (a queued "
+        "announce is purged as stale after 3 hours, Interface.py:332), and the 2%% "
         "default ANNOUNCE_CAP == 2 — pinning the queue-cap and lifetime the "
         "bandwidth-cap spacing tests only infer."
     ),
@@ -298,8 +298,8 @@ def test_announce_queue_cap_and_lifetime_literals(sut, reference):
             f"{label}: MAX_QUEUED_ANNOUNCES must be {MAX_QUEUED_ANNOUNCES}; "
             f"got {c['max_queued_announces']}"
         )
-        assert c["queued_announce_life"] == QUEUED_ANNOUNCE_LIFE == 60 * 60 * 24, (
-            f"{label}: QUEUED_ANNOUNCE_LIFE must be 24h ({QUEUED_ANNOUNCE_LIFE}s); "
+        assert c["queued_announce_life"] == QUEUED_ANNOUNCE_LIFE == 10800, (
+            f"{label}: QUEUED_ANNOUNCE_LIFE must be 3h ({QUEUED_ANNOUNCE_LIFE}s); "
             f"got {c['queued_announce_life']}"
         )
         assert c["announce_cap"] == ANNOUNCE_CAP, (

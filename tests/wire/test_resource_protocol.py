@@ -52,8 +52,12 @@ __category_order__ = 18
 
 _APP_NAME = "resourceproto"
 
-# RNS.Resource status codes (Resource.py:143-152). REJECTED == NONE == 0.
-_REJECTED = 0x00
+# RNS.Resource status codes (Resource.py:143-152). RNS 1.3.1 had
+# REJECTED == NONE == 0x00 (a latent collision: a rejected resource was
+# indistinguishable from a not-started one); RNS 1.5.5 (commit bb289744
+# "Added RESOURCE_RCL signal on resource receiver cancel") gave REJECTED a
+# distinct value, 0x09.
+_REJECTED = 0x09
 _TRANSFERRING = 0x03
 _COMPLETE = 0x06
 _FAILED = 0x07
@@ -194,7 +198,7 @@ def test_accept_app_accepts_small_rejects_oversize(wire_pair, wire_link_setup):
     if "kotlin" in (server_impl, client_impl):
         pytest.xfail(_KT_REJECTED_PATH_XFAIL)
 
-    # Negative side: > 4096 -> rejected -> RESOURCE_RCL -> sender REJECTED(0).
+    # Negative side: > 4096 -> rejected -> RESOURCE_RCL -> sender REJECTED.
     big = secrets.token_bytes(16 * 1024)
     assert len(big) > _APP_ACCEPT_MAX
     rejected = client.resource_send(link_id, big, timeout_ms=30000)

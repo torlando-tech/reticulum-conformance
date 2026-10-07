@@ -322,6 +322,20 @@ def _ensure_rns_started(config_dir, enable_transport):
     global _shared_rns_instance, _shared_config_dir, _shared_enable_transport
     RNS = _get_rns()
 
+    # RNS 1.5 introduced an async inbound queue (Transport.USE_INBOUND_QUEUE,
+    # default True): preprocess_inbound enqueues and a background inbound_job
+    # thread drains it. The queue worker thread is spawned UNCONDITIONALLY in
+    # Transport.start() (Transport.py:527-529) - not gated on transport_enabled -
+    # so inbound is async even for non-transport instances (enable_transport=False).
+    # In 1.3.1 inbound is fully synchronous. The behavioral tests (and their
+    # "read the table WITHOUT any wall-clock waiting" design) assume the
+    # synchronous model, so disable the queue in the harness to keep
+    # inject -> read deterministic. This is a test-harness control, not a
+    # change to the reference's protocol behavior: _inbound is the same code
+    # path either way, the only difference is who calls it (us, inline vs the
+    # queue thread).
+    RNS.Transport.USE_INBOUND_QUEUE = False
+
     if _shared_rns_instance is not None:
         if _shared_enable_transport != enable_transport:
             raise RuntimeError(

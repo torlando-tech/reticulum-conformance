@@ -166,11 +166,27 @@ def test_resource_malformed_adv_dropped(wire_link_setup):
 def test_resource_adv_request_response_flags(wire_link_setup):
     server, client, _dest_hash, link_id = wire_link_setup(_APP, _ASPECTS)
 
-    # Request advertisement bypasses ACCEPT_NONE.
-    req = client.inject_resource_adv_flags(link_id, "request_autoaccept")
+    # RNS 1.5.5 (commit 3a36c367 "Improved resource handling") gated the
+    # is_request advertisement branch on `destination.request_handlers` being
+    # non-empty (Link.py:1037); 1.3.1 accepted a request adv unconditionally
+    # (Link.py:1070-1071). The "bypasses ACCEPT_NONE" property is preserved -
+    # the is_request branch still runs BEFORE the resource_strategy branches -
+    # only the precondition changed. Register a minimal request handler so the
+    # accepted path is observable; without one the adv falls through to
+    # ACCEPT_NONE and is rejected (the negative control for the gate).
+    no_handler = client.inject_resource_adv_flags(link_id, "request_autoaccept")
+    assert no_handler["strategy"] == _ACCEPT_NONE, no_handler
+    assert no_handler["accepted"] is False, (
+        f"a request advertisement under ACCEPT_NONE with NO request handler "
+        f"registered must NOT be accepted (1.5.5 3a36c367 gate): {no_handler!r}"
+    )
+    req = client.inject_resource_adv_flags(
+        link_id, "request_autoaccept", register_request_handler=True,
+    )
     assert req["strategy"] == _ACCEPT_NONE, req
     assert req["accepted"] is True, (
-        f"a request advertisement was NOT auto-accepted under ACCEPT_NONE: {req!r}"
+        f"a request advertisement was NOT auto-accepted under ACCEPT_NONE "
+        f"with a request handler registered: {req!r}"
     )
 
     # Response advertisement with no pending request is rejected.

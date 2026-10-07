@@ -57,7 +57,7 @@ CHANNEL = 0x0E
 FLAG_SIGNED = 0b00000001
 FLAG_ENCRYPTED = 0b00000010
 
-DEFAULT_STAMP_VALUE = 14
+DEFAULT_STAMP_VALUE = 16
 STAMP_SIZE = 32
 
 # Discovery destination / handler aspect_filter dotted name
@@ -333,20 +333,20 @@ def test_receiver_flag_bit_tolerance(sut):
 @conformance_case(
     commands=["discovery_build_announce_appdata", "discovery_receive_announce"],
     verifies=(
-        "DEFAULT_STAMP_VALUE=14 is both the SENDER default stamp cost when "
+        "DEFAULT_STAMP_VALUE=16 is both the SENDER default stamp cost when "
         "interface.discovery_stamp_value is unset (Discovery.py:34,98) and the "
         "RECEIVER default required_value (InterfaceAnnounceHandler.__init__ "
         "default, Discovery.py:192). Building an announce with NO stamp_value "
-        "produces a stamp whose value >= 14 (accepted at required_value 14), and "
-        "the impl's DEFAULT_STAMP_VALUE constant equals the spec literal 14. A "
-        "receiver constructed with its DEFAULT required_value reports 14 and DROPS "
-        "a genuine cost-6 announce (6 < 14) that it accepts once required_value is "
-        "lowered to 6 — proving the default threshold is 14, not a weaker value."
+        "produces a stamp whose value >= 16 (accepted at required_value 16), and "
+        "the impl's DEFAULT_STAMP_VALUE constant equals the spec literal 16. A "
+        "receiver constructed with its DEFAULT required_value reports 16 and DROPS "
+        "a genuine cost-6 announce (6 < 16) that it accepts once required_value is "
+        "lowered to 6 — proving the default threshold is 16, not a weaker value."
     ),
 )
 def test_default_stamp_cost_14(sut):
     # SENDER default: omit the per-interface stamp value (None) -> impl falls back
-    # to DEFAULT_STAMP_VALUE, producing a value-14 proof.
+    # to DEFAULT_STAMP_VALUE, producing a value-16 proof.
     dflt = sut.execute(
         "discovery_build_announce_appdata", interface_type="TCPServerInterface",
         stamp_value=None, transport_enabled=True,
@@ -354,17 +354,17 @@ def test_default_stamp_cost_14(sut):
     assert dflt["aborted"] is False
     assert dflt["default_stamp_value"] == DEFAULT_STAMP_VALUE
     at14 = _recv(sut, dflt["app_data"], required_value=DEFAULT_STAMP_VALUE)
-    assert at14["accepted"] is True, "default-cost announce must meet the value-14 threshold"
+    assert at14["accepted"] is True, "default-cost announce must meet the value-16 threshold"
 
     # RECEIVER default: a genuine cost-6 announce, delivered to a handler built
-    # with its DEFAULT required_value, is dropped (6 < 14); accepted at 6.
+    # with its DEFAULT required_value, is dropped (6 < 16); accepted at 6.
     cost6 = _build(sut, "TCPServerInterface", {
         "name": "Six", "reachable_on": "example.com", "port": 4242})
     under_default = _recv(sut, cost6["app_data"], default_required_value=True)
     assert under_default["required_value"] == DEFAULT_STAMP_VALUE, (
-        "receiver default required_value must be DEFAULT_STAMP_VALUE=14")
+        "receiver default required_value must be DEFAULT_STAMP_VALUE=16")
     assert under_default["default_stamp_value"] == DEFAULT_STAMP_VALUE
-    assert under_default["accepted"] is False, "cost-6 announce must drop under default-14 receiver"
+    assert under_default["accepted"] is False, "cost-6 announce must drop under default-16 receiver"
     # Positive control: the SAME announce is accepted with required_value 6.
     assert _recv(sut, cost6["app_data"], required_value=_COST)["accepted"] is True
 

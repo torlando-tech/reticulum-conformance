@@ -310,14 +310,17 @@ def client_wait_accepted(server, dest_hash):
         "link_open", "buffer_stream",
     ],
     verifies=(
-        "RNS RawChannelWriter.write caps each raw chunk at MAX_DATA_LEN "
-        "(RNS.Link.MDU - 8 = 423) and emits one StreamDataMessage per write: an "
-        "INCOMPRESSIBLE payload of N bytes produces ceil(N/423) data messages, "
-        "each with bytes<=423, compressed=False, with the per-write processed "
-        "lengths summing to N; a HIGHLY-COMPRESSIBLE payload collapses to a "
-        "single compressed message whose body is < the input (the "
-        "COMPRESSION_TRIES=4 decision). The live MAX_DATA_LEN and COMPRESSION_TRIES "
-        "are asserted == the external literals 423 and 4"
+        "RNS RawChannelWriter.write caps each raw (incompressible) chunk and emits "
+        "one StreamDataMessage per write. RNS 1.3.1 capped at the fixed "
+        "StreamDataMessage.MAX_DATA_LEN (RNS.Link.MDU - 8 = 423); RNS 1.5.5 "
+        "(commit df801810 'Utilize full link MDU in RawChannelWriter') caps at the "
+        "LIVE link MDU (writer._mdu = channel.mdu - HEADER_LEN), which is larger on "
+        "a high-MTU link. The live fixed constant (423) and COMPRESSION_TRIES (4) "
+        "are asserted == the external literals; an INCOMPRESSIBLE payload of N "
+        "bytes then produces ceil(N / live_cap) data messages, each bytes<=live_cap, "
+        "compressed=False, per-write processed lengths summing to N; a "
+        "HIGHLY-COMPRESSIBLE payload collapses to a single compressed message whose "
+        "body is < the input (the COMPRESSION_TRIES=4 decision)."
     ),
 )
 def test_stream_write_chunking_and_compression(wire_link_setup):
@@ -326,13 +329,34 @@ def test_stream_write_chunking_and_compression(wire_link_setup):
         link_timeout_ms=_LINK_TIMEOUT_MS, path_timeout_ms=_PATH_TIMEOUT_MS,
     )
 
-    # Incompressible payload -> raw chunking at MAX_DATA_LEN.
+    # Incompressible payload -> raw chunking.
     n = 1000
     payload = os.urandom(n)
     res = client.buffer_stream(link_id, payload, timeout_ms=_SEND_TIMEOUT_MS)
 
-    assert res["max_data_len"] == _MAX_DATA_LEN, (
-        f"live MAX_DATA_LEN={res['max_data_len']}, expected {_MAX_DATA_LEN}"
+    # The FIXED constant is still the external ground-truth literal (1.5.5 keeps
+    # the StreamDataMessage.MAX_DATA_LEN definition; it just no longer uses it as
+    # the raw-write cap). Pin that, then drive the chunk math from the LIVE cap
+    # the writer actually used (1.5.5's df801810 change).
+    assert res["fixed_max_data_len"] == _MAX_DATA_LEN, (
+        f"fixed StreamDataMessage.MAX_DATA_LEN={res['fixed_max_data_len']}, "
+        f"expected {_MAX_DATA_LEN}"
+    )
+    live_cap = res["max_data_len"]
+    assert live_cap > 0, f"live chunk cap must be positive: {res!r}"
+    # RNS 1.5.5 (df801810) derives the raw-write cap from the LIVE link MDU:
+    # writer._mdu = channel.mdu - StreamDataMessage.HEADER_LEN (HEADER_LEN=2).
+    # Pin the exact formula from bridge-reported values (channel_mdu - cap == 2).
+    # A 1.3.1-style writer (capped at the fixed 423 constant) does NOT satisfy
+    # this on a high-MTU link: it reports cap=423 while channel_mdu is large.
+    assert res["channel_mdu"] - live_cap == 2, (
+        f"1.5.5 raw-write cap must be channel_mdu - HEADER_LEN (2): "
+        f"channel_mdu={res['channel_mdu']}, cap={live_cap} "
+        f"(diff={res['channel_mdu'] - live_cap})"
+    )
+    assert live_cap >= _MAX_DATA_LEN, (
+        f"the live chunk cap must be >= the 1.3.1 fixed constant "
+        f"{_MAX_DATA_LEN}: got {live_cap}"
     )
     assert res["compression_tries"] == _COMPRESSION_TRIES, (
         f"live COMPRESSION_TRIES={res['compression_tries']}, "
@@ -341,13 +365,13 @@ def test_stream_write_chunking_and_compression(wire_link_setup):
 
     manifest = res["manifest"]
     data_msgs = [m for m in manifest if m["bytes"] > 0]
-    expected_msgs = math.ceil(n / _MAX_DATA_LEN)
+    expected_msgs = math.ceil(n / live_cap)
     assert len(data_msgs) == expected_msgs, (
-        f"incompressible {n} bytes must chunk into ceil({n}/{_MAX_DATA_LEN})="
+        f"incompressible {n} bytes must chunk into ceil({n}/{live_cap})="
         f"{expected_msgs} data messages, got {len(data_msgs)}: {manifest!r}"
     )
-    assert all(m["bytes"] <= _MAX_DATA_LEN for m in manifest), (
-        f"every emitted chunk must be <= MAX_DATA_LEN={_MAX_DATA_LEN}: {manifest!r}"
+    assert all(m["bytes"] <= live_cap for m in manifest), (
+        f"every emitted chunk must be <= live cap={live_cap}: {manifest!r}"
     )
     assert all(not m["compressed"] for m in data_msgs), (
         f"incompressible chunks must not be flagged compressed: {data_msgs!r}"
@@ -357,8 +381,8 @@ def test_stream_write_chunking_and_compression(wire_link_setup):
     assert sum(res["write_returns"]) == n, (
         f"per-write processed lengths must sum to {n}: {res['write_returns']!r}"
     )
-    assert all(r <= _MAX_DATA_LEN for r in res["write_returns"]), (
-        f"each incompressible write consumes <= {_MAX_DATA_LEN} bytes: "
+    assert all(r <= live_cap for r in res["write_returns"]), (
+        f"each incompressible write consumes <= live cap {live_cap} bytes: "
         f"{res['write_returns']!r}"
     )
     # Channel sequences are contiguous across the emitted messages.
@@ -378,9 +402,9 @@ def test_stream_write_chunking_and_compression(wire_link_setup):
     assert comp_data[0]["compressed"] is True, (
         f"the collapsed message must be flagged compressed: {comp_data[0]!r}"
     )
-    assert comp_data[0]["bytes"] < n and comp_data[0]["bytes"] <= _MAX_DATA_LEN, (
-        f"the compressed body must be smaller than the input and fit a message: "
-        f"{comp_data[0]!r}"
+    assert comp_data[0]["bytes"] < n and comp_data[0]["bytes"] <= live_cap, (
+        f"the compressed body must be smaller than the input and fit a message "
+        f"(live cap {live_cap}): {comp_data[0]!r}"
     )
     assert comp["write_returns"] == [n], (
         f"a single compressed write must consume the whole {n}-byte input: "

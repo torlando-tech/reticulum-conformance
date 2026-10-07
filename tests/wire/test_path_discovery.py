@@ -221,9 +221,15 @@ def test_path_response_reuses_cached_announce(wire_trio, wire_3peer):
 
 
 _DISCOVER_PATHS_FOR_MODES = {"access_point", "gateway", "roaming"}
-_NON_DISCOVER_MODES = {"full", "point_to_point", "boundary"}
+# RNS 1.5.5 added a MODE_BOUNDARY carve-out to the PR-search condition
+# (Transport.py:3430-3432): boundary-mode interfaces now forward PRs for
+# unknown destinations (filtered through BOUNDARY_SEARCH_MODES). This is a
+# behavioral change from 1.3.1, where boundary was NOT in DISCOVER_PATHS_FOR
+# and did not participate in PR forwarding.
+_BOUNDARY_PR_FORWARD = {"boundary"}
+_NON_DISCOVER_MODES = {"full", "point_to_point"}
 
-_ALL_MODES_FOR_GATING = sorted(_DISCOVER_PATHS_FOR_MODES | _NON_DISCOVER_MODES)
+_ALL_MODES_FOR_GATING = sorted(_DISCOVER_PATHS_FOR_MODES | _BOUNDARY_PR_FORWARD | _NON_DISCOVER_MODES)
 
 
 @pytest.mark.parametrize("transport_mode", _ALL_MODES_FOR_GATING)
@@ -232,13 +238,15 @@ _ALL_MODES_FOR_GATING = sorted(_DISCOVER_PATHS_FOR_MODES | _NON_DISCOVER_MODES)
         "start_tcp_server", "start_tcp_client", "request_path",
         "has_discovery_path_request",
     ],
-    verifies="A transport node forwards a path request for an unknown destination to its other interfaces only when the receiving interface's mode is in DISCOVER_PATHS_FOR (ACCESS_POINT, GATEWAY, ROAMING), asserting the discovery_path_requests membership exactly matches that gate",
+    verifies="A transport node forwards a path request for an unknown destination to its other interfaces only when the receiving interface's mode is in DISCOVER_PATHS_FOR (ACCESS_POINT, GATEWAY, ROAMING) OR is MODE_BOUNDARY (RNS 1.5.5 boundary PR-search carve-out, Transport.py:3430-3432), asserting the discovery_path_requests membership exactly matches that gate",
 )
 def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
     """When C sends a PR for an UNKNOWN destination to B, B must only
     forward the request to its other interfaces if B's receiving
     interface mode is in DISCOVER_PATHS_FOR = {ACCESS_POINT, GATEWAY,
-    ROAMING}.
+    ROAMING} OR is MODE_BOUNDARY (RNS 1.5.5 added a boundary carve-out to
+    the PR-search condition, Transport.py:3430-3432; in 1.3.1 boundary did
+    not forward).
 
     Observable: `B.has_discovery_path_request(UNKNOWN)` — a membership
     test on `Transport.discovery_path_requests`. That dict is populated
@@ -269,7 +277,10 @@ def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
     time.sleep(_LOCAL_STATE_SETTLE_SEC)
 
     observed = transport.has_discovery_path_request(unknown_hash)
-    expected = transport_mode in _DISCOVER_PATHS_FOR_MODES
+    expected = (
+        transport_mode in _DISCOVER_PATHS_FOR_MODES
+        or transport_mode in _BOUNDARY_PR_FORWARD
+    )
 
     assert observed == expected, (
         f"B ({transport.role_label}) with mode={transport_mode} "
@@ -278,7 +289,8 @@ def test_discover_paths_for_mode_gating(wire_3peer, transport_mode):
         f"{'forward' if expected else 'no forward'} because "
         f"{transport_mode} is "
         f"{'in' if expected else 'NOT in'} DISCOVER_PATHS_FOR "
-        f"(= {sorted(_DISCOVER_PATHS_FOR_MODES)})."
+        f"(= {sorted(_DISCOVER_PATHS_FOR_MODES)})"
+        f"{'+ boundary carve-out' if transport_mode in _BOUNDARY_PR_FORWARD else ''}."
     )
 
 

@@ -237,15 +237,15 @@ def test_optimise_mtu_tier_table(sut, reference):
 
 @conformance_case(
     commands=["interface_optimise_mtu"],
-    verifies="The optimise_mtu tier comparisons are STRICT > except the top tier (>=): exactly 750_000_000 lands in the 131072 tier (NOT 262144), exactly 5_000_000 lands in 4096 (NOT 8192), and exactly 62_500 falls below the lowest tier to None (NOT 1024); while exactly 1_000_000_000 is included in the top 524288 tier (>=). Each boundary discriminates the strict-vs-inclusive comparison and is anchored on the spec literal",
+    verifies="The optimise_mtu tier comparisons are INCLUSIVE >= for all tiers (RNS 1.5.5): exactly 1_000_000_000 lands in the 524288 tier, exactly 750_000_000 lands in the 262144 tier (inclusive boundary), exactly 5_000_000 lands in 8192 (inclusive), and exactly 62_500 lands in 1024 (inclusive lowest tier); 62_501 also lands in 1024. Each boundary is anchored on the spec literal",
 )
 def test_optimise_mtu_tier_boundaries(sut, reference):
     boundaries = [
         (1_000_000_000, 524288),  # >= top tier: inclusive
-        (750_000_000, 131072),    # > 750M is strict -> next tier down
-        (5_000_000, 4096),        # > 5M is strict -> next tier down
+        (750_000_000, 262144),    # >= 750M is inclusive -> top of that tier
+        (5_000_000, 8192),        # >= 5M is inclusive -> top of that tier
         (62_501, 1024),           # just above the lowest cutoff
-        (62_500, None),           # > 62500 is strict -> below lowest tier
+        (62_500, 1024),           # >= 62500 is inclusive -> in the lowest tier
     ]
     for impl, label in ((reference, "ref"), (sut, "sut")):
         for bitrate, expected in boundaries:
@@ -388,25 +388,30 @@ def test_kiss_stream_truncates_at_hw_mtu(sut, reference):
 
 @conformance_case(
     commands=["hdlc_deframe_stream", "kiss_deframe_stream"],
-    verifies="The HW_MTU in-frame cap is a KISS-path property, not HDLC: the standard-HDLC read loop (TCPInterface.py:380-398) has no per-byte HW_MTU gate, so an over-HW_MTU HDLC frame is delivered whole, whereas the identical-size payload under KISS is truncated to HW_MTU — pinning that the cap lives only in the byte-oriented KISS/Serial parser",
+    verifies="RNS 1.5.5 added an upper HW_MTU cap to the HDLC read loop (TCPInterface.check_frame_len: drop if frame_len > HW_MTU + ifac_size), so an over-HW_MTU HDLC frame is DROPPED (not delivered), while the identical-size payload under the byte-oriented KISS parser is TRUNCATED to HW_MTU — pinning the new asymmetric oversize handling: HDLC drops whole, KISS truncates",
 )
 def test_hdlc_stream_not_capped_by_hw_mtu(sut, reference):
     hw_mtu = 20
     payload = b"A" * 40  # 2x HW_MTU
-    for impl, label in ((reference, "ref"), (sut, "sut")):
+    for impl, label in ((sut, "sut"), (reference, "reference")):
+        # HDLC: RNS 1.5.5's check_frame_len drops a frame > HW_MTU + ifac_size
+        # (ifac_size=0 here, so > 20). The full 40-byte frame must be DROPPED,
+        # not delivered whole (the 1.3.1 behavior).
         hdlc = impl.execute(
             "hdlc_deframe_stream", stream=_hdlc_frame(payload).hex(), hw_mtu=hw_mtu
         )["frames"]
-        assert hdlc == [payload.hex()], (
-            f"{label}: HDLC read loop must NOT cap at HW_MTU — the full "
-            f"{len(payload)}-byte frame should be delivered; got lengths "
-            f"{[len(bytes.fromhex(x)) for x in hdlc]}"
+        assert hdlc == [], (
+            f"{label}: HDLC read loop must DROP a {len(payload)}-byte frame "
+            f"exceeding HW_MTU={hw_mtu} (check_frame_len upper cap, RNS 1.5.5); "
+            f"got {hdlc!r}"
         )
+        # KISS: the byte-oriented parser still TRUNCATES to HW_MTU (its per-byte
+        # gate is unchanged in 1.5.5).
         kiss = impl.execute(
             "kiss_deframe_stream", stream=_kiss_frame(payload).hex(), hw_mtu=hw_mtu
         )["frames"]
         assert kiss == [(b"A" * hw_mtu).hex()], (
-            f"{label}: same payload under KISS must truncate to {hw_mtu} bytes — "
-            f"the cap is KISS-only; got lengths "
+            f"{label}: same payload under KISS must truncate to {hw_mtu} bytes "
+            f"— the cap is KISS-only; got lengths "
             f"{[len(bytes.fromhex(x)) for x in kiss]}"
         )

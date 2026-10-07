@@ -1594,9 +1594,23 @@ def _drive_interface_rx(kiss_framing, stream, hw_mtu):
     stand_in = types.SimpleNamespace(
         online=True, detached=False, initiator=False,
         kiss_framing=kiss_framing, socket=_FeedSocket(stream), HW_MTU=hw_mtu,
+        ifac_size=0,
     )
     stand_in.process_incoming = lambda frame: delivered.append(frame)
     stand_in.teardown = lambda: None
+    # RNS 1.5.5's optimized read_loop (TCPInterface.py:read_loop) delegates the
+    # runt-drop / oversize check to two new instance methods, Interface
+    # .check_frame_len and .invalid_frame (TCPInterface.py:338-345), which the
+    # 1.3.1 read_loop inlined instead. The stand-in must provide them (plus
+    # ifac_size, which check_frame_len reads) or read_loop raises AttributeError,
+    # which its own except swallows and breaks the loop, delivering zero frames.
+    # Bind the REAL methods (no protocol logic reconstructed in the harness):
+    # check_frame_len runs RNS's own length policy (drop if <= HEADER_MINSIZE or
+    # > HW_MTU + ifac_size), invalid_frame runs RNS's own drop-logging.
+    stand_in.check_frame_len = types.MethodType(
+        TCPClientInterface.check_frame_len, stand_in)
+    stand_in.invalid_frame = types.MethodType(
+        TCPClientInterface.invalid_frame, stand_in)
     TCPClientInterface.read_loop(stand_in)
     return delivered
 
@@ -3140,6 +3154,16 @@ def cmd_discovery_build_announce_appdata(params):
     iface.discovery_bandwidth = fields.get('bandwidth')
     iface.discovery_channel = fields.get('channel')
     iface.discovery_modulation = fields.get('modulation')
+    # 1.5.5's announce builder reads discovery_location without a getattr guard
+    # (Discovery.py:142, the new location_cmd feature). Reticulum.py defaults it
+    # to None in the config path, but Interface.__init__ never sets it, so a
+    # programmatically-constructed stand-in must. Optional field: None = no
+    # location executable, lat/lon/height stay None.
+    iface.discovery_location = fields.get('location_cmd')
+    # 1.5.5's OP_ADDR feature reads this too (Discovery.py, after the location
+    # block). Same pattern: Reticulum.py defaults it to None in the config path,
+    # Interface.__init__ never sets it.
+    iface.discovery_lxmf_address = fields.get('discovery_lxmf_address')
 
     app_data = announcer.get_interface_announce_data(iface)
     if app_data is None:

@@ -579,6 +579,17 @@ def _ensure_wire_rns_started(config_dir: str):
     global _shared_wire_rns, _shared_wire_config_dir
     RNS = _get_rns()
 
+    # RNS 1.5 introduced an async inbound queue (Transport.USE_INBOUND_QUEUE,
+    # default True): preprocess_inbound enqueues and a background inbound_job
+    # thread drains it. Wire tests observe link/channel state (window growth,
+    # keepalive answers, receipts) immediately after a real TCP exchange; the
+    # async queue defers the processing that drives those state transitions,
+    # making the tests race the background thread. Disable the queue in the
+    # harness so inbound is synchronous (matching the 1.3.1 model the tests
+    # were written against). _inbound is the same code path either way; only
+    # the caller changes (inline vs background thread).
+    RNS.Transport.USE_INBOUND_QUEUE = False
+
     if _shared_wire_rns is None:
         # Adopt an existing Reticulum singleton if one is already running
         # (started by another module path in this bridge process). In
@@ -4008,6 +4019,14 @@ def cmd_wire_send_keepalive_probe(params):
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
     value = bytes.fromhex(params.get("value", "ff"))
+    # RNS 1.5.5 (commit e64d8150) rate-limits the non-initiator's 0xFE answer:
+    # it only answers a 0xFF keepalive when `now >= last_outbound + keepalive`
+    # (Link.py:1132). This prevents keepalive storms but means a probe on a
+    # fresh link (last_outbound recent) is suppressed. Pass force_keepalive_due
+    # to backdate last_outbound so the answer path is observable deterministically
+    # (it does NOT change the answer logic - only the timer input, as a test
+    # harness would set time).
+    force_keepalive_due = bool(params.get("force_keepalive_due", False))
 
     with _instances_lock:
         inst = _instances.get(handle)
@@ -4016,6 +4035,12 @@ def cmd_wire_send_keepalive_probe(params):
     link = _find_link_by_id(inst, link_id)
     if link is None:
         raise ValueError(f"Unknown link_id: {link_id.hex()}")
+
+    if force_keepalive_due:
+        try:
+            link.last_outbound = 0  # force now >= last_outbound + keepalive
+        except Exception:
+            pass
 
     store = inst.setdefault("keepalive_payloads", {})
 
@@ -4150,6 +4175,39 @@ def _ensure_channel_state(inst, link_id):
     channel.add_message_handler(_on_message)
     state = {"channel": channel, "received": received, "lock": rlock}
     channels[link_id] = state
+
+    # Two loopback-timing adjustments so the channel window behaves deterministically
+    # under CI CPU contention (the reference is driven over a loopback TCP link,
+    # rtt ~1ms, on a 2-vCPU runner).
+    #
+    # (a) Raise the per-packet timeout floor. RNS's Channel._get_packet_timeout_time
+    # floors at ~37ms on this link - far tighter than any real link. Under load the
+    # Transport jobloop is starved and only ticks ~1s apart, so a proof whose wire
+    # round-trip is sub-ms but whose delivery callback is merely CPU-delayed can miss
+    # the 37ms deadline and fire a spurious _packet_timeout. That is NOT self-
+    # correcting: the timeout does window -= 1 (Channel.py:475) and resends, but the
+    # resent packet's proof finds the envelope already removed by the original
+    # proof's _packet_tx_op, so it no-ops - netting the send to 0 growth instead of
+    # +1, leaving the window permanently one behind even though the late proof still
+    # reports delivered=True. The floor must exceed the worst-case delayed proof
+    # callback under load (~1-2s on a contended 2-vCPU runner; the jobloop tick
+    # interval) and stay low enough that a genuine-loss send still reaches its 5th
+    # retransmit within the drop-acks test's 20s wait (4 waits * 3s = 12s < 20s).
+    _orig_ptt = channel._get_packet_timeout_time
+    _CHANNEL_TIMEOUT_FLOOR_S = 3.0
+    def _load_tolerant_channel_timeout(tries):
+        return max(_orig_ptt(tries), _CHANNEL_TIMEOUT_FLOOR_S)
+    channel._get_packet_timeout_time = _load_tolerant_channel_timeout
+
+    # (b) Lengthen the link's stale watchdog. drop_acks retransmission tests
+    # suppress inbound proofs, so the link's last_inbound never advances and RNS's
+    # stale watchdog (default 10s) would tear the link down mid-sequence before the
+    # channel's own 5-try exhaustion does. With the (a) floor, 5 retransmit waits
+    # take 5*3s = 15s; 30s gives wide margin for the channel's teardown to win the
+    # race. The teardown still comes from the channel (_max_tries exhausted), not
+    # the watchdog, so the tests' teardown assertions are unchanged.
+    link.stale_time = 30.0
+
     return state
 
 
@@ -5111,6 +5169,13 @@ def cmd_wire_buffer_stream(params):
             }
 
         writer = RawChannelWriter(stream_id, channel)
+        # RNS 1.5.5 (commit df801810 "Utilize full link MDU in RawChannelWriter")
+        # chunks raw (incompressible) writes at the LIVE link MDU
+        # (writer._mdu = channel.mdu - StreamDataMessage.HEADER_LEN, Buffer.py),
+        # not the fixed StreamDataMessage.MAX_DATA_LEN constant. The eof_with_data
+        # "final write" decision must key off the same live cap, or the EOF flag
+        # lands on a separate empty message instead of the last data-bearing one.
+        _live_chunk_cap = writer._mdu
         remaining = data
         total = 0
         write_returns = []
@@ -5121,7 +5186,7 @@ def cmd_wire_buffer_stream(params):
             # eof_with_data: flag EOF on the final data-bearing write so its
             # StreamDataMessage carries both payload and the EOF marker. The
             # final write is the one whose remaining fits a single message.
-            if eof_with_data and len(remaining) <= StreamDataMessage.MAX_DATA_LEN:
+            if eof_with_data and len(remaining) <= _live_chunk_cap:
                 writer._eof = True
             n = writer.write(remaining)
             if n and n > 0:
@@ -5167,7 +5232,16 @@ def cmd_wire_buffer_stream(params):
             "eof": True,
             "manifest": manifest,
             "write_returns": write_returns,
-            "max_data_len": int(StreamDataMessage.MAX_DATA_LEN),
+            # RNS 1.5.5 (df801810) chunks raw writes at the live link MDU, not
+            # the fixed constant. Report BOTH so a test can verify the contract
+            # self-consistently: `max_data_len` is the cap the writer actually
+            # used (writer._mdu = channel.mdu - HEADER_LEN); `fixed_max_data_len`
+            # is the StreamDataMessage.MAX_DATA_LEN constant (the 1.3.1 cap and
+            # the value 1.5.5 uses as a fallback). `channel_mdu` is the live
+            # channel.mdu the cap was derived from.
+            "max_data_len": int(_live_chunk_cap),
+            "fixed_max_data_len": int(StreamDataMessage.MAX_DATA_LEN),
+            "channel_mdu": int(channel.mdu),
             "max_chunk_len": int(RawChannelWriter.MAX_CHUNK_LEN),
             "compression_tries": int(RawChannelWriter.COMPRESSION_TRIES),
             "tx_ring_after": tx_ring_after,
@@ -7692,6 +7766,16 @@ def cmd_wire_inject_resource_adv_flags(params):
     handle = params["handle"]
     link_id = bytes.fromhex(params["link_id"])
     variant = params["variant"]
+    # RNS 1.5.5 (commit 3a36c367 "Improved resource handling") gates the
+    # is_request advertisement branch on `self.destination.request_handlers`
+    # being non-empty (Link.py:1037); 1.3.1 accepted a request adv
+    # unconditionally (Link.py:1070-1071). Pass register_request_handler=True to
+    # register a minimal request handler on the link's destination so the
+    # is_request-accepted path is observable (the "bypasses ACCEPT_NONE" property
+    # is unchanged in 1.5.5 - the is_request branch still runs before the
+    # strategy branches - only the precondition changed). The handler is saved
+    # and restored, like the resource_strategy.
+    register_request_handler = bool(params.get("register_request_handler", False))
     with _instances_lock:
         inst = _instances.get(handle)
     if inst is None:
@@ -7724,12 +7808,29 @@ def cmd_wire_inject_resource_adv_flags(params):
         )
 
     saved_strategy = link.resource_strategy
+    # 1.5.5 (3a36c367) gates the is_request branch on destination.request_handlers
+    # being non-empty. Register a minimal handler (save/restore) to make the
+    # accepted path observable without polluting the link's destination.
+    saved_handlers = None
+    saved_max_request_size = None
+    if register_request_handler and hasattr(link, "destination") and link.destination is not None:
+        saved_handlers = link.destination.request_handlers
+        saved_max_request_size = getattr(link.destination, "max_request_size", None)
+        link.destination.request_handlers = {
+            b"conformance/adv-flags":
+                None  # any entry makes the dict truthy; the is_request accept
+                      # gate (Link.py:1037) only checks `if
+                      # self.destination.request_handlers:`, not the key/value.
+        }
     before = _count_for_hash()
     link.resource_strategy = strategy
     try:
         link.receive(rx)
     finally:
         link.resource_strategy = saved_strategy
+        if saved_handlers is not None:
+            link.destination.request_handlers = saved_handlers
+            link.destination.max_request_size = saved_max_request_size
     after = _count_for_hash()
     accepted = after > before
 

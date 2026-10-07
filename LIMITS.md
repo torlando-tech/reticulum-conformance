@@ -2,7 +2,7 @@
 
 This suite verifies an implementation's **byte-level cryptography/encoding**
 and its **wire-protocol interop as an endpoint and single-hop transport**
-against real Python RNS 1.3.1 over loopback TCP. A green run is strong
+against real Python RNS 1.5.5 over loopback TCP. A green run is strong
 evidence of correctness for everything it exercises — but the harness
 architecture **cannot** observe the behaviors below. They are out of scope by
 construction, not merely untested; an implementer must validate them by other
@@ -33,7 +33,7 @@ CONFORMANCE_COMPLETENESS.md §2 for the architectural analysis.)
   SUT library; only assertions anchored on the *reference peer's* side of a
   heterogeneous exchange are structurally honest.
 
-## Specific RNS 1.3.1 behaviors deferred as out-of-scope here
+## Specific RNS 1.5.5 behaviors deferred as out-of-scope here
 
 These were reached during the completeness build and confirmed to require one of
 the ceilings above (sockets/threads, real timing, >1 hop, persistence, or a live
@@ -72,7 +72,7 @@ Identity/Channel/Resource classes (which pull in MsgPack and a live Transport
 state machine) are **not compiled**.
 
 Everything the suite drives outside the gaps below runs and passes against real
-Python RNS 1.3.1. The gated run scopes out **only** the families the fork
+Python RNS 1.5.5. The gated run scopes out **only** the families the fork
 genuinely cannot support (capability gaps — not hidden failures):
 
 - **Discovery module** (`test_discovery_*`): the fork has no `RNS.Discovery`

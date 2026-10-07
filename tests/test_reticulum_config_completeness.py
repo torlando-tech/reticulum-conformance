@@ -95,21 +95,42 @@ def test_header1_minsize_is_19(sut, reference):
                 f"{_HEADER_MINSIZE}"
             )
 
-    # The empty-payload frame is exactly the minimum header (19 bytes) and must
-    # unpack (positive: an impl requiring >=20 bytes fails here)...
+    # A 1-byte-payload frame (20 bytes = 19 overhead + 1 data) must unpack.
+    # (RNS 1.5.5 commit d80245b6 added a zero-length data rejection to
+    # Packet.unpack; the empty-payload 19-byte frame is now rejected, so the
+    # positive unpack check uses a minimal non-empty payload.)
     minimal = sut.execute(
+        "packet_build",
+        dest_type="plain", packet_type=_PTYPE_DATA,
+        context=0, context_flag=0, hops=0, data="00",
+    )
+    raw = bytes.fromhex(minimal["raw"])
+    assert len(raw) == _HEADER_MINSIZE + 1, (
+        f"1-byte-payload PLAIN frame is {len(raw)} bytes; must equal "
+        f"HEADER_MINSIZE + 1 == {_HEADER_MINSIZE + 1}"
+    )
+    accepted = sut.execute("packet_unpack", raw=raw.hex())
+    assert accepted["unpacked"] is True, (
+        f"a {_HEADER_MINSIZE + 1}-byte HEADER_1 frame must unpack"
+    )
+
+    # The empty-payload 19-byte frame (zero-length data field) is now REJECTED
+    # by RNS 1.5.5 (Packet.unpack: "Zero-length data field"). An impl that
+    # still accepts zero-data packets would pass here (regression).
+    empty = sut.execute(
         "packet_build",
         dest_type="plain", packet_type=_PTYPE_DATA,
         context=0, context_flag=0, hops=0, data="",
     )
-    raw = bytes.fromhex(minimal["raw"])
-    assert len(raw) == _HEADER_MINSIZE, (
-        f"empty-payload PLAIN frame is {len(raw)} bytes; must equal "
+    empty_raw = bytes.fromhex(empty["raw"])
+    assert len(empty_raw) == _HEADER_MINSIZE, (
+        f"empty-payload PLAIN frame is {len(empty_raw)} bytes; must equal "
         f"HEADER_MINSIZE == {_HEADER_MINSIZE}"
     )
-    accepted = sut.execute("packet_unpack", raw=raw.hex())
-    assert accepted["unpacked"] is True, (
-        f"a minimal {_HEADER_MINSIZE}-byte HEADER_1 frame must unpack"
+    empty_rejected = sut.execute("packet_unpack", raw=empty_raw.hex())
+    assert empty_rejected["unpacked"] is False, (
+        f"an empty-payload {_HEADER_MINSIZE}-byte HEADER_1 frame (zero-length "
+        f"data) must be rejected by RNS 1.5.5"
     )
 
     # ...while one byte short of the minimum header is rejected (negative).

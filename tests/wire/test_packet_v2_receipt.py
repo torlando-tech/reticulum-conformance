@@ -124,13 +124,16 @@ def test_packet_receipt_timeout_defaults(wire_pair_started):
     commands=["start_tcp_server", "start_tcp_client", "packet_receipt_generation"],
     verifies=(
         "Transport.outbound's generate_receipt gate requires the packet to be DATA "
-        "(Transport.py:1097): with create_receipt=True on a SINGLE destination and "
-        "the NONE context, a DATA packet DOES get a PacketReceipt, but an ANNOUNCE, "
-        "a LINKREQUEST, and a PROOF packet each get NO receipt — even though every "
+        "(Transport.py:1359-1361): with create_receipt=True on a SINGLE destination "
+        "and the NONE context, a DATA packet DOES get a PacketReceipt, but a "
+        "LINKREQUEST and a PROOF packet each get NO receipt - even though every "
         "one is actually transmitted (sent=True), so the absent receipt is the "
-        "packet-type clause firing, not a failed send. An impl that attached a "
-        "receipt to an announce/link-request/proof would track deliveries that "
-        "never produce a proof"
+        "packet-type clause firing, not a failed send. An ANNOUNCE is a separate "
+        "1.5.5 case: the announce-broadcast gate (Transport.py:1458-1468) blocks "
+        "an unsolicited ANNOUNCE before packet_sent runs, so it is not transmitted "
+        "(sent=False) and its absent receipt is that gate, not the DATA clause. An "
+        "impl that attached a receipt to a link-request/proof would track "
+        "deliveries that never produce a proof."
     ),
 )
 def test_receipt_generation_packet_type_clause(wire_pair_started):
@@ -145,9 +148,10 @@ def test_receipt_generation_packet_type_clause(wire_pair_started):
     )
 
     # Negatives: a non-DATA packet on the SAME SINGLE destination + NONE context
-    # gets NO receipt, while still being transmitted.
+    # gets NO receipt, while still being transmitted. LINKREQUEST and PROOF
+    # transmit normally (they are not caught by the ANNOUNCE-specific broadcast
+    # gate), so their absent receipt is the receipt DATA clause firing.
     for packet_type, name in (
-        (_PT_ANNOUNCE, "ANNOUNCE"),
         (_PT_LINKREQUEST, "LINKREQUEST"),
         (_PT_PROOF, "PROOF"),
     ):
@@ -168,3 +172,30 @@ def test_receipt_generation_packet_type_clause(wire_pair_started):
             f"{name}: Transport.outbound must NOT attach a receipt to a non-DATA "
             f"packet: {res!r}"
         )
+
+    # ANNOUNCE is a separate case in RNS 1.5.5: the announce-broadcast gate
+    # (Transport.py:1458-1468) blocks an unsolicited ANNOUNCE (no attached
+    # interface, unknown destination) BEFORE packet_sent runs, so it is never
+    # transmitted and can never carry a receipt. Its absent receipt is the
+    # ANNOUNCE gate, not the receipt DATA clause the test otherwise pins.
+    ann = client.packet_receipt_generation(
+        dest_type="single", context=_CTX_NONE, packet_type=_PT_ANNOUNCE,
+    )
+    assert ann["packet_type"] == _PT_ANNOUNCE, (
+        f"ANNOUNCE: bridge built the wrong packet_type: {ann!r}"
+    )
+    assert ann["create_receipt_flag"] is True, (
+        f"ANNOUNCE: create_receipt must be set: {ann!r}"
+    )
+    assert ann["has_receipt"] is False, (
+        f"ANNOUNCE: must not carry a receipt: {ann!r}"
+    )
+    # 1.5.5: the unsolicited ANNOUNCE is blocked by the broadcast gate, so it is
+    # not transmitted (1.3.1 broadcast it unconditionally, so sent was True and
+    # the no-receipt was the receipt DATA clause; 1.5.5 the no-receipt is the
+    # ANNOUNCE gate).
+    assert ann["sent"] is False, (
+        f"ANNOUNCE: 1.5.5's announce-broadcast gate blocks an unsolicited "
+        f"ANNOUNCE (no attached interface, unknown dest) before packet_sent, so "
+        f"it must NOT be transmitted: {ann!r}"
+    )

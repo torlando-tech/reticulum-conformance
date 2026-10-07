@@ -17,8 +17,8 @@ import _rns_paths as p
 
 # The audited ground-truth release tags. Bump here (and the ref: pins in
 # tests.yml) together when re-auditing against a new RNS/LXMF release.
-EXPECTED_RNS = "1.3.1"
-EXPECTED_LXMF = "0.9.9"
+EXPECTED_RNS = "1.5.5"
+EXPECTED_LXMF = "1.2.0"
 
 
 def version_of(pkg, env_var):

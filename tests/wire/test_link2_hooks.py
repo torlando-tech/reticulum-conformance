@@ -53,10 +53,10 @@ _CTX_RESPONSE = 0x0A
 _RETICULUM_MTU = 500
 # TCP interface BITRATE_GUESS is 10 Mbps (TCPInterface.py:76). With
 # AUTOCONFIGURE_MTU, Interface.optimise_mtu (Interface.py:198-221) maps the
-# bitrate to a hardware MTU: 10_000_000 is NOT > 10_000_000 but IS > 5_000_000,
-# so it lands in the 8192 branch. The class-level TCPInterface.HW_MTU constant
-# (262144) is the pre-autoconfigure ceiling, not the live value.
-_TCP_HW_MTU = 8192
+# bitrate to a hardware MTU: 10_000_000 IS >= 10_000_000, so it lands in the
+# 16384 branch. The class-level TCPInterface.HW_MTU constant (262144) is the
+# pre-autoconfigure ceiling, not the live value.
+_TCP_HW_MTU = 16384
 
 # RNS.Reticulum.TRUNCATED_HASHLENGTH == 128 bits -> request_id is 16 bytes.
 _TRUNC_HASH_BYTES = 16
@@ -226,7 +226,7 @@ def test_large_response_forks_to_resource_not_response_packet(wire_link_setup):
         "start_tcp_server", "start_tcp_client", "listen", "poll_path",
         "link_open", "interface_hw_mtu", "link_mtu",
     ],
-    verifies="Link MTU discovery (Link.py:309-314, Reticulum.LINK_MTU_DISCOVERY default True): with discovery ON the initiator signals its next-hop interface HW MTU (autoconfigured to 8192 from the 10 Mbps TCP bitrate per Interface.optimise_mtu) and the negotiated link MTU settles on exactly that value — elevated above the 500-byte Reticulum.MTU baseline used when discovery is off.",
+    verifies="Link MTU discovery (Link.py:309-314, Reticulum.LINK_MTU_DISCOVERY default True): with discovery ON the initiator signals its next-hop interface HW MTU (autoconfigured to 16384 from the 10 Mbps TCP bitrate per Interface.optimise_mtu) and the negotiated link MTU settles on exactly that value — elevated above the 500-byte Reticulum.MTU baseline used when discovery is off.",
 )
 def test_discovery_on_negotiates_link_mtu_to_hw_mtu(wire_peers):
     server, client = wire_peers
@@ -241,7 +241,7 @@ def test_discovery_on_negotiates_link_mtu_to_hw_mtu(wire_peers):
     )
     assert cfg["hw_mtu"] == _TCP_HW_MTU, (
         f"autoconfigured TCP interface HW MTU expected {_TCP_HW_MTU} (10 Mbps -> "
-        f"8192 branch of Interface.optimise_mtu), got {cfg['hw_mtu']!r}"
+        f"16384 branch of Interface.optimise_mtu), got {cfg['hw_mtu']!r}"
     )
     assert cfg["autoconfigure_mtu"] is True and cfg["fixed_mtu"] is False, (
         f"default TCP interface should autoconfigure MTU (not fixed): {cfg!r}"

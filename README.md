@@ -1,7 +1,7 @@
 # Reticulum Conformance Suite
 
 A cross-implementation conformance test suite for [Reticulum](https://reticulum.network/).
-It pins a new Reticulum implementation against the **RNS 1.3.1** reference,
+It pins a new Reticulum implementation against the **RNS 1.5.5** reference,
 byte-for-byte where the wire format demands it, by driving both the reference
 and the system-under-test (SUT) through a uniform **bridge** protocol and
 comparing their behavior on the same inputs.
@@ -18,7 +18,7 @@ comparing their behavior on the same inputs.
 A SUT that implements the full bridge command surface and passes
 `pytest tests/ --impl=<name>` green supports exactly this claim, and no more:
 
-> *Byte-accurate on RNS 1.3.1 cryptography, identity, wire formats, and the
+> *Byte-accurate on RNS 1.5.5 cryptography, identity, wire formats, and the
 > announce / path / link / channel / buffer / resource / IFAC protocol state
 > machines, as an endpoint and one-hop transport over TCP.*
 
@@ -130,7 +130,7 @@ and `reference/wire_tcp.py` for the canonical reference bridge.
 - `tests/` — the conformance tests (`tests/wire/`, `tests/behavioral/`, plus the
   primitive suites). `integration/` drives real in-process RNS (pipe / three-node
   sessions) and runs reference-only.
-- `reference/` — the canonical reference bridge (RNS 1.3.1).
+- `reference/` — the canonical reference bridge (RNS 1.5.5).
 - `tools/` — `kotlin_gap.py` (command-surface gap), `audit_bridge_delegation.py`
   and `check_conformance_decorated.py` (honesty gates).
 - `CONFORMANCE_COMPLETENESS_V3.md` — the current completeness evaluation and the

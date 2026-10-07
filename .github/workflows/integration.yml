@@ -30,7 +30,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies (RNS/LXMF pinned to audited ground truth)
-        run: pip install pytest "rns==1.3.1" "lxmf==0.9.9"
+        run: pip install pytest "rns==1.5.5" "lxmf==1.2.0"
 
       - name: Assert RNS/LXMF versions match audited ground truth
         run: |
@@ -39,14 +39,14 @@ jobs:
           import RNS, LXMF
           print(f"RNS {RNS.__version__}, LXMF {LXMF.__version__}")
           errs = []
-          if RNS.__version__ != "1.3.1":
-              errs.append(f"RNS {RNS.__version__} != 1.3.1")
-          if LXMF.__version__ != "0.9.9":
-              errs.append(f"LXMF {LXMF.__version__} != 0.9.9")
+          if RNS.__version__ != "1.5.5":
+              errs.append(f"RNS {RNS.__version__} != 1.5.5")
+          if LXMF.__version__ != "1.2.0":
+              errs.append(f"LXMF {LXMF.__version__} != 1.2.0")
           if errs:
               print("::error::not running against audited ground truth: " + "; ".join(errs))
               sys.exit(1)
-          print("OK: RNS 1.3.1 / LXMF 0.9.9")
+          print("OK: RNS 1.5.5 / LXMF 1.2.0")
           PY
 
       - name: Run integration suite (--python-only) with min-passed guard

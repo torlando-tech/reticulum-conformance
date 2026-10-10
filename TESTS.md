@@ -1159,13 +1159,14 @@ HDLC and KISS are byte-stuffing protocols for framing variable-length data on a 
 |---|------|--------------|-----------------|
 | 31.1 | `test_blackhole_permanent_until_none` | `start`, `blackhole_identity`, `blackhole_clear_storage`, `blackhole_storage_files`, `read_blackhole_table`, `blackhole_clear`, `blackhole_reload` | until=None is the DEFAULT of Transport.blackhole_identity (Transport.py:3407,3418) and means no expiry: the recorded entry's until is None, and after persist_blackhole + clearing the in-memory table, reload_blackhole RESTORES it because the reload guard is `until == None or now < until` (Transport.py:3482). A second entry whose until is in the PAST is NOT restored by the same reload — proving None is treated as permanent, not as already-expired. Anchored on independent minted identity hashes and a chosen past timestamp. |
 
-## 32. Interface Mode (Behavioral) (1 test)
+## 32. Interface Mode (Behavioral) (2 tests)
 
 **File:** `tests/behavioral/test_interface_mode_internal.py`
 
 | # | Test | Commands Used | What It Verifies |
 |---|------|--------------|-----------------|
 | 32.1 | `test_internal_mode_constant_and_discovery` | `start`, `attach_mock_interface`, `read_interface_mode` | INTERNAL is a distinct interface mode (constant 0x07, RNS 1.3.6+) that participates in path discovery (DISCOVER_PATHS_FOR, Interface.py:55) with the base announce attributes the re-broadcast gate reads (Interface.py:122-123, Transport.py:1471-1490): an INTERNAL-mode interface reports mode=0x07, announces_from_internal=True, announces_to_internal=None, discover_paths=True, distinct from FULL (0x01, no path discovery) |
+| 32.2 | `test_internal_egress_blocks_boundary_next_hop_rebroadcast` | `start`, `attach_mock_interface`, `announce_build`, `inject`, `read_path_table`, `read_announce_table`, `set_announce_timestamp`, `force_cull`, `drain_tx` | The internal-mode announce re-broadcast rule (Transport.py:1479-1490): when the announce re-broadcast gate evaluates an INTERNAL-mode egress interface for a non-local announce whose next hop is a BOUNDARY-mode interface, it BLOCKS the re-broadcast, while a BOUNDARY-mode egress interface (Transport.py:1505-1516, which blocks only ROAMING next-hops) re-broadcasts the same announce - so INTERNAL egress is distinguishable from BOUNDARY egress on a BOUNDARY next hop |
 
 ## 33. Config Parsing Hooks (10 tests)
 

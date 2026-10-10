@@ -36,7 +36,14 @@ proves the readback is not vacuous - a conformant port reports the FULL constant
 coerces every mode to a single value would still fail the INTERNAL assertions.
 """
 
+import secrets
+import time
+
 from conformance import conformance_case
+from tests.behavioral.packet_builders import (
+    build_announce_from_destination,
+    first_announce,
+)
 
 # Reference-implementation mode constants (RNS/Interfaces/Interface.py:45-51).
 # Pinned as spec literals so the test does not depend on the bridge importing
@@ -121,6 +128,127 @@ def test_internal_mode_constant_and_discovery(behavioral):
         assert internal["mode"] != full["mode"], (
             "INTERNAL and FULL interfaces report the same mode constant; INTERNAL "
             "is not a distinct mode"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "announce_build", "inject",
+              "read_path_table", "read_announce_table", "set_announce_timestamp",
+              "force_cull", "drain_tx"],
+    verifies=(
+        "The internal-mode announce re-broadcast rule (Transport.py:1479-1490): "
+        "when the announce re-broadcast gate evaluates an INTERNAL-mode egress "
+        "interface for a non-local announce whose next hop is a BOUNDARY-mode "
+        "interface, it BLOCKS the re-broadcast, while a BOUNDARY-mode egress "
+        "interface (Transport.py:1505-1516, which blocks only ROAMING next-hops) "
+        "re-broadcasts the same announce - so INTERNAL egress is distinguishable "
+        "from BOUNDARY egress on a BOUNDARY next hop"
+    ),
+)
+def test_internal_egress_blocks_boundary_next_hop_rebroadcast(behavioral):
+    """Drive one announce retransmit whose next hop is BOUNDARY and observe the
+    per-egress-interface decision of the internal-mode re-broadcast gate.
+
+    Setup: an announce arrives on `boundary` (a BOUNDARY-mode interface), which
+    learns a path to the announcer whose received-on (next-hop) interface is
+    `boundary` itself and schedules a local retransmit. Making the entry due and
+    running one jobs() pass fires the retransmit: it is a re-broadcast
+    (attached_interface=None), so it fans out to every OUT egress interface and
+    the per-interface announce gate (Transport.py:1459) runs for each. The next
+    hop interface is `boundary` (BOUNDARY mode), which is the gate's
+    from_interface.
+
+    Expected: the INTERNAL egress interface blocks the re-broadcast (the
+    INTERNAL branch, Transport.py:1479-1490: from_interface is BOUNDARY ->
+    should_transmit=False), while the second BOUNDARY egress interface
+    re-broadcasts it (the BOUNDARY branch, Transport.py:1505-1516, blocks only
+    ROAMING next-hops) - the positive control proving the retransmit actually
+    fired and the block is specific to INTERNAL egress.
+
+    HARD-FAIL capture: passes on the Python transport (the reference resolves
+    INTERNAL to 0x07 and implements the gate); fails on the Kotlin transport at
+    the INTERNAL attach (reticulum-kt's InterfaceMode enum has no INTERNAL and
+    the bridge's parseMode rejects the string) until that work lands on
+    reticulum-kt main, at which point the real gate assertion runs and the test
+    self-clears with no edit here.
+    """
+    inst = behavioral.start(enable_transport=True)
+    try:
+        # `boundary` is the ingress AND the path's next hop (received-on).
+        # `boundary2` and `internal` are the two egress probes: a BOUNDARY
+        # positive control and the INTERNAL subject under test. Distinct
+        # per-interface announce ingress-burst control is avoided because only
+        # ONE announce is injected.
+        boundary = inst.attach_mock_interface("boundary", mode="BOUNDARY")
+        boundary2 = inst.attach_mock_interface("boundary2", mode="BOUNDARY")
+        internal = inst.attach_mock_interface("internal", mode="INTERNAL")
+
+        # Inject a real announce on `boundary`: learns the path (next hop =
+        # boundary, BOUNDARY mode) and schedules the local retransmit with
+        # attached_interface=None (the re-broadcast form).
+        raw, dest, _ = build_announce_from_destination(
+            behavioral.bridge, identity_private_key=secrets.token_bytes(64),
+            app_name="intgate", aspects=["egress"], emission_ts=1_000_000_100,
+            wire_hops=1,
+        )
+        inst.inject(boundary, raw)
+        path = inst.read_path_table(dest)
+        assert path["found"], "announce did not learn a path"
+        # Confirm the next hop is the BOUNDARY ingress interface - the gate's
+        # from_interface. If the path table pointed elsewhere the gate would be
+        # testing a different next-hop mode and this would not exercise the
+        # INTERNAL branch.
+        assert path["receiving_interface_hash"] is not None
+        ann = inst.read_announce_table(dest)
+        assert ann["found"], "announce did not schedule a local retransmit"
+
+        # Make the retransmit due and fire exactly one jobs() pass. The retransmit
+        # is emitted on a spawned thread (Transport.py:1222-1223 ->
+        # handle_outgoing_announces), so poll the egress queues on a wall-clock
+        # deadline rather than reading once.
+        inst.set_announce_timestamp(dest, retransmit_timeout=0)
+        inst.force_cull()
+
+        def _poll_emitted(iface_id, deadline_s=10.0):
+            """Return the egress bytes on `iface_id` once at least one announce is
+            present or the wall-clock deadline elapses (whichever first)."""
+            deadline = time.time() + deadline_s
+            while True:
+                got = inst.drain_tx(iface_id)
+                if first_announce(got) is not None:
+                    return got
+                if time.time() >= deadline:
+                    return got
+                time.sleep(0.05)
+
+        # Positive control: the BOUNDARY egress re-broadcasts the announce
+        # (the BOUNDARY branch blocks only ROAMING next-hops; the next hop is
+        # BOUNDARY). This proves the retransmit actually fired, so a missing
+        # emission on the INTERNAL egress is a real block, not a no-op pass.
+        boundary2_out = _poll_emitted(boundary2)
+        assert first_announce(boundary2_out) is not None, (
+            "positive control failed: the BOUNDARY egress interface did not "
+            "re-broadcast the announce whose next hop is BOUNDARY; the "
+            "retransmit did not fire (or the egress model diverges), so the "
+            "INTERNAL-block assertion below would be vacuous"
+        )
+
+        # The distinctive INTERNAL rule: the INTERNAL egress interface does NOT
+        # re-broadcast the same announce (the INTERNAL branch sees a BOUNDARY
+        # next hop and blocks). A short deadline suffices here (vs the positive
+        # control's): the re-broadcast fans out to every egress interface in a
+        # single send() pass (Transport.handle_outgoing_announces), so once the
+        # positive control above observed the emission, this interface's
+        # (non-)emission was decided in that same pass - any 3s is orders of
+        # magnitude past the spawned thread's queue append.
+        internal_out = _poll_emitted(internal, deadline_s=3.0)
+        assert first_announce(internal_out) is None, (
+            "INTERNAL egress re-broadcast an announce whose next hop is a "
+            "BOUNDARY-mode interface; the internal-mode re-broadcast gate "
+            "(Transport.py:1479-1490) must block BOUNDARY next-hops on an "
+            "INTERNAL-mode interface"
         )
     finally:
         behavioral.cleanup()

@@ -43,7 +43,15 @@ from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     build_announce_from_destination,
     first_announce,
+    HEADER_2,
+    DESTINATION_TYPE_SINGLE,
+    PACKET_TYPE_ANNOUNCE,
 )
+
+# Transport-type nibble for a transport relay packet (RNS/Transport.py:102,
+# TRANSPORT = 0x01). Pinned as a spec literal like the other RNS constants here
+# so the test does not depend on the bridge importing the module.
+TRANSPORT_TYPE_TRANSPORT = 0x01
 
 # Reference-implementation mode constants (RNS/Interfaces/Interface.py:45-51).
 # Pinned as spec literals so the test does not depend on the bridge importing
@@ -240,11 +248,57 @@ def test_internal_egress_blocks_boundary_next_hop_rebroadcast(behavioral):
         # BOUNDARY). This proves the retransmit actually fired, so a missing
         # emission on the INTERNAL egress is a real block, not a no-op pass.
         boundary2_out = _poll_emitted(boundary2)
-        assert first_announce(boundary2_out) is not None, (
+        reemit = first_announce(boundary2_out)
+        assert reemit is not None, (
             "positive control failed: the BOUNDARY egress interface did not "
             "re-broadcast the announce whose next hop is BOUNDARY; the "
             "retransmit did not fire (or the egress model diverges), so the "
             "INTERNAL-block assertion below would be vacuous"
+        )
+        # The re-emitted bytes must be the SAME announce in the transport relay
+        # form, not a coincidental emission. The retransmit rebuilds the packet
+        # as a HEADER_2 TRANSPORT announce (Transport.py:800-810) carrying:
+        #   - destination_hash = the announcer's destination (the one we learned
+        #     a path to);
+        #   - transport_id = THIS node's identity (Transport.identity.hash) -
+        #     the re-broadcasting node stamps itself as the transport relay;
+        #   - hops = received hops + 1 (the per-hop +1 on receive; wire_hops=1
+        #     in -> 2 out);
+        #   - header_type=HEADER_2 (transport), transport_type=TRANSPORT,
+        #     packet_type=ANNOUNCE, destination_type=SINGLE.
+        # Asserting the transport_id == our identity and the destination_hash ==
+        # the announcer's dest pins that this is the re-broadcast of the exact
+        # injected announce, not an unrelated one that happened to flow.
+        assert reemit["destination_hash"] == dest, (
+            f"re-emitted announce targets {reemit['destination_hash'].hex()} but "
+            f"the learned announcer is {dest.hex()}; the positive control is not "
+            f"re-broadcasting the injected announce"
+        )
+        assert reemit["transport_id"] == inst.identity_hash, (
+            f"re-emitted announce transport_id {reemit['transport_id'].hex()} is "
+            f"not this node's identity {inst.identity_hash.hex()}; the "
+            f"re-broadcast must be stamped with the re-broadcasting node "
+            f"(Transport.identity.hash, Transport.py:807)"
+        )
+        assert reemit["hops"] == 2, (
+            f"re-emitted announce carries hops={reemit['hops']}; the +1-on-receive "
+            f"increment (injected wire_hops=1 -> 2 out) must hold"
+        )
+        assert reemit["header_type"] == HEADER_2, (
+            f"re-emitted announce header_type={reemit['header_type']}; a "
+            f"transport re-broadcast must be HEADER_2 (the relay form)"
+        )
+        assert reemit["transport_type"] == TRANSPORT_TYPE_TRANSPORT, (
+            f"re-emitted announce transport_type={reemit['transport_type']}; a "
+            f"transport re-broadcast must carry transport_type=TRANSPORT"
+        )
+        assert reemit["packet_type"] == PACKET_TYPE_ANNOUNCE, (
+            f"re-emitted announce packet_type={reemit['packet_type']}; must be "
+            f"ANNOUNCE"
+        )
+        assert reemit["destination_type"] == DESTINATION_TYPE_SINGLE, (
+            f"re-emitted announce destination_type={reemit['destination_type']}; "
+            f"must be SINGLE"
         )
 
         # The distinctive INTERNAL rule: the INTERNAL egress interface does NOT

@@ -43,6 +43,7 @@ from conformance import conformance_case
 from tests.behavioral.packet_builders import (
     build_announce_from_destination,
     first_announce,
+    parse_packet_header,
     HEADER_2,
     DESTINATION_TYPE_SINGLE,
     PACKET_TYPE_ANNOUNCE,
@@ -300,6 +301,23 @@ def test_internal_egress_blocks_boundary_next_hop_rebroadcast(behavioral):
             f"re-emitted announce destination_type={reemit['destination_type']}; "
             f"must be SINGLE"
         )
+        # The re-emitted announce must carry the SAME body (data + context) as
+        # the injected one - a relay that drops or alters the signed bytes is
+        # not re-broadcasting the announce even if the headers match. The
+        # retransmit reuses packet.data and packet.context verbatim
+        # (Transport.py:801-802, new_packet built from announce_data /
+        # context), so they must round-trip byte-for-byte.
+        injected = parse_packet_header(raw)
+        assert reemit["data"] == injected["data"], (
+            f"re-emitted announce body ({len(reemit['data'])} bytes) differs from "
+            f"the injected body ({len(injected['data'])} bytes); the re-broadcast "
+            f"dropped or altered the announce payload instead of forwarding it"
+        )
+        assert reemit["context"] == injected["context"], (
+            f"re-emitted announce context {reemit['context']:#x} differs from the "
+            f"injected {injected['context']:#x}; the re-broadcast must preserve the "
+            f"announce context"
+        )
 
         # The distinctive INTERNAL rule: the INTERNAL egress interface does NOT
         # re-broadcast the same announce (the INTERNAL branch sees a BOUNDARY
@@ -315,6 +333,107 @@ def test_internal_egress_blocks_boundary_next_hop_rebroadcast(behavioral):
             "BOUNDARY-mode interface; the internal-mode re-broadcast gate "
             "(Transport.py:1479-1490) must block BOUNDARY next-hops on an "
             "INTERNAL-mode interface"
+        )
+    finally:
+        behavioral.cleanup()
+
+
+@conformance_case(
+    commands=["start", "attach_mock_interface", "announce_build", "inject",
+              "read_path_table", "read_announce_table", "read_interface_mode",
+              "set_announce_timestamp", "force_cull", "drain_tx"],
+    verifies=(
+        "The internal-mode announce re-broadcast rule is not a blanket block "
+        "(Transport.py:1479-1490): when the announce re-broadcast gate evaluates "
+        "an INTERNAL-mode egress interface for a non-local announce whose next hop "
+        "is FULL-mode (an allowed next hop - not BOUNDARY and not announces_to_"
+        "internal=True), the INTERNAL interface DOES re-broadcast the announce, so "
+        "a port that disables all INTERNAL egress is distinguishable from one that "
+        "implements the mode"
+    ),
+)
+def test_internal_egress_rebroadcasts_allowed_next_hop(behavioral):
+    """Companion to the BOUNDARY-block test: prove INTERNAL egress SENDS when
+    the next hop is allowed, so the block test cannot pass vacuously on a port
+    that disables all INTERNAL output.
+
+    Setup mirrors the block test but the ingress is a FULL-mode interface, so
+    the learned path's next hop (the gate's from_interface) is FULL. FULL is an
+    allowed next hop for the INTERNAL branch (Transport.py:1479-1490): it is not
+    BOUNDARY and does not carry announces_to_internal=True, so the gate
+    re-broadcasts. A BOUNDARY egress interface re-broadcasts the same announce
+    (positive control), and so must the INTERNAL egress.
+
+    HARD-FAIL capture: passes on the Python transport; fails on the Kotlin
+    transport at the INTERNAL attach until reticulum-kt adds the INTERNAL enum
+    value + bridge mode, at which point the real assertion runs and the test
+    self-clears with no edit here.
+    """
+    inst = behavioral.start(enable_transport=True)
+    try:
+        # `full` is the ingress AND the path's next hop (FULL mode = the gate's
+        # from_interface, an allowed next hop). `boundary` is a BOUNDARY egress
+        # positive control; `internal` is the subject under test.
+        full = inst.attach_mock_interface("full", mode="FULL")
+        boundary = inst.attach_mock_interface("boundary", mode="BOUNDARY")
+        internal = inst.attach_mock_interface("internal", mode="INTERNAL")
+
+        # Inject a real announce on `full`: learns the path (next hop = full,
+        # FULL mode) and schedules a local retransmit.
+        raw, dest, _ = build_announce_from_destination(
+            behavioral.bridge, identity_private_key=secrets.token_bytes(64),
+            app_name="intsend", aspects=["egress"], emission_ts=1_000_000_400,
+            wire_hops=1,
+        )
+        inst.inject(full, raw)
+        path = inst.read_path_table(dest)
+        assert path["found"], "announce did not learn a path"
+        # The next hop must be the FULL ingress interface - the gate's
+        # from_interface. A FULL next hop is an ALLOWED next hop for the
+        # INTERNAL branch, so the INTERNAL egress must emit (this is the
+        # companion to the BOUNDARY-block test).
+        full_hash = inst.read_interface_mode(full)["interface_hash"]
+        assert path["receiving_interface_hash"] == full_hash, (
+            f"the announce's learned path has next hop "
+            f"{path['receiving_interface_hash']!r}, not the FULL ingress "
+            f"interface {full_hash!r}; the next hop is not an allowed "
+            f"next hop, so this would not exercise the INTERNAL-allow branch"
+        )
+        ann = inst.read_announce_table(dest)
+        assert ann["found"], "announce did not schedule a local retransmit"
+
+        inst.set_announce_timestamp(dest, retransmit_timeout=0)
+        inst.force_cull()
+
+        def _poll_emitted(iface_id, deadline_s=10.0):
+            deadline = time.time() + deadline_s
+            while True:
+                got = inst.drain_tx(iface_id)
+                if first_announce(got) is not None:
+                    return got
+                if time.time() >= deadline:
+                    return got
+                time.sleep(0.05)
+
+        # Positive control: the BOUNDARY egress re-broadcasts the FULL-next-hop
+        # announce (proves the retransmit fired).
+        boundary_out = _poll_emitted(boundary)
+        assert first_announce(boundary_out) is not None, (
+            "positive control failed: the BOUNDARY egress interface did not "
+            "re-broadcast the FULL-next-hop announce; the retransmit did not "
+            "fire, so the INTERNAL-emit assertion below would be vacuous"
+        )
+
+        # The companion rule: the INTERNAL egress MUST re-broadcast a
+        # FULL-next-hop announce. A port that disables all INTERNAL output
+        # passes the BOUNDARY-block test vacuously (it blocks everything); this
+        # test catches it, because here the INTERNAL egress is required to emit.
+        internal_out = _poll_emitted(internal)
+        assert first_announce(internal_out) is not None, (
+            "INTERNAL egress did NOT re-broadcast an announce with a FULL (allowed) "
+            "next hop; the internal-mode re-broadcast gate must re-broadcast "
+            "allowed next hops (Transport.py:1479-1490), so a port that disables "
+            "all INTERNAL output would fail here while passing the block test"
         )
     finally:
         behavioral.cleanup()

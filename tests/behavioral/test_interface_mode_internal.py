@@ -135,8 +135,8 @@ def test_internal_mode_constant_and_discovery(behavioral):
 
 @conformance_case(
     commands=["start", "attach_mock_interface", "announce_build", "inject",
-              "read_path_table", "read_announce_table", "set_announce_timestamp",
-              "force_cull", "drain_tx"],
+              "read_path_table", "read_announce_table", "read_interface_mode",
+              "set_announce_timestamp", "force_cull", "drain_tx"],
     verifies=(
         "The internal-mode announce re-broadcast rule (Transport.py:1479-1490): "
         "when the announce re-broadcast gate evaluates an INTERNAL-mode egress "
@@ -196,11 +196,23 @@ def test_internal_egress_blocks_boundary_next_hop_rebroadcast(behavioral):
         inst.inject(boundary, raw)
         path = inst.read_path_table(dest)
         assert path["found"], "announce did not learn a path"
-        # Confirm the next hop is the BOUNDARY ingress interface - the gate's
-        # from_interface. If the path table pointed elsewhere the gate would be
-        # testing a different next-hop mode and this would not exercise the
-        # INTERNAL branch.
-        assert path["receiving_interface_hash"] is not None
+        # The crux precondition: the path's next hop (IDX_PT_RVCD_IF) MUST be
+        # the BOUNDARY ingress interface - that is the gate's from_interface, and
+        # the INTERNAL branch (Transport.py:1479-1490) only BLOCKS when the next
+        # hop is BOUNDARY. Verify it explicitly rather than assuming it from the
+        # single-interface setup: if the next hop were a different interface the
+        # INTERNAL assertion below would be testing a different next-hop mode, or
+        # (if the next hop were None) the announce would be blocked at
+        # Transport.py:1467 "next hop interface doesn't exist" and the INTERNAL
+        # assertion would pass for the wrong reason.
+        boundary_hash = inst.read_interface_mode(boundary)["interface_hash"]
+        assert path["receiving_interface_hash"] == boundary_hash, (
+            f"the announce's learned path has next hop "
+            f"{path['receiving_interface_hash']!r}, not the BOUNDARY ingress "
+            f"interface {boundary_hash!r}; the re-broadcast gate's "
+            f"from_interface would not be BOUNDARY-mode, so this would not "
+            f"exercise the INTERNAL branch (Transport.py:1479)"
+        )
         ann = inst.read_announce_table(dest)
         assert ann["found"], "announce did not schedule a local retransmit"
 

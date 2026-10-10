@@ -87,10 +87,12 @@ Commands added:
        (and local_client_interfaces); for the path_table missing-interface
        eviction test, :782-785, which needs no clock.)
   behavioral_read_interface_mode(handle, iface_id)
-      -> {mode, announces_from_internal, announces_to_internal, discover_paths}
-      (observation seam for interface-mode conformance. `mode` is the iface's
-       actual mode constant - the value the announce re-broadcast gate
-       (Transport.py:1471-1490) switches on; `announces_from_internal` /
+      -> {iface_id, interface_hash, mode, announces_from_internal,
+          announces_to_internal, discover_paths}
+      (observation seam for interface-mode conformance. `interface_hash` is the
+       iface's identity hash (for asserting it is the path's next hop); `mode`
+       is the iface's actual mode constant - the value the announce re-broadcast
+       gate (Transport.py:1471-1490) switches on; `announces_from_internal` /
        `announces_to_internal` are the two attrs that gate reads, defaulting
        from Interface.__init__ (Interface.py:122-123); `discover_paths` is
        membership in DISCOVER_PATHS_FOR (Interface.py:55). The reference
@@ -1151,6 +1153,8 @@ def cmd_behavioral_read_interface_mode(params):
         raise ValueError(f"Unknown iface_id: {iface_id}")
 
     return {
+        "iface_id": iface_id,
+        "interface_hash": iface.get_hash().hex(),
         "mode": iface.mode,
         "announces_from_internal": bool(iface.announces_from_internal),
         "announces_to_internal": iface.announces_to_internal,

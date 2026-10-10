@@ -346,6 +346,19 @@ class Instance:
             "behavioral_detach_interface", handle=self.handle, iface_id=iface_id,
         )
 
+    def read_interface_mode(self, iface_id):
+        """Report the effective interface mode + announce attributes for
+        `iface_id`: {mode, announces_from_internal, announces_to_internal,
+        discover_paths}. `mode` is the interface's actual mode constant (the
+        value the announce re-broadcast gate, Transport.py:1471-1490, switches
+        on); the announce attributes are the two values that gate reads,
+        defaulting from Interface.__init__ (Interface.py:122-123);
+        `discover_paths` is membership in DISCOVER_PATHS_FOR (Interface.py:55).
+        See behavioral_read_interface_mode."""
+        return self.bridge.execute(
+            "behavioral_read_interface_mode", handle=self.handle, iface_id=iface_id,
+        )
+
     def register_destination(self, app_name, aspects, identity_seed=None,
                              type="single", proof_strategy=None):
         """Register a real local IN destination on this Transport instance.

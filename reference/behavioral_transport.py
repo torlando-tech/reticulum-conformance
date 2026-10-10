@@ -86,6 +86,24 @@ Commands added:
       -> {detached}  (detaches and removes one iface from Transport.interfaces
        (and local_client_interfaces); for the path_table missing-interface
        eviction test, :782-785, which needs no clock.)
+  behavioral_read_interface_mode(handle, iface_id)
+      -> {iface_id, interface_hash, mode, announces_from_internal,
+          announces_to_internal, discover_paths}
+      (observation seam for interface-mode conformance. `interface_hash` is the
+       iface's identity hash (for asserting it is the path's next hop); `mode`
+       is the iface's actual mode constant - the value the announce re-broadcast
+       gate (Transport.py:1471-1490) switches on; `announces_from_internal` /
+       `announces_to_internal` are the two attrs that gate reads, defaulting
+       from Interface.__init__ (Interface.py:122-123); `discover_paths` is
+       membership in DISCOVER_PATHS_FOR (Interface.py:55). The reference
+       resolves the mode string to a real constant in MockInterface
+       (BaseInterface.MODE_INTERNAL for "INTERNAL", RNS 1.3.6+); a port whose
+       bridge cannot express the mode either rejects the attach or reports a
+       different constant, so this is the observable differential for "does the
+       port support this interface mode?". OPTIONAL: a port may omit the command
+       - the INTERNAL-mode test attaches the mode FIRST and fails at the attach
+       for a port lacking the mode, so a missing readback only matters once the
+       port CAN express the mode.)
 """
 
 import os
@@ -179,6 +197,13 @@ def _make_mock_interface_class():
                 "ROAMING": BaseInterface.MODE_ROAMING,
                 "BOUNDARY": BaseInterface.MODE_BOUNDARY,
                 "GATEWAY": BaseInterface.MODE_GATEWAY,
+                # RNS 1.3.6+ internal interface mode (Interface.py:51). The
+                # base Interface.__init__ already defaults the two
+                # announces_from/to_internal attrs that the internal-mode
+                # announce re-broadcast gate reads (Transport.py:1471-1490), so
+                # the constant is all the MockInterface needs to stand in for
+                # a real internal-mode interface.
+                "INTERNAL": BaseInterface.MODE_INTERNAL,
             }
             self.mode = mode_map.get(mode_name, BaseInterface.MODE_FULL)
 
@@ -1091,6 +1116,50 @@ def cmd_behavioral_detach_interface(params):
     if iface in RNS.Transport.local_client_interfaces:
         RNS.Transport.local_client_interfaces.remove(iface)
     return {"detached": True}
+
+
+def cmd_behavioral_read_interface_mode(params):
+    """Report the effective mode + announce attributes of an attached interface.
+
+    Observation seam for interface-mode conformance: returns the interface's
+    actual ``mode`` constant (the value the announce re-broadcast gate at
+    Transport.py:1471-1490 switches on) plus the two announce attributes that
+    gate reads (``announces_from_internal`` / ``announces_to_internal``),
+    which the base ``Interface.__init__`` defaults (Interface.py:122-123).
+    ``discover_paths`` reports membership in ``DISCOVER_PATHS_FOR``
+    (Interface.py:55) - the set of modes that run path discovery, which
+    includes INTERNAL but not FULL/POINT_TO_POINT/BOUNDARY.
+
+    The reference bridge resolves the mode string to a real constant in
+    ``MockInterface`` (``BaseInterface.MODE_INTERNAL`` for ``"INTERNAL"``,
+    RNS 1.3.6+). A port whose bridge cannot express the mode either rejects
+    the attach or coerces it to a different constant, so this command is the
+    observable differential for "does the port support this interface mode?".
+
+    params: handle, iface_id
+    returns: {mode, announces_from_internal, announces_to_internal, discover_paths}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    iface_id = params["iface_id"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    iface = inst["interfaces"].get(iface_id)
+    if iface is None:
+        raise ValueError(f"Unknown iface_id: {iface_id}")
+
+    return {
+        "iface_id": iface_id,
+        "interface_hash": iface.get_hash().hex(),
+        "mode": iface.mode,
+        "announces_from_internal": bool(iface.announces_from_internal),
+        "announces_to_internal": iface.announces_to_internal,
+        "discover_paths": iface.mode in RNS.Interfaces.Interface.Interface.DISCOVER_PATHS_FOR,
+    }
 
 
 def cmd_behavioral_ifac_mask(params):
@@ -2147,6 +2216,7 @@ BEHAVIORAL_COMMANDS = {
     "behavioral_set_announce_timestamp": cmd_behavioral_set_announce_timestamp,
     "behavioral_force_cull": cmd_behavioral_force_cull,
     "behavioral_detach_interface": cmd_behavioral_detach_interface,
+    "behavioral_read_interface_mode": cmd_behavioral_read_interface_mode,
     "behavioral_ifac_mask": cmd_behavioral_ifac_mask,
     "behavioral_inbound_remembered": cmd_behavioral_inbound_remembered,
     "behavioral_seed_link_table": cmd_behavioral_seed_link_table,

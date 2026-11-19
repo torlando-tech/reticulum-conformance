@@ -59,20 +59,29 @@ jobs:
           repository: torlando-tech/reticulum-kt
           path: reticulum-kt
 
-      # Pin RNS/LXMF to the audited release tags (RNS 1.5.5 / LXMF 1.2.0)
-      # rather than tracking master HEAD. Without ref: CI silently validated
-      # against whatever upstream master happened to be, not the ground-truth
-      # release the suite was audited against (N-M16).
+      # Reference pins come from the suite's single source of truth
+      # (reference-pins.env), never a literal here — see that file for the
+      # re-audit procedure. Without a pin, CI silently validated against
+      # whatever upstream master happened to be at clone time (N-M16).
+      - name: Read audited reference pins
+        id: pins
+        working-directory: reticulum-conformance
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "rns=$RNS" >> "$GITHUB_OUTPUT"
+          echo "lxmf=$LXMF" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: markqvist/Reticulum
-          ref: "1.5.5"
+          ref: ${{ steps.pins.outputs.rns }}
           path: Reticulum
 
       - uses: actions/checkout@v4
         with:
           repository: markqvist/LXMF
-          ref: "1.2.0"
+          ref: ${{ steps.pins.outputs.lxmf }}
           path: LXMF
 
       - name: Set up JDK 21
@@ -95,7 +104,7 @@ jobs:
         # deployments use, rather than only the pure-Python fallback.
         run: pip install pytest pytest-xdist cryptography msgpack u-msgpack-python
 
-      - name: Assert RNS/LXMF versions match audited ground truth (1.5.5 / 1.2.0)
+      - name: Assert RNS/LXMF versions match audited ground truth
         # Shared guard (tools/check_rns_lxmf_versions.py) run by BOTH the kotlin
         # and reference jobs so the version check lives in one place. Reads
         # __version__ from the pinned checkouts' _version.py without a full
@@ -152,17 +161,26 @@ jobs:
         with:
           path: reticulum-conformance
 
-      # Pin RNS/LXMF to the audited release tags (RNS 1.5.5 / LXMF 1.2.0).
+      # Same single source of truth as the kotlin job: reference-pins.env.
+      - name: Read audited reference pins
+        id: pins
+        working-directory: reticulum-conformance
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "rns=$RNS" >> "$GITHUB_OUTPUT"
+          echo "lxmf=$LXMF" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: markqvist/Reticulum
-          ref: "1.5.5"
+          ref: ${{ steps.pins.outputs.rns }}
           path: Reticulum
 
       - uses: actions/checkout@v4
         with:
           repository: markqvist/LXMF
-          ref: "1.2.0"
+          ref: ${{ steps.pins.outputs.lxmf }}
           path: LXMF
 
       - name: Set up Python
@@ -175,7 +193,7 @@ jobs:
         # pyca-provider equivalence tests; see the kotlin job for the rationale.
         run: pip install pytest cryptography msgpack u-msgpack-python
 
-      - name: Assert RNS/LXMF versions match audited ground truth (1.5.5 / 1.2.0)
+      - name: Assert RNS/LXMF versions match audited ground truth
         # Shared guard (tools/check_rns_lxmf_versions.py), the same step the
         # kotlin job runs, so the version check lives in one place.
         working-directory: reticulum-conformance

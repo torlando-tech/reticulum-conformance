@@ -13,8 +13,10 @@ name: Conformance Honesty
 #      TESTS.md is a false public claim.
 #
 # Pure-Python: no Kotlin/Swift build, no bridge subprocess. RNS/LXMF are pinned
-# to the audited ground-truth releases (1.5.5 / 1.2.0) from PyPI so collection
-# resolves the same implementation the suite was audited against.
+# to the audited ground-truth releases recorded in reference-pins.env (the
+# single source of truth shared with tests.yml and downstream SUT repos) from
+# PyPI, so collection resolves the same implementation the suite was audited
+# against.
 
 on:
   push:
@@ -35,28 +37,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Read audited reference pins
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "RNS_VERSION=$RNS" >> "$GITHUB_ENV"
+          echo "LXMF_VERSION=$LXMF" >> "$GITHUB_ENV"
+
       - name: Install dependencies (RNS/LXMF pinned to audited ground truth)
-        run: pip install pytest "rns==1.5.5" "lxmf==1.2.0" msgpack u-msgpack-python
+        run: pip install pytest "rns==$RNS_VERSION" "lxmf==$LXMF_VERSION" msgpack u-msgpack-python
 
       - name: Assert RNS/LXMF versions match audited ground truth
         # The suite resolves RNS/LXMF via _rns_paths (no env var -> the
         # pip-installed site-packages, exactly as local ground truth). Verify
-        # those are the audited releases before trusting any honesty verdict.
-        run: |
-          python3 - <<'PY'
-          import sys
-          import RNS, LXMF
-          print(f"RNS {RNS.__version__}, LXMF {LXMF.__version__}")
-          errs = []
-          if RNS.__version__ != "1.5.5":
-              errs.append(f"RNS {RNS.__version__} != 1.5.5")
-          if LXMF.__version__ != "1.2.0":
-              errs.append(f"LXMF {LXMF.__version__} != 1.2.0")
-          if errs:
-              print("::error::not running against audited ground truth: " + "; ".join(errs))
-              sys.exit(1)
-          print("OK: RNS 1.5.5 / LXMF 1.2.0")
-          PY
+        # those are the releases recorded in reference-pins.env before trusting
+        # any honesty verdict. Same guard the conformance jobs run.
+        run: python3 -m tools.check_rns_lxmf_versions
 
       - name: Drift guard — every test must carry @conformance_case
         run: python3 tools/check_conformance_decorated.py

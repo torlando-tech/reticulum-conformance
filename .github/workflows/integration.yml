@@ -29,25 +29,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Read audited reference pins
+        run: |
+          set -euo pipefail
+          source ./reference-pins.env
+          echo "RNS_VERSION=$RNS" >> "$GITHUB_ENV"
+          echo "LXMF_VERSION=$LXMF" >> "$GITHUB_ENV"
+
       - name: Install dependencies (RNS/LXMF pinned to audited ground truth)
-        run: pip install pytest "rns==1.5.5" "lxmf==1.2.0"
+        run: pip install pytest "rns==$RNS_VERSION" "lxmf==$LXMF_VERSION"
 
       - name: Assert RNS/LXMF versions match audited ground truth
-        run: |
-          python3 - <<'PY'
-          import sys
-          import RNS, LXMF
-          print(f"RNS {RNS.__version__}, LXMF {LXMF.__version__}")
-          errs = []
-          if RNS.__version__ != "1.5.5":
-              errs.append(f"RNS {RNS.__version__} != 1.5.5")
-          if LXMF.__version__ != "1.2.0":
-              errs.append(f"LXMF {LXMF.__version__} != 1.2.0")
-          if errs:
-              print("::error::not running against audited ground truth: " + "; ".join(errs))
-              sys.exit(1)
-          print("OK: RNS 1.5.5 / LXMF 1.2.0")
-          PY
+        # Same shared guard as honesty.yml and the conformance jobs — the
+        # audited pair comes from reference-pins.env, never a literal here.
+        run: python3 -m tools.check_rns_lxmf_versions
 
       - name: Run integration suite (--python-only) with min-passed guard
         env:

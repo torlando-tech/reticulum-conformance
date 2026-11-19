@@ -64,6 +64,49 @@ _COMPRESSION_TRIES = 4       # RawChannelWriter.COMPRESSION_TRIES
 _SEQ_MODULUS = 0x10000       # Channel.SEQ_MODULUS
 
 
+def _require_active_link(client, link_id, where):
+    """Fail on the link's real state when it was torn down mid-test.
+
+    A stale/CLOSED link makes every Channel write a no-op, and the bridge then
+    returns an EMPTY manifest — indistinguishable, in the response, from a
+    Buffer semantics mismatch (and previously surfaced as
+    ``IndexError: list index out of range`` on ``manifest[-1]``). Diagnose the
+    link, not the stream.
+    """
+    st = client.link_status(link_id)
+    if st["status_name"] != "ACTIVE":
+        raise AssertionError(
+            f"{where}: the SUT link {link_id.hex()[:8]} is "
+            f"{st['status_name']} ({st.get('teardown_reason_name')}), not ACTIVE — "
+            "it was torn down before the streamed write, so no "
+            "StreamDataMessage can be recorded; this is a link-state failure "
+            f"(keepalive_s={st.get('keepalive_s')}, "
+            f"stale_time_s={st.get('stale_time_s')}, "
+            f"no_inbound_for_ms={st.get('no_inbound_for_ms')}), not a Buffer "
+            "EOF-semantics mismatch"
+        )
+    return st
+
+
+def _require_manifest(resp, where):
+    """Explain an empty StreamDataMessage manifest instead of indexing it.
+
+    ``written=0`` means the writer never reached the channel (link not usable
+    or the outlet did not transmit) — a link-state failure, not EOF semantics.
+    """
+    if not resp["manifest"]:
+        raise AssertionError(
+            f"{where}: the SUT recorded no StreamDataMessage for the streamed "
+            f"write (written={resp['written']}, "
+            f"write_returns={resp['write_returns']!r}, "
+            f"tx_ring_after={resp['tx_ring_after']}) — with written=0 the write "
+            "never reached the channel (link not usable / outlet did not "
+            "transmit): a link-state failure, not a Buffer EOF-semantics "
+            "mismatch"
+        )
+    return resp["manifest"]
+
+
 @conformance_case(
     commands=[
         "start_tcp_server", "start_tcp_client", "listen", "poll_path",
@@ -415,7 +458,7 @@ def test_stream_write_chunking_and_compression(wire_link_setup):
 @conformance_case(
     commands=[
         "start_tcp_server", "start_tcp_client", "listen", "poll_path",
-        "link_open", "buffer_stream", "buffer_received",
+        "link_open", "buffer_stream", "buffer_received", "link_status",
     ],
     verifies=(
         "RNS Buffer EOF semantics: a NON-empty EOF-flagged write carries data + "
@@ -434,17 +477,19 @@ def test_stream_eof_semantics(wire_link_setup):
     )
 
     # (a) Non-empty EOF: data + EOF in one message on stream 10.
+    _require_active_link(client, link_id, "(a) eof_with_data on stream 10")
     pa = os.urandom(900)
     ra = client.buffer_stream(
         link_id, pa, stream_id=10, eof_with_data=True, timeout_ms=_SEND_TIMEOUT_MS
     )
-    assert ra["manifest"][-1]["eof"] is True and ra["manifest"][-1]["bytes"] > 0, (
+    ra_manifest = _require_manifest(ra, "(a) eof_with_data on stream 10")
+    assert ra_manifest[-1]["eof"] is True and ra_manifest[-1]["bytes"] > 0, (
         f"eof_with_data must flag EOF on the final DATA-bearing message: "
-        f"{ra['manifest']!r}"
+        f"{ra_manifest!r}"
     )
-    assert all(m["bytes"] > 0 for m in ra["manifest"]), (
+    assert all(m["bytes"] > 0 for m in ra_manifest), (
         f"eof_with_data must NOT emit a separate empty-EOF message: "
-        f"{ra['manifest']!r}"
+        f"{ra_manifest!r}"
     )
     rcv_a = server.buffer_received(dest_hash, stream_id=10, timeout_ms=_SEND_TIMEOUT_MS)
     assert rcv_a["data"] == pa and rcv_a["eof"] is True, (
@@ -458,12 +503,14 @@ def test_stream_eof_semantics(wire_link_setup):
     )
 
     # (b) close() path on stream 20: a separate empty EOF + tx ring drained.
+    _require_active_link(client, link_id, "(b) close() on stream 20")
     pb = os.urandom(900)
     rb = client.buffer_stream(
         link_id, pb, stream_id=20, use_close=True, timeout_ms=_SEND_TIMEOUT_MS
     )
-    assert any(m["bytes"] == 0 and m["eof"] for m in rb["manifest"]), (
-        f"close() must emit a separate empty EOF message: {rb['manifest']!r}"
+    rb_manifest = _require_manifest(rb, "(b) close() on stream 20")
+    assert any(m["bytes"] == 0 and m["eof"] for m in rb_manifest), (
+        f"close() must emit a separate empty EOF message: {rb_manifest!r}"
     )
     assert rb["tx_ring_after"] == 0, (
         f"close() must drain the tx ring (every envelope proved): "
@@ -476,11 +523,13 @@ def test_stream_eof_semantics(wire_link_setup):
     )
 
     # (c) Default path on stream 0: a separate empty EOF message (contrast).
+    _require_active_link(client, link_id, "(c) default path on stream 0")
     pc = os.urandom(900)
     rc = client.buffer_stream(link_id, pc, timeout_ms=_SEND_TIMEOUT_MS)
-    assert rc["manifest"][-1]["bytes"] == 0 and rc["manifest"][-1]["eof"] is True, (
+    rc_manifest = _require_manifest(rc, "(c) default path on stream 0")
+    assert rc_manifest[-1]["bytes"] == 0 and rc_manifest[-1]["eof"] is True, (
         f"the default path must terminate with a separate empty EOF message: "
-        f"{rc['manifest']!r}"
+        f"{rc_manifest!r}"
     )
     rcv_c = server.buffer_received(dest_hash, timeout_ms=_SEND_TIMEOUT_MS)
     assert rcv_c["data"] == pc and rcv_c["eof"] is True, (

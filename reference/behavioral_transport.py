@@ -44,6 +44,16 @@ Commands added:
        Transport.packet_filter; covers the transport_id "other instance" drop
        (Transport.py:1340-1343), PLAIN/GROUP hops>1 TTL drop (:1352-1369) and
        the KEEPALIVE/RESOURCE*/CACHE_REQUEST/CHANNEL context bypasses (:1345-1350).)
+  behavioral_hashlist_limit(handle, limit) -> {limit, current, previous, total}
+      (sets Transport.hashlist_maxsize and resets BOTH dedup generations — the
+       entry budget is the total for both windows, rotation happens at
+       budget//2; a small limit makes rotation drivable with a few packets.
+       Version-agnostic: 1.3.1 plain sets and master's bucketed PacketHashlist.)
+  behavioral_hashlist_stats(handle) -> {limit, current, previous, total}
+      (observable retention: per-generation entry counts, summed across the
+       windows. Asserting total <= budget + 2 after a jobs() pass is what fails
+       an implementation that keeps an unbounded / mis-sized dedup window —
+       columba#1222, reticulum-kt#102.)
   behavioral_read_reverse_table(handle, dest=None)
       -> {found, received_if, outbound_if, received_if_hash, outbound_if_hash,
           timestamp}  when dest (a reverse-table key = forwarded packet's
@@ -2183,7 +2193,135 @@ def cmd_behavioral_read_announce_handler_calls(params):
     }
 
 
+# --- Packet-hashlist rotation / retention (the dedup window) ---------------
+#
+# Every conformant implementation keeps TWO generations of packet hashes and
+# rotates the active generation once per window: a replayed packet is dropped
+# while its hash is in either generation, and hashes older than the previous
+# generation are forgotten. That eviction is what bounds memory — columba#1222
+# (reticulum-kt#102) was an implementation whose window budget was the flat
+# desktop constant instead of the platform budget, so it retained an unbounded
+# / mis-sized history and OOMed on a 201 MB-heap Android device.
+#
+# The rotation TRIGGER is an implementation detail (RNS 1.3.1 rotates inside
+# Transport.jobs() once the current generation exceeds hashlist_maxsize//2;
+# reticulum-kt rotates inside add_packet_hash), so the commands below expose
+# only observable state — budget, per-generation entry counts — and the tests
+# drive rotations through behavioral_force_cull (a synchronous jobs() pass).
+
+_DEFAULT_HASHLIST_MAXSIZE = 1_000_000
+
+
+def _hashlist_generations(RNS):
+    """Return (current, previous) entry counts for either hashlist shape.
+
+    RNS 1.3.1: two plain sets (`Transport.packet_hashlist` / `_prev`).
+    RNS master: a bucketed `PacketHashlist` whose `__len__` is the current
+    generation and whose `_prv` buckets hold the previous one.
+    """
+    hl = RNS.Transport.packet_hashlist
+    if isinstance(hl, (set, frozenset)):
+        prev = getattr(RNS.Transport, "packet_hashlist_prev", None) or ()
+        return len(hl), len(prev)
+
+    width = getattr(hl, "width", None)
+    previous_buckets = getattr(hl, "_prv", None)
+    if width and previous_buckets is not None:
+        # Each generation packs fixed-width entries into bytearrays, so a
+        # bucket's length / width is its entry count.
+        return len(hl), sum(len(bucket) // width for bucket in previous_buckets)
+    return len(hl), 0
+
+
+def _clear_hashlist_generations(RNS):
+    """Drop both generations so a test starts from a known-empty window."""
+    hl = RNS.Transport.packet_hashlist
+    if isinstance(hl, (set, frozenset)):
+        RNS.Transport.packet_hashlist = set()
+        if hasattr(RNS.Transport, "packet_hashlist_prev"):
+            RNS.Transport.packet_hashlist_prev = set()
+        return
+
+    current_buckets = getattr(hl, "_cur", None)
+    previous_buckets = getattr(hl, "_prv", None)
+    if current_buckets is not None and previous_buckets is not None:
+        for bucket in current_buckets:
+            bucket.clear()
+        for bucket in previous_buckets:
+            bucket.clear()
+        if hasattr(hl, "_count"):
+            hl._count = 0
+        return
+    hl.clear()
+
+
+def cmd_behavioral_hashlist_limit(params):
+    """Set the packet-hashlist entry budget and reset both generations.
+
+    The budget is the TOTAL for both dedup windows: rotation happens once the
+    current generation exceeds `budget // 2` (RNS/Transport.py:640-642@1.3.1,
+    :886-887@master), so retention stays near one budget of history. A small
+    limit lets a test drive rotation with a handful of packets instead of the
+    1M-entry desktop default.
+
+    params: handle, limit (int; omitted/None restores the reference default)
+    returns: {limit, current, previous, total}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+    limit = params.get("limit")
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    if limit is None:
+        limit = _DEFAULT_HASHLIST_MAXSIZE
+    limit = int(limit)
+    if limit < 2:
+        raise ValueError("hashlist limit must be >= 2 (rotation needs a half-window)")
+
+    RNS.Transport.hashlist_maxsize = limit
+    _clear_hashlist_generations(RNS)
+
+    current, previous = _hashlist_generations(RNS)
+    return {
+        "limit": limit,
+        "current": current,
+        "previous": previous,
+        "total": current + previous,
+    }
+
+
+def cmd_behavioral_hashlist_stats(params):
+    """Report the packet-hashlist budget and per-generation entry counts.
+
+    params: handle
+    returns: {limit, current, previous, total}
+    """
+    RNS = _get_rns()
+    handle = params["handle"]
+
+    with _instances_lock:
+        inst = _instances.get(handle)
+    if inst is None:
+        raise ValueError(f"Unknown handle: {handle}")
+
+    current, previous = _hashlist_generations(RNS)
+    return {
+        "limit": int(
+            getattr(RNS.Transport, "hashlist_maxsize", _DEFAULT_HASHLIST_MAXSIZE)
+        ),
+        "current": current,
+        "previous": previous,
+        "total": current + previous,
+    }
+
+
 BEHAVIORAL_COMMANDS = {
+    "behavioral_hashlist_limit": cmd_behavioral_hashlist_limit,
+    "behavioral_hashlist_stats": cmd_behavioral_hashlist_stats,
     "behavioral_register_destination": cmd_behavioral_register_destination,
     "behavioral_read_destination_deliveries": cmd_behavioral_read_destination_deliveries,
     "behavioral_hold_and_release_announce": cmd_behavioral_hold_and_release_announce,

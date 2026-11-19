@@ -277,6 +277,19 @@ class Instance:
             handle=self.handle, raw=raw.hex(), remember=remember,
         )
 
+    def hashlist_limit(self, limit):
+        """Set the packet-hashlist entry budget (the total for BOTH dedup
+        windows; rotation happens at budget//2) and reset both generations.
+        Returns {limit, current, previous, total}. See behavioral_hashlist_limit."""
+        return self.bridge.execute(
+            "behavioral_hashlist_limit", handle=self.handle, limit=limit,
+        )
+
+    def hashlist_stats(self):
+        """Return the packet-hashlist budget and per-generation entry counts
+        {limit, current, previous, total}. See behavioral_hashlist_stats."""
+        return self.bridge.execute("behavioral_hashlist_stats", handle=self.handle)
+
     def read_reverse_table(self, dest=None):
         """Read Transport.reverse_table. With `dest` (bytes; a reverse-table key
         = the forwarded packet's truncated hash) return that single entry's

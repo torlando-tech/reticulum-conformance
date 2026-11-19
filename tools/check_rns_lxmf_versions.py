@@ -9,16 +9,37 @@ mismatch is a hard failure regardless of which job is inspected first.
 Reads __version__ from each checkout's _version.py - the definitive source of
 RNS.__version__ / LXMF.__version__ - without a full `import RNS` (which would
 need cryptography/pyserial that these jobs do not always pip-install).
+
+The audited release tags come from the repo's single source of truth,
+`reference-pins.env`; bump them there, not here.
 """
 import os
 import sys
 
 import _rns_paths as p
 
-# The audited ground-truth release tags. Bump here (and the ref: pins in
-# tests.yml) together when re-auditing against a new RNS/LXMF release.
-EXPECTED_RNS = "1.5.5"
-EXPECTED_LXMF = "1.2.0"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PINS_FILE = os.path.join(REPO_ROOT, "reference-pins.env")
+
+
+def read_pins(path=PINS_FILE):
+    """Parse `KEY=value` lines (comments/blank lines allowed)."""
+    pins = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            pins[key.strip()] = value.strip()
+    if "RNS" not in pins or "LXMF" not in pins:
+        print(f"::error::{path} must define RNS and LXMF", file=sys.stderr)
+        sys.exit(1)
+    return pins
+
+
+EXPECTED_RNS = read_pins()["RNS"]
+EXPECTED_LXMF = read_pins()["LXMF"]
 
 
 def version_of(pkg, env_var):

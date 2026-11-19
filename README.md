@@ -6,6 +6,10 @@ byte-for-byte where the wire format demands it, by driving both the reference
 and the system-under-test (SUT) through a uniform **bridge** protocol and
 comparing their behavior on the same inputs.
 
+The audited release pair (RNS / LXMF) is recorded once in `reference-pins.env`;
+CI here and in downstream SUT repos read that file instead of hardcoding
+versions.
+
 > **Status:** experimental / WIP. Originally built to certify the Swift and
 > Kotlin implementations. The reference legs are green; bringing a SUT bridge
 > to the full command surface is the gating work (see
